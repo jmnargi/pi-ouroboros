@@ -1,0 +1,52 @@
+{
+  "name": "pi-ouroboros",
+  "version": "0.1.0",
+  "description": "Self-improving pi coding agent: pi digests its own sessions, reflects on its mistakes, and writes its own rules and skills — so the next session starts smarter.",
+  "type": "module",
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "pi",
+    "pi-extension",
+    "pi-package",
+    "self-improvement",
+    "reflection",
+    "learning",
+    "skills",
+    "post-mortem"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jmnargi/pi-ouroboros.git"
+  },
+  "license": "MIT",
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-agent-core": "^0.84.2",
+    "@earendil-works/pi-ai": "^0.84.2",
+    "@earendil-works/pi-coding-agent": "^0.84.2",
+    "@earendil-works/pi-tui": "^0.84.2",
+    "@types/bun": "^1.4.0",
+    "@types/node": "^22.0.0",
+    "typebox": "^1.3.17",
+    "typescript": "^5.6.0"
+  }
+}
