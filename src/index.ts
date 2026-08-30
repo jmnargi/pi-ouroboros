@@ -91,9 +91,9 @@ function sessionHasOuroborosMessage(entries: unknown[], sessionId: string): bool
 	// Match the digest-block line, not a bare substring.
 	// A reflection for a different digest must not count as delivered.
 	// Its data can contain 'session: <this id>' (for example, a user prompt
-	// '- session: A'). The real block always renders `\nsession: <id>\n` as
-	// its first line, with '<' escaped exactly as formatDigest does — the
-	// needle must match the RENDERED form.
+	// '- session: A'). The block always renders `\nsession: <id>\n` as its
+	// first line. The needle must match the rendered form. formatDigest
+	// escapes '<' the same way.
 	const needle = `\nsession: ${escapeTags(sessionId)}\n`;
 	for (const raw of entries) {
 		if (!raw || typeof raw !== "object") continue;
@@ -119,8 +119,8 @@ export default function (pi: ExtensionAPI): void {
 	/** True while injected digests await cleanup — avoids a readdir every turn. */
 	let hasInjectedDigests = false;
 	/** Sids actually queued in the current session_start. agent_end deletes
-	 * ONLY these markers — a recovered-but-not-queued digest keeps its marker
-	 * (the atomic claim) for the next session start. */
+	 * only these markers. A recovered-but-not-queued digest keeps its marker
+	 * for the next session start. */
 	let queuedInjected = new Set<string>();
 	const updateStatus = (): void => {
 		const host = uiHost;
@@ -189,9 +189,8 @@ export default function (pi: ExtensionAPI): void {
 		uiHost = ctx as unknown as UiHost;
 		reflectQueued = false;
 		queuedInjected = new Set();
-		// Reset the stale flag: a previous session's failed run can leave it
-		// true, and a spurious marker-deletion pass at the next agent_end
-		// would do an unnecessary readdir.
+		// Reset the stale flag. A failed run can leave it true. A spurious
+		// marker-deletion pass would do an unnecessary readdir.
 		hasInjectedDigests = false;
 		// Leftover .injected.json files mean the queued reflection was never
 		// confirmed delivered (crash, quit before the first turn, failed LLM
@@ -203,14 +202,13 @@ export default function (pi: ExtensionAPI): void {
 			try {
 				const injected = listInjectedDigests(dataDir);
 				if (injected.length > 0) {
-					// The queued reflection can already be in the CURRENT
-					// session's history: the message is drained (persisted)
-					// before the first LLM call, and a failed call keeps the
-					// marker. This fires for every non-reload reason — the
-					// primary resume path (pi --continue/--resume) emits
-					// reason "startup", not "resume". If the history already
-					// has the reflection for this digest, delete the marker
-					// instead of re-injecting — that would deliver it twice.
+					// The queued reflection can already be in the current
+					// session's history. The message is drained before the
+					// first LLM call. A failed call keeps the marker. This
+					// fires for every non-reload reason — the primary resume
+					// path (pi --continue/--resume) emits reason "startup",
+					// not "resume". If the history has the reflection,
+					// delete the marker. Re-injecting would deliver it twice.
 					// The entries come from the runtime's parsed session
 					// (complete, no file IO).
 					const entries = (ctx as unknown as { sessionManager?: { getEntries?: () => unknown[] } }).sessionManager?.getEntries?.() ?? [];
@@ -244,17 +242,24 @@ export default function (pi: ExtensionAPI): void {
 		} else {
 			// Reload re-imports the extension module (fresh state) but keeps
 			// the AgentSession — the queued message survives in
-			// _pendingNextTurnMessages. Reconcile the markers: a marker whose
-			// reflection is already in the session history was delivered
-			// before the reload (delete it). The rest are left alone — a
-			// marker can also be a recovered-but-not-queued digest (kept as
-			// the atomic claim from a prior session_start), whose reflection
-			// is NOT queued; deleting it at agent_end would lose it. The
-			// next session start's recovery reconciles the delivered ones.
+			// _pendingNextTurnMessages. Reconcile the markers. Delete a
+			// marker whose reflection is already in the session history.
+			// It was delivered before the reload. Leave the rest alone. A
+			// marker can be a recovered-but-not-queued digest. Its
+			// reflection is not queued. Deleting it at agent_end would lose
+			// it. The next session start's recovery reconciles the
+			// delivered ones.
 			try {
 				const entries = (ctx as unknown as { sessionManager?: { getEntries?: () => unknown[] } }).sessionManager?.getEntries?.() ?? [];
 				for (const sid of listInjectedDigests(dataDir)) {
-					const digest = readInjectedDigest(dataDir, sid);
+					// Per-marker isolation: a transient IO error on one
+					// marker must not stall the rest.
+					let digest: OuroborosDigest | null = null;
+					try {
+						digest = readInjectedDigest(dataDir, sid);
+					} catch {
+						continue;
+					}
 					if (digest && sessionHasOuroborosMessage(entries, digest.sessionId)) {
 						deleteInjectedDigest(dataDir, sid);
 					} else {
@@ -313,10 +318,9 @@ export default function (pi: ExtensionAPI): void {
 						{ deliverAs: "nextTurn" },
 					);
 				} catch {
-					// sendMessage never throws in the current runtime, but if
-					// it ever does, restore the digest for the next session
-					// start instead of losing the reflection. Recovered
-					// digests keep their marker (still claimed).
+					// sendMessage never throws in the current runtime. If it
+					// does, restore the digest for the next session start.
+					// Recovered digests keep their marker (still claimed).
 					if (!recoveredSet.has(sid)) unmarkDigestInjected(dataDir, sid);
 					continue;
 				}
@@ -336,7 +340,7 @@ export default function (pi: ExtensionAPI): void {
 		if (rules.length === 0) return;
 		return { systemPrompt: `${event.systemPrompt}${buildRulesAppendix(rules, rulesMaxChars)}` };
 	});
-	pi.on("agent_end", (event) => {
+	pi.on("agent_end", (event, ctx) => {
 		// The queued reflection was delivered in this turn.
 		// The marker is no longer needed.
 		// The plugin deletes it here, not at before_agent_start.
@@ -345,37 +349,46 @@ export default function (pi: ExtensionAPI): void {
 		// Skipped entirely when nothing was injected (the common case):
 		// zero file IO per turn.
 		if (hasInjectedDigests) {
-			// A FAILED run (API down, auth error, retries exhausted) also
-			// emits agent_end, with a message whose stopReason is
-			// "error"/"aborted" (pi-agent-core agent.js handleRunFailure).
-			// The reflection was NOT delivered — keep the marker.
+			// A failed run also emits agent_end. Its message has stopReason
+			// "error" or "aborted". The reflection was not delivered —
+			// keep the marker.
 			const messages = (event as { messages?: unknown[] }).messages ?? [];
 			const last = messages[messages.length - 1] as { stopReason?: unknown } | undefined;
 			if (last?.stopReason === "error" || last?.stopReason === "aborted") return;
 			try {
 				// Delete ONLY the markers queued in this session_start. A
-				// recovered-but-not-queued digest (sendMessage failure, or a
-				// second recovered digest skipped because one was already
-				// injected) keeps its marker — the atomic claim — for the
+				// recovered-but-not-queued digest keeps its marker for the
 				// next session start.
 				for (const sid of queuedInjected) {
 					deleteInjectedDigest(dataDir, sid);
 				}
 				// A reload re-imported the module, so a marker queued before
 				// the reload is not in queuedInjected. Delete any injected
-				// marker whose reflection is verifiably in THIS run's
-				// messages — the drained custom message carries the digest
-				// block. A marker whose reflection is not in the messages
+				// marker whose reflection is verifiably delivered: in THIS
+				// run's messages (the drained custom message carries the
+				// digest block) or in the session history (a failed run
+				// drained it, and an auto-retry continued from that
+				// context). A marker whose reflection is not delivered
 				// (recovered-but-not-queued) is left for the next recovery.
+				const entries = (ctx as unknown as { sessionManager?: { getEntries?: () => unknown[] } } | undefined)?.sessionManager?.getEntries?.() ?? [];
 				for (const sid of listInjectedDigests(dataDir)) {
-					const digest = readInjectedDigest(dataDir, sid);
+					// Per-marker isolation: a transient IO error on one
+					// marker must not stall the rest.
+					let digest: OuroborosDigest | null = null;
+					try {
+						digest = readInjectedDigest(dataDir, sid);
+					} catch {
+						continue;
+					}
 					if (!digest) continue;
 					const needle = `\nsession: ${escapeTags(digest.sessionId)}\n`;
-					const delivered = messages.some((m) => {
+					const inRun = messages.some((m) => {
 						const content = (m as { content?: unknown })?.content;
 						return typeof content === "string" && content.includes(needle);
 					});
-					if (delivered) deleteInjectedDigest(dataDir, sid);
+					if (inRun || sessionHasOuroborosMessage(entries, digest.sessionId)) {
+						deleteInjectedDigest(dataDir, sid);
+					}
 				}
 			} catch {
 				// best-effort — a failed cleanup must not skip the status
@@ -457,9 +470,9 @@ export default function (pi: ExtensionAPI): void {
 			}
 			if (!description.trim()) throw new Error("skillDescription is required for kind=skill");
 			if (!body.trim()) throw new Error("skillBody is required for kind=skill");
-			// Bounds: the body is written verbatim and pi advertises the
-			// description in the system prompt — a huge body is a disk-fill
-			// vector and a huge description enlarges every future prompt.
+			// The body is written verbatim. Pi advertises the description
+			// in the system prompt. A huge body can fill the disk. A huge
+			// description enlarges every future prompt.
 			if (description.length > 200) throw new Error("skillDescription must be 200 characters or fewer");
 			if (body.length > 20_000) throw new Error("skillBody must be 20,000 characters or fewer");
 			const file = writeSkill(dataDir, name, description, body);
@@ -546,9 +559,8 @@ export default function (pi: ExtensionAPI): void {
 		},
 	});
 
-	// No custom message renderer: pi's default CustomMessageComponent renders
-	// the content as Markdown (label + body), which is better than a raw
-	// Text dump for the numbered instructions.
+	// No custom message renderer is used. Pi's default
+	// CustomMessageComponent renders the content as Markdown.
 
 	pi.on("session_shutdown", () => {
 		try {

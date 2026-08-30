@@ -60,8 +60,9 @@ The plugin does not lock the file across instances.
 Run one pi instance at a time to avoid lost rules.
 Two concurrent instances can also deliver the same reflection twice.
 The marker protocol has no ownership across processes.
-After a reload, a queued reflection can be delivered twice.
-The plugin does not persist the queued flag across a reload.
+After a reload, the plugin reconciles the markers.
+The queued message survives the reload.
+The plugin delivers it once.
 
 The digest content is untrusted data.
 The digest can contain text from files, tools, or other agents.
@@ -82,24 +83,24 @@ pi.dev awaits every event handler.
 The plugin keeps handler work small.
 
 Measured costs:
-
-- Session start with no digests: 0.002 ms.
-- Session start with 1 digest: 0.057 ms.
-- Session start with 50 digests: 0.105 ms.
-- Rules read per turn (cached): 0.002 ms.
-- Skills read per turn (cached): 0.002 ms.
-- Rule append at cap (char eviction): 0.047 ms.
-- Digest list with 10,000 digests: 21 ms.
-- Digest build with a 300 KB prompt: 0.022 ms.
-- Digest build with 10,000 tool calls (capped): 4.6 ms.
-- Digest save (atomic write): 0.021 ms.
+- Session start with no digests: 0.007 ms.
+- Session start with 1 digest: 0.063 ms.
+- Session start with 50 digests: 0.129 ms.
+- Rules read per turn (cached): 0.001 ms.
+- Skills read per turn (cached): 0.001 ms.
+- Rule append at cap (char eviction): 0.029 ms.
+- Digest list with 10,000 digests: 23 ms.
+- Digest build with a 300 KB prompt: 0.026 ms.
+- Digest build with 10,000 tool calls (capped): 6.3 ms.
+- Digest save (atomic write): 0.039 ms.
 
 The plugin caches the rules file.
 The plugin invalidates the cache on its own writes.
 The plugin checks the file mtime for external writes.
 The plugin caches the skills list.
 The plugin invalidates the skills cache on its own writes.
-The plugin examines every pending digest at session start.
+The plugin scans every pending digest at session start.
+The plugin deletes the rest after the first notable digest is queued.
 The plugin deletes non-notable and corrupt digests during the scan.
 The plugin skips the per-turn cleanup when nothing is pending.
 Run `bun bench/bench.ts` to re-measure the hot paths.
@@ -130,9 +131,8 @@ Use environment variables to change the behavior.
 | `PI_OUROBOROS_RULES_CAP` | `50` | Maximum number of rules |
 | `PI_OUROBOROS_RULES_MAX_CHARS` | `3000` | Maximum characters of rules per turn. The plugin also evicts the oldest rules when the file exceeds this budget. The plugin truncates a single rule at 500 characters. |
 | `PI_OUROBOROS_REFLECT_MIN_PROMPTS` | `5` | Minimum prompts for a clean session to be notable (floor 20) |
-| `PI_CODING_AGENT_DIR` | `~/.pi/agent` | Directory for all ouroboros state (rules, digests, skills) |
+The plugin stores all ouroboros state in the agent directory.
 
-All ouroboros state is stored in the agent directory.
 Changing `PI_CODING_AGENT_DIR` creates a new state directory.
 The old rules, digests, and skills stay in the old directory.
 
@@ -149,7 +149,7 @@ npx tsc --noEmit
 
 The tests cover digest extraction, persistence, prompt building, and the extension entry point.
 Run `bun bench/bench.ts` to measure the hot paths.
-The test suite has 165 tests.
+The test suite has 170 tests.
 
 The reflection happens at the start of the next session.
 The reflection does not happen at shutdown.

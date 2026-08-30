@@ -19,7 +19,7 @@
  *     on the message object.
  *   - Bash tool calls: stored as toolResult with `toolName: "bash"`. A real
  *     failure has `isError: true` and text ending "Command exited with code
- *     N" (the tool throws); a success has `isError: false` and no exit code.
+ *     N". A success has `isError: false` and no exit code.
  *     The command text is stored on the preceding assistant toolCall
  *     (matched by toolCallId).
  *   - The documented `bashExecution` role (command/exitCode on the message)
@@ -44,8 +44,8 @@ export interface OuroborosDigest {
 	userPrompts: string[];
 	/** Uncapped count of user prompts (userPrompts is capped at PROMPT_CAP). */
 	userPromptCount: number;
-	/** Assistant tool calls (name + truncated key args), newest-last — the
-	 * reflection needs to see what the model actually DID, not just failures. */
+	/** Assistant tool calls (name + truncated key args), newest-last. The
+	 * reflection needs to see what the model did, not just failures. */
 	toolCalls: Array<{ tool: string; args: string }>;
 	/** Assistant text messages, newest-last, each truncated. */
 	assistantText: string[];
@@ -137,8 +137,8 @@ function cpPrefix(s: string, max: number): string {
 }
 
 /** The last max code points, without materializing the whole string.
- * O(max) iterations and O(max) copies: the code points are collected in
- * reverse order and joined once (no quadratic string concatenation). */
+ * O(max) iterations and O(max) copies. The code points are collected in
+ * reverse order and joined once. */
 function cpSuffix(s: string, max: number): string {
 	if (s.length <= max) return s; // fast path
 	// Walk backwards by code points: a low surrogate at i-1 means the code
@@ -168,12 +168,11 @@ function cpSuffix(s: string, max: number): string {
 }
 
 function truncate(s: string, max: number): string {
-	// Cleaning removes characters, so the first max code points of the
-	// cleaned text can start arbitrarily far into the input. Grow the bound
-	// geometrically until enough survive or the string is exhausted — the
-	// common case (no control chars) is one pass over ~max*2 units. The
-	// count and the final cut are O(max), never O(n): a 10MB input must not
-	// materialize a 10M-element array.
+	// Cleaning removes characters. The first max code points of the
+	// cleaned text can start arbitrarily far into the input. Grow the
+	// bound geometrically until enough survive or the string is exhausted.
+	// The count and the final cut are O(max), never O(n). A 10MB input
+	// must not materialize a 10M-element array.
 	let bound = max * 2 + 1;
 	let cleaned = "";
 	while (true) {
@@ -204,10 +203,10 @@ function cleanName(s: string, max: number): string {
 }
 
 /** Keep the LAST max code points — bash errors put the exit code at the end.
- * The input is bounded before the code-point pass: a 10MB tool output must
- * not materialize a 10M-element array. Grow the tail bound geometrically
- * until enough code points survive or the string is exhausted. The count
- * and the final cut are O(max), never O(n). */
+ * Bound the input before the code-point pass. A 10MB tool output must not
+ * materialize a 10M-element array. Grow the tail bound geometrically until
+ * enough code points survive or the string is exhausted. The count and the
+ * final cut are O(max), never O(n). */
 function truncateTail(s: string, max: number): string {
 	let bound = max * 2 + 1;
 	let cleaned = "";
@@ -230,10 +229,10 @@ function asNumber(v: unknown): number {
 }
 
 /**
- * Build a digest from raw session entries. `sessionId`/`cwd` fall back to the
- * session header entry when present; `endedAt` is the caller-provided wall
- * clock (the shutdown moment); `startedAt` is the caller-provided header
- * timestamp when available.
+ * Build a digest from raw session entries. `sessionId`/`cwd` fall back to
+ * the session header entry when present. `endedAt` is the caller-provided
+ * wall clock. `startedAt` is the caller-provided header timestamp when
+ * available.
  */
 export function buildDigest(
 	entries: unknown[],
@@ -244,11 +243,10 @@ export function buildDigest(
 ): OuroborosDigest {
 	const digest: OuroborosDigest = {
 		version: 1,
-		// Sanitize the parameters here, not in the session-header branch:
-		// getEntries() excludes session entries in the real runtime, so the
-		// production path (session_shutdown) passes RAW values. A control
-		// char in the project directory name must not make the digest fail
-		// validation on load (which would delete the reflection).
+		// Sanitize the parameters here, not in the session-header branch.
+		// getEntries() excludes session entries in the real runtime. The
+		// production path passes raw values. A control char in the project
+		// directory name must not make the digest fail validation on load.
 		sessionId: cleanName(sessionId, 200),
 		cwd: cleanName(cwd, 2000),
 		startedAt: cleanName(startedAt, 100),
@@ -286,10 +284,10 @@ export function buildDigest(
 		const entry = raw as RawEntry;
 
 		// Session header (present in tests; getEntries() excludes it in pi).
-		// The parameters are already sanitized at assignment above; this
-		// branch re-sanitizes the header values (defense in depth) so a
-		// control char in the project directory name can never make the
-		// digest fail validation on load.
+		// The parameters are already sanitized at assignment above. This
+		// branch re-sanitizes the header values. A control char in the
+		// project directory name can then never make the digest fail
+		// validation on load.
 		if (entry.type === "session") {
 			if (typeof entry.cwd === "string" && entry.cwd) digest.cwd = cleanName(entry.cwd, 2000);
 			if (typeof entry.id === "string" && entry.id) digest.sessionId = cleanName(entry.id, 200);
@@ -328,7 +326,7 @@ export function buildDigest(
 			digest.userPromptCount += 1;
 			const text = truncate(extractText(msg.content), PROMPT_MAX_CHARS);
 			if (text) {
-				// Bounded DURING the loop (keeps the newest) — a prompt-heavy
+				// Bound during the loop (keeps the newest). A prompt-heavy
 				// session must not build a 100k-element array before the cap.
 				if (digest.userPrompts.length >= PROMPT_CAP) digest.userPrompts.shift();
 				digest.userPrompts.push(text);
@@ -337,16 +335,14 @@ export function buildDigest(
 		}
 		if (msg.role === "assistant") {
 			if (typeof msg.stopReason === "string" && msg.stopReason) {
-				// Bounded and sanitized: a crafted session must not grow the
-				// stopReasons object without limit, and a crafted key must
-				// not insert control chars into the reflection. cleanName
-				// cuts by code points (a UTF-16 slice could split a
-				// surrogate pair) and strips lone surrogates.
+				// Bounded and sanitized. A crafted session must not grow the
+				// stopReasons object without limit. A crafted key must not
+				// insert control chars into the reflection. cleanName cuts
+				// by code points and strips lone surrogates.
 				const key = cleanName(msg.stopReason, 100);
 				if (key) {
-					// Object.hasOwn: a key naming an Object.prototype property
-					// ('constructor', 'toString', ...) must not be treated as
-					// an existing count (the inherited value is a function).
+					// Use Object.hasOwn. A key naming an Object.prototype
+					// property must not be treated as an existing count.
 					if (Object.hasOwn(digest.stopReasons, key)) {
 						digest.stopReasons[key] = (digest.stopReasons[key] ?? 0) + 1;
 					} else if (Object.keys(digest.stopReasons).length < 20) {
@@ -383,11 +379,10 @@ export function buildDigest(
 							if (oldest !== undefined) bashCommands.delete(oldest);
 						}
 					}
-					// Assistant trace: what the model actually DID, so the
-					// reflection can see silent mistakes (wrong file edited,
-					// destructive command that succeeded). Bounded DURING the
-					// loop (shift+push keeps the newest) so a 10k-call
-					// session does not build a 10k-element array.
+					// Assistant trace: what the model did. The reflection
+					// can then see silent mistakes. Bound during the loop
+					// (shift+push keeps the newest) so a 10k-call session
+					// does not build a 10k-element array.
 					if (b.type === "toolCall" && typeof b.name === "string") {
 						if (rawToolCalls.length >= TOOL_CALL_CAP) rawToolCalls.shift();
 						// cleanName strips control chars (a prompt-injected
@@ -403,10 +398,10 @@ export function buildDigest(
 		}
 
 		if (msg.role === "toolResult") {
-			// Real bash failures: the tool throws, so isError is true and the
-			// text ends with "Command exited with code N". A command that
-			// merely PRINTS "exit code: 5" (e.g. `echo "exit code: 5"`) exits
-			// 0 with isError false — it is not a failure.
+			// Real bash failures: the tool throws, so isError is true and
+			// the text ends with "Command exited with code N". A command
+			// that prints "exit code: 5" exits 0 with isError false. It is
+			// not a failure.
 			if (msg.toolName === "bash") {
 				if (msg.isError === true) {
 					const raw = typeof msg.toolCallId === "string" ? bashCommands.get(msg.toolCallId) : undefined;
@@ -452,9 +447,9 @@ export function buildDigest(
 		digest.failedCommands = digest.failedCommands.slice(-COMMAND_CAP);
 	}
 	// Stringify the kept trace calls (the raw buffers are already bounded).
-	// The replacer truncates string values so a huge field (e.g. a crafted
-	// write_file content) is not fully serialized; a circular or too-deep
-	// object throws, and the args are dropped rather than losing the digest.
+	// The replacer truncates string values. A huge field is then not fully
+	// serialized. A circular or too-deep object throws. The args are
+	// dropped rather than losing the digest.
 	for (const t of rawToolCalls) {
 		let args = "";
 		if (typeof t.args === "object" && t.args !== null) {
@@ -482,9 +477,10 @@ export function isNotable(digest: OuroborosDigest, minPrompts: number): boolean 
 	const hasAbnormalStop = Object.keys(digest.stopReasons).some((k) => !Object.hasOwn(BENIGN_STOP_REASONS, k));
 	if (hasAbnormalStop) return true;
 	if (digest.compactions > 0) return true;
-	// A long successful session is worth reflecting on, but only well above
-	// the default threshold — without a failure signal the model writes
-	// platitudes. userPromptCount is uncapped (userPrompts is capped at 12).
+	// A long successful session is worth reflecting on. It must be well
+	// above the default threshold. Without a failure signal the model
+	// writes platitudes. userPromptCount is uncapped (userPrompts is
+	// capped at 12).
 	return digest.userPromptCount >= Math.max(minPrompts, 20);
 }
 

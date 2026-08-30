@@ -202,6 +202,21 @@ describe("buildRulesAppendix", () => {
 		expect(body.length).toBeLessThanOrEqual(200);
 		expect(body.endsWith("…")).toBe(true);
 	});
+	test("a multi-MB rule is bounded before the code-point pass (Security9)", () => {
+		// A hand-edited rules.md can carry a multi-MB line. The truncation
+		// must not materialize a multi-MB array — the result is the same
+		// truncated candidate, bounded.
+		const appendix = buildRulesAppendix(["x".repeat(5_000_000) + "END"], 200);
+		expect(appendix).toContain("…");
+		expect(appendix.length).toBeLessThan(400);
+	});
+	test("a tiny remaining budget does not materialize the rule (Lifecycle3)", () => {
+		// When the budget is nearly exhausted, the truncation must bail out
+		// before slicing — a negative slice bound would return nearly the
+		// whole multi-MB rule.
+		const appendix = buildRulesAppendix(["x".repeat(5_000_000)], 200);
+		expect(appendix.length).toBeLessThan(400);
+	});
 	test("truncates oversized rules instead of dropping them", () => {
 		const rules = ["a".repeat(5000), "small rule"];
 		const appendix = buildRulesAppendix(rules, 200);

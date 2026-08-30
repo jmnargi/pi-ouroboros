@@ -8,8 +8,8 @@
  *   <dataDir>/skills/<name>/SKILL.md        — self-written skills (pi discovers
  *                                             these automatically at startup)
  *
- * All writes are atomic (temp + rename) and all reads degrade to empty state
- * on corrupt files — ouroboros must never crash pi over a half-written file.
+ * All writes are atomic (temp + rename). All reads return empty state on
+ * corrupt files. Ouroboros must never crash pi over a half-written file.
  */
 
 import { createHash } from "node:crypto";
@@ -73,10 +73,9 @@ export function skillsDir(dataDir: string): string {
 let rulesCache: { file: string; mtimeMs: number; size: number; rules: string[] } | null = null;
 /** File path of the last known-missing rules file (negative cache). */
 let rulesMissingFile: string | null = null;
-/** When rulesMissingFile was set — the negative cache is time-bounded so an
- * externally created rules.md (another pi instance, the user) is picked up. */
+/** The negative cache is time-bounded. An externally created rules.md is
+ * picked up. */
 let rulesMissingAt = 0;
-
 /** Load rules as a list of non-empty lines (comments starting with `#` kept). */
 export function loadRules(dataDir: string): string[] {
 	const file = rulesFile(dataDir);
@@ -84,16 +83,16 @@ export function loadRules(dataDir: string): string[] {
 	rulesMissingFile = null;
 	try {
 		const stat = fs.statSync(file);
-		// mtime + size: on coarse-granularity filesystems (1s), two writes in
-		// the same bucket are still caught by the size change.
+		// Use mtime + size. On coarse-granularity filesystems, two writes
+		// in the same second are caught by the size change.
 		if (rulesCache && rulesCache.file === file && rulesCache.mtimeMs === stat.mtimeMs && rulesCache.size === stat.size) {
 			return rulesCache.rules;
 		}
 		const text = fs.readFileSync(file, "utf8");
 		// Strip control chars and lone surrogates at the injection boundary
-		// too: rules written by older plugin versions (or hand-edited)
-		// bypass appendRule's strip. A lone surrogate in the system prompt
-		// can make the provider reject the request.
+		// too. Older plugin versions or hand-editing bypass appendRule's
+		// strip. A lone surrogate in the system prompt can make the
+		// provider reject the request.
 		const rules = text
 			.split("\n")
 			.map((l) =>
@@ -119,8 +118,8 @@ function invalidateRulesCache(): void {
 }
 
 /** Normalize a rule for near-duplicate detection (case, punctuation, spaces).
- * Unicode-aware: CJK/kana rules must keep their letters, or every non-Latin
- * rule would collapse to the empty key and only one could ever be stored. */
+ * Unicode-aware: CJK/kana rules must keep their letters. Otherwise every
+ * non-Latin rule collapses to the empty key. */
 function dedupKey(rule: string): string {
 	return rule
 		.toLowerCase()
@@ -149,9 +148,9 @@ export function appendRule(
 	cap: number = DEFAULT_RULES_CAP,
 	maxChars: number = DEFAULT_RULES_MAX_CHARS,
 ): { added: boolean; reason: "added" | "duplicate" | "conflict" | "empty"; count: number; cap: number } {
-	// Bypass the negative cache: a rules.md created by another process
-	// within the 1s window must be seen, or this write would clobber it.
-	invalidateRulesCache();
+	// Bypass the negative cache. A rules.md created by another process
+	// within the 1s window must be seen. Otherwise this write would
+	// clobber it.
 	// Strip control chars and lone surrogates: a rule is injected into the
 	// system prompt verbatim. The cap is by code points — a UTF-16 slice
 	// could split a surrogate pair and store a lone surrogate.
@@ -160,12 +159,16 @@ export function appendRule(
 		.replace(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g, "")
 		.trim()
 		.replace(/\s+/g, " ");
-	const chars = Array.from(normalized);
-	const capped = chars.length <= MAX_RULE_CHARS ? normalized : chars.slice(0, MAX_RULE_CHARS).join("");
-	// A rule with no letter or number content ('!!!', emoji-only) is not a
-	// lesson — and every such rule shares the empty dedupKey, so the first
-	// would silently shadow all later ones as 'duplicate'. Unicode-aware:
-	// CJK lessons (the model can write in any language) must be accepted.
+	// Bound the input before the code-point pass: a multi-MB lesson must
+	// not materialize a multi-MB array. MAX_RULE_CHARS*2+1 units cover the
+	// first MAX_RULE_CHARS code points even when every one is astral.
+	const bounded = normalized.slice(0, MAX_RULE_CHARS * 2 + 1);
+	const chars = Array.from(bounded);
+	const capped = chars.length <= MAX_RULE_CHARS ? bounded : chars.slice(0, MAX_RULE_CHARS).join("");
+	// A rule with no letter or number content is not a lesson. Every such
+	// rule shares the empty dedupKey. The first would shadow all later
+	// ones as 'duplicate'. Unicode-aware: CJK lessons (the model can write
+	// in any language) must be accepted.
 	if (!capped || !/[\p{L}\p{N}]/u.test(capped)) return { added: false, reason: "empty", count: loadRules(dataDir).length, cap };
 	for (let attempt = 0; attempt < 3; attempt++) {
 		const rules = loadRules(dataDir);
@@ -225,6 +228,7 @@ export function clearRules(dataDir: string): void {
 // ---------------------------------------------------------------------------
 /** Mark a digest as injected (renamed so listDigests skips it). */
 export function markDigestInjected(dataDir: string, sessionId: string): boolean {
+	if (digestsDirIsSymlink(dataDir)) return false;
 	const from = digestFile(dataDir, sessionId);
 	const to = `${from.slice(0, -".json".length)}.injected.json`;
 	// No existsSync pre-check: the rename itself is the atomic claim.
@@ -236,9 +240,20 @@ export function markDigestInjected(dataDir: string, sessionId: string): boolean 
 		return false;
 	}
 }
+/** True when the digests dir (or its parent) is a symlink. The digest
+ * read/delete path must never follow one: a symlinked digests dir would
+ * make the plugin read and delete arbitrary *.json files in the target. */
+function digestsDirIsSymlink(dataDir: string): boolean {
+	try {
+		return fs.lstatSync(ouroborosDir(dataDir)).isSymbolicLink() || fs.lstatSync(digestsDir(dataDir)).isSymbolicLink();
+	} catch {
+		return false; // missing dirs are fine
+	}
+}
 
 /** Undo an injection mark (rename back to pending) — for sendMessage failure. */
 export function unmarkDigestInjected(dataDir: string, sessionId: string): boolean {
+	if (digestsDirIsSymlink(dataDir)) return false;
 	const from = `${digestFile(dataDir, sessionId).slice(0, -".json".length)}.injected.json`;
 	const to = digestFile(dataDir, sessionId);
 	try {
@@ -248,8 +263,8 @@ export function unmarkDigestInjected(dataDir: string, sessionId: string): boolea
 		return false;
 	}
 }
-/** Injected digest session ids, newest first (by mtime, then name). */
 export function listInjectedDigests(dataDir: string): string[] {
+	if (digestsDirIsSymlink(dataDir)) return [];
 	try {
 		const dir = digestsDir(dataDir);
 		if (!fs.existsSync(dir)) return [];
@@ -275,8 +290,8 @@ export function listInjectedDigests(dataDir: string): string[] {
 }
 
 export function deleteInjectedDigest(dataDir: string, sessionId: string): boolean {
+	if (digestsDirIsSymlink(dataDir)) return false;
 	const file = `${digestFile(dataDir, sessionId).slice(0, -".json".length)}.injected.json`;
-	if (!fs.existsSync(file)) return false;
 	fs.rmSync(file, { force: true });
 	return true;
 }
@@ -306,13 +321,13 @@ function migrateDigest(p: unknown): unknown {
 	}
 	if (!Array.isArray(d.toolCalls)) d.toolCalls = [];
 	if (!Array.isArray(d.assistantText)) d.assistantText = [];
-	// Sanitize fields the round-8 validator rejects: strip the control-char
-	// class (including format controls) and re-bound the fields the round-7
-	// writer stored RAW (header fields, models, error tool names, tool
-	// names, stopReasons keys) so a pre-round-8 digest survives validation
-	// instead of being deleted. Only WELL-SHAPED elements are sanitized — a
-	// wrong-shaped element (never produced by any writer) is left untouched
-	// so the validator still rejects the digest as corrupt.
+	// Sanitize the fields the round-8 validator rejects. Strip the
+	// control-char class. Re-bound the fields the round-7 writer stored
+	// raw (header fields, models, error tool names, tool names,
+	// stopReasons keys). A pre-round-8 digest then survives validation.
+	// Only WELL-SHAPED elements are sanitized. A wrong-shaped element
+	// (never produced by any writer) is left untouched. The validator
+	// still rejects the digest as corrupt.
 	const strip = (s: unknown): string =>
 		typeof s === "string"
 			? s
@@ -334,8 +349,7 @@ function migrateDigest(p: unknown): unknown {
 	if (typeof d.startedAt === "string") d.startedAt = cpCut(strip(d.startedAt), 100);
 	if (typeof d.endedAt === "string") d.endedAt = cpCut(strip(d.endedAt), 100);
 	// Fields the round-7 writer already bounded are only control-char
-	// stripped (a longer value is corruption and must stay rejected — the
-	// validator's length checks catch it).
+	// stripped. A longer value is corruption and stays rejected.
 	if (Array.isArray(d.userPrompts)) d.userPrompts = d.userPrompts.map((s) => (typeof s === "string" ? strip(s) : s));
 	if (Array.isArray(d.assistantText)) d.assistantText = d.assistantText.map((s) => (typeof s === "string" ? strip(s) : s));
 	if (Array.isArray(d.toolCalls)) {
@@ -369,9 +383,9 @@ function migrateDigest(p: unknown): unknown {
 	// The round-7 writer stored models RAW and unbounded — re-bound both.
 	if (Array.isArray(d.models)) d.models = d.models.map((s) => (typeof s === "string" ? cpCut(strip(s), 200) : s)).slice(0, 20);
 	if (typeof d.stopReasons === "object" && d.stopReasons !== null && !Array.isArray(d.stopReasons)) {
-		// Null prototype: a '__proto__' key must be an own property, not
-		// swallowed by the Object.prototype setter (the writer already uses
-		// Object.create(null) — the load path must match).
+		// Use a null prototype. A '__proto__' key must be an own property.
+		// The writer already uses Object.create(null). The load path must
+		// match.
 		const cleaned: Record<string, number> = Object.create(null);
 		for (const [k, v] of Object.entries(d.stopReasons as Record<string, unknown>)) {
 			// Keys are sanitized (the round-7 writer stored them raw); values
@@ -387,9 +401,9 @@ function migrateDigest(p: unknown): unknown {
 }
 
 export function loadDigest(dataDir: string, sessionId: string): OuroborosDigest | null {
-	// A JSON.parse failure means the file is corrupt — return null so the
-	// caller deletes it. A readFileSync failure (EMFILE, EACCES, EIO) is
-	// transient — throw so the caller skips the digest and keeps the file.
+	// A JSON.parse failure means the file is corrupt. Return null so the
+	// caller deletes it. A readFileSync failure is transient. Throw so the
+	// caller skips the digest and keeps the file.
 	let text: string;
 	try {
 		text = fs.readFileSync(digestFile(dataDir, sessionId), "utf8");
@@ -408,9 +422,9 @@ export function loadDigest(dataDir: string, sessionId: string): OuroborosDigest 
 
 /** Load a digest that is currently marked injected (awaiting delivery). */
 export function readInjectedDigest(dataDir: string, sessionId: string): OuroborosDigest | null {
-	// Same corrupt-vs-transient split as loadDigest: a parse failure is
-	// corruption (null -> the caller deletes the marker); an IO failure is
-	// transient (throw -> the caller keeps the marker for the next start).
+	// Use the same corrupt-vs-transient split as loadDigest. A parse
+	// failure is corruption. The caller deletes the marker. An IO failure
+	// is transient. The caller keeps the marker.
 	let text: string;
 	try {
 		const file = `${digestFile(dataDir, sessionId).slice(0, -".json".length)}.injected.json`;
@@ -428,8 +442,8 @@ export function readInjectedDigest(dataDir: string, sessionId: string): Ouroboro
 	return isValidDigest(migrated) ? (migrated as OuroborosDigest) : null;
 }
 
-/** The last session's digest, kept for /ouroboros digest (pending digests
- * are consumed at the next session start, so the command reads this copy). */
+/** The last session's digest, kept for /ouroboros digest. Pending digests
+ * are consumed at the next session start. The command reads this copy. */
 export function lastDigestFile(dataDir: string): string {
 	return path.join(ouroborosDir(dataDir), "last-digest.json");
 }
@@ -454,28 +468,28 @@ export function loadLastDigest(dataDir: string): OuroborosDigest | null {
 	}
 }
 export function deleteDigest(dataDir: string, sessionId: string): boolean {
+	if (digestsDirIsSymlink(dataDir)) return false;
 	const file = digestFile(dataDir, sessionId);
 	if (!fs.existsSync(file)) return false;
-	// force: true — the file can vanish between the check and the delete
-	// (concurrent cleanup by another pi instance).
+	// Use force: true. The file can vanish between the check and the
+	// delete.
 	fs.rmSync(file, { force: true });
 	return true;
 }
 
-/** Pending digest session ids, newest first (by mtime, then name). */
 export function listDigests(dataDir: string): string[] {
+	if (digestsDirIsSymlink(dataDir)) return [];
 	try {
 		const dir = digestsDir(dataDir);
 		if (!fs.existsSync(dir)) return [];
-		// Stat each file ONCE, then sort — a comparator calling statSync is
-		// O(n log n) syscalls (measured: 241k statx for 10k digests). One
-		// unstatable file (broken symlink, concurrent delete) must not fail
-		// the whole listing.
+		// Stat each file once, then sort. A comparator calling statSync is
+		// O(n log n) syscalls. One unstatable file (broken symlink,
+		// concurrent delete) must not fail the whole listing.
 		const entries: Array<{ name: string; mtime: number }> = [];
 		for (const f of fs.readdirSync(dir)) {
 			if (!f.endsWith(".json") || f.endsWith(".injected.json")) continue;
-			// Only names that round-trip through safeSessionId are listed —
-			// a hand-created "a.b.json" would otherwise be listed but never
+			// List only names that round-trip through safeSessionId. A
+			// hand-created "a.b.json" would otherwise be listed but never
 			// loadable or deletable. Hashed names (sid-h-<16hex>) round-trip
 			// because safeSessionId is idempotent for that shape.
 			const stem = f.slice(0, -".json".length);
@@ -500,9 +514,8 @@ export function isValidDigest(p: unknown): p is OuroborosDigest {
 	// reach the reflection message. The writer and migrateDigest strip
 	// them; this is the last line of defense.
 	const LONE_SURROGATE = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
-	// The writer caps by CODE POINTS (truncate/truncateTail/cleanName use
-	// Array.from) — the validator must measure the same way, or astral-heavy
-	// content (emoji) would fail validation and lose the reflection.
+	// The writer caps by code points. The validator must measure the same
+	// way. Otherwise astral-heavy content would fail validation.
 	const cpLen = (s: string): number => Array.from(s).length;
 	const clean = (v: unknown, max: number): v is string =>
 		typeof v === "string" && cpLen(v) <= max && !/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f]/.test(v) && !LONE_SURROGATE.test(v);
@@ -598,14 +611,15 @@ export function writeSkill(dataDir: string, name: string, description: string, b
 	const dir = path.join(skillsDir(dataDir), name);
 	const file = path.join(dir, "SKILL.md");
 	fs.mkdirSync(dir, { recursive: true });
-	// JSON.stringify produces a valid YAML double-quoted scalar: descriptions
-	// with colons, leading dashes, or YAML-reserved words must not break the
-	// frontmatter (pi silently skips skills with unparseable frontmatter).
+	// JSON.stringify produces a valid YAML double-quoted scalar.
+	// Descriptions with colons or leading dashes must not break the
+	// frontmatter.
 	const content = `---\nname: ${name}\ndescription: ${JSON.stringify(normalizeDescription(description))}\n---\n\n${body.trim()}\n`;
-	// The no-overwrite check must be atomic: two concurrent writers can both
-	// pass an existsSync pre-check, then the second rename would overwrite
-	// the first. Write a unique tmp, then link it to the final name — link
-	// fails with EEXIST if the target exists. The tmp is then removed.
+	// The no-overwrite check must be atomic. Two concurrent writers can
+	// both pass an existsSync pre-check. The second rename would then
+	// overwrite the first. Write a unique tmp, then link it to the final
+	// name. Link fails with EEXIST if the target exists. The tmp is then
+	// removed.
 	const tmp = `${file}.${process.pid}.${Date.now()}.${tmpCounter++}.tmp`;
 	const fd = fs.openSync(tmp, "wx");
 	try {
@@ -628,14 +642,19 @@ export function writeSkill(dataDir: string, name: string, description: string, b
 		}
 		if (code === "EPERM" || code === "ENOTSUP" || code === "ENOSYS" || code === "EOPNOTSUPP") {
 			// The filesystem has no hard links (FAT32, exFAT, some network
-			// mounts): fall back to an exclusive open of the final path
-			// ('wx' = O_CREAT|O_EXCL). The no-overwrite guarantee holds; a
-			// crash mid-write can leave a partial file (accepted).
+			// mounts). Fall back to an exclusive open of the final path.
+			// The no-overwrite guarantee holds. A crash mid-write can leave
+			// a partial file (accepted).
 			try {
 				const fd2 = fs.openSync(file, "wx");
 				try {
 					fs.writeFileSync(fd2, content);
 					fs.fsyncSync(fd2);
+				} catch (err2) {
+					// A thrown write (disk full, IO error) must not leave a
+					// partial file that blocks future writes of this name.
+					fs.rmSync(file, { force: true });
+					throw err2;
 				} finally {
 					fs.closeSync(fd2);
 				}
@@ -686,18 +705,29 @@ export function cleanupStaleTmp(dataDir: string, maxAgeMs: number = 60 * 60 * 10
 	const cutoff = Date.now() - maxAgeMs;
 	// atomicWrite is used for rules, digests, AND skills. Skill tmps are
 	// stored one level deeper: skills/<name>/SKILL.md.*.tmp.
-	// The top-level dirs are lstat-checked too: a symlinked ouroboros or
-	// digests dir must not make the cleanup delete *.tmp files inside an
-	// arbitrary target (readdirSync follows links).
+	// Lstat-check every scanned dir. A symlinked ouroboros, digests, or
+	// skills dir must not make the cleanup delete *.tmp files inside an
+	// arbitrary target. The digests dir is only scanned when the ouroboros
+	// dir is real. A symlinked ouroboros dir makes the digests path
+	// resolve inside the target.
 	const dirs: string[] = [];
-	for (const dir of [ouroborosDir(dataDir), digestsDir(dataDir)]) {
+	const ouroboros = ouroborosDir(dataDir);
+	let ouroborosReal = false;
+	try {
+		ouroborosReal = !fs.lstatSync(ouroboros).isSymbolicLink();
+		if (ouroborosReal) dirs.push(ouroboros);
+	} catch {
+		// missing — nothing to scan
+	}
+	if (ouroborosReal) {
 		try {
-			if (!fs.lstatSync(dir).isSymbolicLink()) dirs.push(dir);
+			if (!fs.lstatSync(digestsDir(dataDir)).isSymbolicLink()) dirs.push(digestsDir(dataDir));
 		} catch {
 			// missing — nothing to scan
 		}
 	}
 	try {
+		if (fs.lstatSync(skillsDir(dataDir)).isSymbolicLink()) return;
 		// Only real directories are scanned — a symlinked skill dir must
 		// not make the cleanup delete *.tmp files inside an arbitrary
 		// target (readdirSync follows links).
@@ -735,14 +765,14 @@ function atomicWrite(file: string, content: string): void {
 	// pid + ms + monotonic counter: unique even for concurrent writes from
 	// the same process in the same millisecond.
 	const tmp = `${file}.${process.pid}.${Date.now()}.${tmpCounter++}.tmp`;
-	// "wx" = O_CREAT|O_EXCL: a pre-created symlink at the tmp path fails the
-	// open instead of being followed (TOCTOU symlink redirect).
+	// "wx" = O_CREAT|O_EXCL. A pre-created symlink at the tmp path fails
+	// the open instead of being followed.
 	const fd = fs.openSync(tmp, "wx");
 	try {
 		fs.writeFileSync(fd, content);
-		// fsync before rename: on power loss, ext4 delayed allocation can
-		// make the rename durable before the data blocks, leaving an empty
-		// file.
+		// Fsync before rename. On power loss, ext4 delayed allocation can
+		// make the rename durable before the data blocks. This leaves an
+		// empty file.
 		fs.fsyncSync(fd);
 	} catch (err) {
 		// A failed write (disk full, IO error) must not leak the tmp.

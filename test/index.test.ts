@@ -385,6 +385,19 @@ describe("session_start", () => {
 		await api.fire("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }] });
 		expect(readdirSync(digestsDir(dataDir))).toEqual(["sess-1.injected.json"]);
 	});
+	test("agent_end deletes a marker whose reflection is in the session history (Security9)", async () => {
+		// A failed run drained the reflection (persisted in the history)
+		// and an auto-retry succeeded: the retry's messages do not contain
+		// the custom message, but the session history does — the marker
+		// must be deleted, not re-injected at the next session start.
+		saveDigest(dataDir, buildDigest(notableEntries(), "sess-1", "/proj", "2026-08-30T12:00:00.000Z"));
+		markDigestInjected(dataDir, "sess-1");
+		const handler = api.fire.bind(api, "session_start");
+		await handler({ reason: "reload" }, fakeCtx());
+		const entries = [{ type: "custom_message", customType: OUROBOROS_CUSTOM_TYPE, content: "[Ouroboros] ...\nsession: sess-1\ncwd: /proj" }];
+		await api.fire("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }] }, fakeCtx({ sessionManager: { getEntries: () => entries } }));
+		expect(readdirSync(digestsDir(dataDir))).toEqual([]);
+	});
 	test("a recovered digest that is no longer notable has its marker removed (TestQuality3)", async () => {
 		// PI_OUROBOROS_REFLECT_MIN_PROMPTS can be raised between sessions:
 		// a digest that was notable at capture is not notable now. The

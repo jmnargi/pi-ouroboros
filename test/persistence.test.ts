@@ -238,6 +238,20 @@ describe("digests", () => {
 		expect(deleteDigest(dir, "sess-abc")).toBe(false);
 		expect(listDigests(dir)).toEqual([]);
 	});
+	test("a symlinked digests dir is never read or deleted through (Security9)", () => {
+		const dir = tmpDataDir();
+		// A symlinked digests dir pointing at a victim directory: the
+		// plugin must not list, read, or delete the victim's *.json files.
+		const victim = fs.mkdtempSync(path.join(os.tmpdir(), "ouroboros-victim-"));
+		tmpDirs.push(victim);
+		fs.writeFileSync(path.join(victim, "package.json"), "{}");
+		fs.mkdirSync(path.join(dir, "ouroboros"), { recursive: true });
+		fs.symlinkSync(victim, path.join(dir, "ouroboros", "digests"));
+		expect(listDigests(dir)).toEqual([]);
+		expect(listInjectedDigests(dir)).toEqual([]);
+		expect(deleteDigest(dir, "package")).toBe(false);
+		expect(fs.existsSync(path.join(victim, "package.json"))).toBe(true);
+	});
 
 	test("loadDigest rejects corrupt files", () => {
 		const dir = tmpDataDir();
@@ -506,6 +520,34 @@ describe("digests", () => {
 		cleanupStaleTmp(dir);
 		expect(fs.existsSync(oldTmp)).toBe(true);
 	});
+	test("cleanupStaleTmp does not follow a symlinked ouroboros dir with a digests subdir (FixAudit10)", () => {
+		const dir = tmpDataDir();
+		// The target has a REAL digests subdir with an old tmp: the
+		// digests-dir lstat would resolve inside the symlink target and
+		// delete it. The ouroboros-dir check must gate the digests scan.
+		const target = fs.mkdtempSync(path.join(os.tmpdir(), "ouroboros-target-"));
+		tmpDirs.push(target);
+		fs.mkdirSync(path.join(target, "digests"), { recursive: true });
+		const oldTmp = path.join(target, "digests", "victim.tmp");
+		fs.writeFileSync(oldTmp, "x");
+		const old = new Date(Date.now() - 2 * 60 * 60 * 1000);
+		fs.utimesSync(oldTmp, old, old);
+		fs.symlinkSync(target, path.join(dir, "ouroboros"));
+		cleanupStaleTmp(dir);
+		expect(fs.existsSync(oldTmp)).toBe(true);
+	});
+	test("writeSkill re-throws a non-EEXIST link error and cleans its tmp (TestQuality4)", () => {
+		const dir = tmpDataDir();
+		// A directory at the SKILL.md path makes linkSync fail with EPERM
+		// on Linux. The fallback's openSync(file, "wx") then fails with
+		// EEXIST (the directory exists) — the friendly 'already exists'
+		// error proves the fallback ran (a revert would re-throw the raw
+		// EPERM instead).
+		const skillDir = path.join(dir, "skills", "my-skill");
+		fs.mkdirSync(path.join(skillDir, "SKILL.md"), { recursive: true });
+		expect(() => writeSkill(dir, "my-skill", "desc", "body")).toThrow(/already exists/);
+		expect(fs.readdirSync(skillDir).filter((f) => f.endsWith(".tmp"))).toEqual([]);
+	});
 	test("writeSkill refuses to overwrite atomically (Security7)", () => {
 		// The no-overwrite contract is pinned here; the atomicity property
 		// (two concurrent writers cannot both pass the check) is verified
@@ -524,11 +566,13 @@ describe("digests", () => {
 	test("writeSkill re-throws a non-EEXIST link error and cleans its tmp (TestQuality4)", () => {
 		const dir = tmpDataDir();
 		// A directory at the SKILL.md path makes linkSync fail with EPERM
-		// on Linux — the error must be re-thrown (not 'already exists') and
-		// the tmp file must be removed.
+		// on Linux. The fallback's openSync(file, "wx") then fails with
+		// EEXIST (the directory exists) — the friendly 'already exists'
+		// error proves the fallback ran (a revert would re-throw the raw
+		// EPERM instead).
 		const skillDir = path.join(dir, "skills", "my-skill");
 		fs.mkdirSync(path.join(skillDir, "SKILL.md"), { recursive: true });
-		expect(() => writeSkill(dir, "my-skill", "desc", "body")).toThrow();
+		expect(() => writeSkill(dir, "my-skill", "desc", "body")).toThrow(/already exists/);
 		expect(fs.readdirSync(skillDir).filter((f) => f.endsWith(".tmp"))).toEqual([]);
 	});
 
