@@ -10,6 +10,16 @@
  * The extractor is defensive: it walks unknown entry shapes with optional
  * chaining and never throws on a malformed entry — a corrupt session must
  * degrade to an empty digest, not crash the shutdown hook.
+ *
+ * Session entry shape (verified against real pi.dev 0.82.1 session files):
+ * every message is `{ type: "message", message: AgentMessage }`.
+ *   - Tool results: `message.role === "toolResult"` with `isError`/`toolName`
+ *     on the message object.
+ *   - Bash tool calls: stored as toolResult with `toolName: "bash"` and the
+ *     exit code embedded in the text content ("exit code: N"); the command
+ *     text lives on the preceding assistant toolCall (matched by toolCallId).
+ *   - The documented `bashExecution` role (command/exitCode on the message)
+ *     is also handled, for other bash paths and future versions.
  */
 
 export interface OuroborosDigest {
@@ -40,6 +50,9 @@ export const PROMPT_MAX_CHARS = 240;
 export const ERROR_MAX_CHARS = 160;
 export const COMMAND_MAX_CHARS = 160;
 
+/** Matches "exit code: 1" / "exit code 2" / "exit code: 0" in bash output. */
+const EXIT_CODE_RE = /exit code:?\s*(\d+)/i;
+
 /** Minimal structural view of a session entry (defensive). */
 interface RawEntry {
 	type?: unknown;
@@ -49,13 +62,15 @@ interface RawEntry {
 		stopReason?: unknown;
 		model?: unknown;
 		usage?: { input?: unknown; output?: unknown; cost?: { total?: unknown } };
+		isError?: unknown;
+		toolName?: unknown;
+		toolCallId?: unknown;
+		command?: unknown;
+		exitCode?: unknown;
 	};
-	isError?: unknown;
-	toolName?: unknown;
-	command?: unknown;
-	exitCode?: unknown;
 	cwd?: unknown;
 	id?: unknown;
+	timestamp?: unknown;
 }
 
 /** Extract plain text from a message content (string or content blocks). */
@@ -86,14 +101,21 @@ function asNumber(v: unknown): number {
 /**
  * Build a digest from raw session entries. `sessionId`/`cwd` fall back to the
  * session header entry when present; `endedAt` is the caller-provided wall
- * clock (the shutdown moment).
+ * clock (the shutdown moment); `startedAt` is the caller-provided header
+ * timestamp when available.
  */
-export function buildDigest(entries: unknown[], sessionId: string, cwd: string, endedAt: string): OuroborosDigest {
+export function buildDigest(
+	entries: unknown[],
+	sessionId: string,
+	cwd: string,
+	endedAt: string,
+	startedAt: string = "",
+): OuroborosDigest {
 	const digest: OuroborosDigest = {
 		version: 1,
 		sessionId,
 		cwd,
-		startedAt: "",
+		startedAt,
 		endedAt,
 		userPrompts: [],
 		errors: [],
@@ -108,18 +130,18 @@ export function buildDigest(entries: unknown[], sessionId: string, cwd: string, 
 	const seenModels = new Set<string>();
 	const seenErrors = new Set<string>();
 	const seenCommands = new Set<string>();
+	/** toolCallId → bash command, from assistant toolCalls. */
+	const bashCommands = new Map<string, string>();
 
 	for (const raw of entries) {
 		if (!raw || typeof raw !== "object") continue;
 		const entry = raw as RawEntry;
 
-		// Session header: cwd + id + start time.
+		// Session header (present in tests; getEntries() excludes it in pi).
 		if (entry.type === "session") {
 			if (typeof entry.cwd === "string" && entry.cwd) digest.cwd = entry.cwd;
 			if (typeof entry.id === "string" && entry.id) digest.sessionId = entry.id;
-			if (typeof (entry as { timestamp?: unknown }).timestamp === "string") {
-				digest.startedAt = (entry as { timestamp: string }).timestamp;
-			}
+			if (typeof entry.timestamp === "string" && entry.timestamp) digest.startedAt = entry.timestamp;
 			continue;
 		}
 
@@ -133,11 +155,11 @@ export function buildDigest(entries: unknown[], sessionId: string, cwd: string, 
 		const msg = entry.message;
 		digest.messageCount += 1;
 
-		// Bash executions are stored as messages with role "bashExecution".
+		// Documented bashExecution role (command/exitCode on the message).
 		if (msg.role === "bashExecution") {
-			const code = asNumber(entry.exitCode);
-			if (code !== 0 && typeof entry.command === "string" && entry.command.trim()) {
-				const cmd = truncate(entry.command, COMMAND_MAX_CHARS);
+			const code = asNumber(msg.exitCode);
+			if (code !== 0 && typeof msg.command === "string" && msg.command.trim()) {
+				const cmd = truncate(msg.command, COMMAND_MAX_CHARS);
 				if (!seenCommands.has(cmd)) {
 					seenCommands.add(cmd);
 					digest.failedCommands.push(cmd);
@@ -166,16 +188,43 @@ export function buildDigest(entries: unknown[], sessionId: string, cwd: string, 
 				digest.usage.output += asNumber(usage.output);
 				digest.usage.cost += asNumber(usage.cost?.total);
 			}
+			// Remember bash commands so their tool results can be attributed.
+			if (Array.isArray(msg.content)) {
+				for (const block of msg.content) {
+					if (!block || typeof block !== "object") continue;
+					const b = block as { type?: unknown; name?: unknown; id?: unknown; arguments?: { command?: unknown } };
+					if (b.type === "toolCall" && b.name === "bash" && typeof b.id === "string" && typeof b.arguments?.command === "string") {
+						bashCommands.set(b.id, b.arguments.command);
+					}
+				}
+			}
 			continue;
 		}
 
-		if (msg.role === "toolResult" && entry.isError === true) {
-			const tool = typeof entry.toolName === "string" ? entry.toolName : "tool";
-			const summary = truncate(extractText(msg.content), ERROR_MAX_CHARS) || "(no output)";
-			const key = `${tool}:${summary}`;
-			if (!seenErrors.has(key)) {
-				seenErrors.add(key);
-				digest.errors.push({ tool, summary });
+		if (msg.role === "toolResult") {
+			// Bash tool results carry the exit code in the text content.
+			if (msg.toolName === "bash") {
+				const text = extractText(msg.content);
+				const match = EXIT_CODE_RE.exec(text);
+				if (match && match[1] !== "0") {
+					const command = typeof msg.toolCallId === "string" ? bashCommands.get(msg.toolCallId) : undefined;
+					const cmd = truncate(command ?? "(unknown command)", COMMAND_MAX_CHARS);
+					if (!seenCommands.has(cmd)) {
+						seenCommands.add(cmd);
+						digest.failedCommands.push(cmd);
+					}
+				}
+				continue;
+			}
+			// Other failed tools: isError/toolName on the message object.
+			if (msg.isError === true) {
+				const tool = typeof msg.toolName === "string" ? msg.toolName : "tool";
+				const summary = truncate(extractText(msg.content), ERROR_MAX_CHARS) || "(no output)";
+				const key = `${tool}:${summary}`;
+				if (!seenErrors.has(key)) {
+					seenErrors.add(key);
+					digest.errors.push({ tool, summary });
+				}
 			}
 			continue;
 		}
@@ -193,7 +242,7 @@ export function buildDigest(entries: unknown[], sessionId: string, cwd: string, 
 export function isNotable(digest: OuroborosDigest, minPrompts: number): boolean {
 	if (digest.errors.length > 0) return true;
 	if (digest.failedCommands.length > 0) return true;
-	if ((digest.stopReasons.length ?? 0) > 0) return true;
+	if (Object.keys(digest.stopReasons).length > 0) return true;
 	if (digest.compactions > 0) return true;
 	return digest.userPrompts.length >= minPrompts;
 }

@@ -33,8 +33,10 @@ import {
 	DEFAULT_REFLECT_MIN_PROMPTS,
 	DEFAULT_RULES_CAP,
 	DEFAULT_RULES_MAX_CHARS,
+	deleteInjectedDigest,
+	listInjectedDigests,
+	markDigestInjected,
 	deleteDigest,
-	digestFile,
 	listDigests,
 	loadDigest,
 	listSkills,
@@ -63,9 +65,9 @@ interface UiHost {
 
 function envInt(name: string, fallback: number): number {
 	const raw = process.env[name];
-	if (!raw) return fallback;
+	if (!raw || !/^\d+$/.test(raw)) return fallback;
 	const n = Number.parseInt(raw, 10);
-	return Number.isFinite(n) && n > 0 ? n : fallback;
+	return n > 0 ? n : fallback;
 }
 
 export default function (pi: ExtensionAPI): void {
@@ -98,9 +100,9 @@ export default function (pi: ExtensionAPI): void {
 
 	const sessionIdOf = (ctx: { sessionManager?: { getSessionId?(): string } }): string => {
 		try {
-			return ctx.sessionManager?.getSessionId?.() ?? "unknown";
+			return ctx.sessionManager?.getSessionId?.() ?? "";
 		} catch {
-			return "unknown";
+			return "";
 		}
 	};
 
@@ -116,10 +118,15 @@ export default function (pi: ExtensionAPI): void {
 	// Session end: digest the session that just finished
 	// ------------------------------------------------------------------
 	pi.on("session_shutdown", (event, ctx) => {
-		if (event.reason !== "quit" && event.reason !== "new") return;
+		// Digest every finished session (quit/new/resume/fork). "reload" keeps
+		// the same session alive, so it must not produce a digest.
+		if (event.reason === "reload") return;
 		try {
+			const sessionId = sessionIdOf(ctx);
+			if (!sessionId) return; // ephemeral/teardown — nothing to key on
 			const entries = ctx.sessionManager.getEntries() as unknown[];
-			const digest = buildDigest(entries, sessionIdOf(ctx), cwdOf(ctx), new Date().toISOString());
+			const header = ctx.sessionManager.getHeader?.() as { timestamp?: string } | undefined;
+			const digest = buildDigest(entries, sessionId, cwdOf(ctx), new Date().toISOString(), header?.timestamp ?? "");
 			saveDigest(dataDir, digest);
 		} catch {
 			// teardown race — best-effort
@@ -147,10 +154,13 @@ export default function (pi: ExtensionAPI): void {
 					continue;
 				}
 				pi.sendMessage(
-					{ customType: OUROBOROS_CUSTOM_TYPE, content: buildReflectionMessage(digest), display: true },
+					{ customType: OUROBOROS_CUSTOM_TYPE, content: buildReflectionMessage(digest, rulesFile(dataDir)), display: true },
 					{ deliverAs: "nextTurn" },
 				);
-				deleteDigest(dataDir, sid);
+				// Mark injected, do not delete: if the user quits before the
+				// next prompt, the digest survives (marked) and is cleaned up
+				// when a turn actually starts.
+				markDigestInjected(dataDir, sid);
 			}
 		} catch {
 			// best-effort
@@ -163,6 +173,11 @@ export default function (pi: ExtensionAPI): void {
 	// ------------------------------------------------------------------
 
 	pi.on("before_agent_start", (event) => {
+		// The queued reflection is delivered in this turn — clean up any
+		// injected digests that were never consumed.
+		for (const sid of listInjectedDigests(dataDir)) {
+			deleteInjectedDigest(dataDir, sid);
+		}
 		const rules = loadRules(dataDir);
 		if (rules.length === 0) return;
 		return { systemPrompt: `${event.systemPrompt}${buildRulesAppendix(rules, rulesMaxChars)}` };
@@ -267,7 +282,7 @@ export default function (pi: ExtensionAPI): void {
 					const entries = cmdCtx.sessionManager.getEntries() as unknown[];
 					const digest = buildDigest(entries, sessionIdOf(cmdCtx), cwdOf(cmdCtx), new Date().toISOString());
 					pi.sendMessage(
-						{ customType: OUROBOROS_CUSTOM_TYPE, content: buildReflectionMessage(digest), display: true },
+						{ customType: OUROBOROS_CUSTOM_TYPE, content: buildReflectionMessage(digest, rulesFile(dataDir)), display: true },
 						{ deliverAs: "nextTurn" },
 					);
 					if (cmdCtx.hasUI) cmdCtx.ui.notify("ouroboros: reflection queued for the next turn", "info");

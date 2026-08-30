@@ -11,12 +11,17 @@ import {
 	appendRule,
 	clearRules,
 	deleteDigest,
+	deleteInjectedDigest,
 	digestFile,
 	loadDigest,
 	loadRules,
 	listDigests,
+	listInjectedDigests,
 	listSkills,
+	markDigestInjected,
+	normalizeDescription,
 	rulesFile,
+	safeSessionId,
 	saveDigest,
 	writeSkill,
 	isValidSkillName,
@@ -60,6 +65,15 @@ describe("rules", () => {
 		expect(loadRules(dir)).toHaveLength(5);
 		appendRule(dir, "rule 5", 5);
 		expect(loadRules(dir)).toEqual(["rule 1", "rule 2", "rule 3", "rule 4", "rule 5"]);
+	});
+
+	test("appendRule truncates oversized rules and reports real count on empty", () => {
+		const dir = tmpDataDir();
+		appendRule(dir, "keep me");
+		const long = "x".repeat(2000);
+		expect(appendRule(dir, long).added).toBe(true);
+		expect(loadRules(dir)[1]).toHaveLength(500);
+		expect(appendRule(dir, "   ")).toEqual({ added: false, count: 2, cap: 50 });
 	});
 
 	test("clearRules empties the file", () => {
@@ -114,6 +128,24 @@ describe("digests", () => {
 		fs.writeFileSync(path.join(path.dirname(digestFile(dir, "x")), "notes.txt"), "hi");
 		expect(listDigests(dir)).toEqual(["sess-abc"]);
 	});
+
+	test("safeSessionId neutralizes path traversal", () => {
+		expect(safeSessionId("01a05380-28c8-7dad-8e5b-165ba08ccd7a")).toBe("01a05380-28c8-7dad-8e5b-165ba08ccd7a");
+		expect(safeSessionId("../../etc/passwd")).not.toContain("..");
+		expect(safeSessionId("../../etc/passwd")).not.toContain("/");
+		expect(digestFile("/tmp", "../../etc/passwd")).not.toContain("..");
+	});
+
+	test("injected digests are marked, listed, and deleted separately", () => {
+		const dir = tmpDataDir();
+		saveDigest(dir, digest());
+		expect(markDigestInjected(dir, "sess-abc")).toBe(true);
+		expect(listDigests(dir)).toEqual([]); // no longer pending
+		expect(listInjectedDigests(dir)).toEqual(["sess-abc"]);
+		expect(deleteInjectedDigest(dir, "sess-abc")).toBe(true);
+		expect(listInjectedDigests(dir)).toEqual([]);
+		expect(markDigestInjected(dir, "sess-abc")).toBe(false); // already gone
+	});
 });
 
 describe("skills", () => {
@@ -142,5 +174,13 @@ describe("skills", () => {
 		const dir = tmpDataDir();
 		fs.mkdirSync(path.join(dir, "skills", "empty"), { recursive: true });
 		expect(listSkills(dir)).toEqual([]);
+	});
+});
+
+describe("normalizeDescription", () => {
+	test("collapses newlines and whitespace to a single line", () => {
+		expect(normalizeDescription("Run the test suite\nafter any refactor")).toBe("Run the test suite after any refactor");
+		expect(normalizeDescription("  a   b  ")).toBe("a b");
+		expect(normalizeDescription("---\nname: other\n---")).toBe("--- name: other ---");
 	});
 });

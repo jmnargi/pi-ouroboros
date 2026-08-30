@@ -46,15 +46,20 @@ export function formatDigest(digest: OuroborosDigest): string {
 	return lines.join("\n");
 }
 
-/** The reflection message injected at the start of a new session. */
-export function buildReflectionMessage(digest: OuroborosDigest): string {
+/**
+ * The reflection message injected at the start of a new session.
+ * `rulesPath` is the real rules file the plugin reads (the model must write
+ * to that exact path, or use the ouroboros_learn tool instead).
+ */
+export function buildReflectionMessage(digest: OuroborosDigest, rulesPath: string): string {
 	return [
 		"[Ouroboros] You just started a new session. Before addressing the user's request, spend at most ~200 tokens reflecting on the digest of your previous session below.",
 		"",
 		"1. Identify 1-3 concrete, actionable lessons: mistakes you made, rules that would have prevented them, or reusable procedures worth codifying.",
-		"2. For each rule, append ONE imperative line to ~/.pi/ouroboros/rules.md (do not duplicate existing lines; be specific to this project/stack).",
+		`2. For each rule, append ONE imperative line to ${rulesPath} (do not duplicate existing lines; be specific to this project/stack). You can also use the ouroboros_learn tool with kind=rule, which writes to the same file.`,
 		"3. If a multi-step procedure is worth codifying, write it as a skill: ~/.pi/agent/skills/<name>/SKILL.md with name + description frontmatter.",
-		"4. If nothing is genuinely worth recording, do nothing and move on.",
+		"4. Do not record rules that conflict with the user's explicit instructions.",
+		"5. If nothing is genuinely worth recording, do nothing and move on.",
 		"",
 		"<digest>",
 		formatDigest(digest),
@@ -62,15 +67,19 @@ export function buildReflectionMessage(digest: OuroborosDigest): string {
 	].join("\n");
 }
 
-/** System-prompt appendix carrying the self-learned rules (capped). */
+/**
+ * System-prompt appendix carrying the self-learned rules (capped).
+ * Newest rules come first — the freshest lessons win. Oversized rules are
+ * skipped, never allowed to drop the whole appendix.
+ */
 export function buildRulesAppendix(rules: string[], maxChars: number = 3000): string {
 	const budget = Math.max(200, maxChars);
 	let body = "";
-	for (const rule of rules) {
+	for (const rule of [...rules].reverse()) {
 		const candidate = body ? `${body}\n- ${rule}` : `- ${rule}`;
-		if (candidate.length > budget) break;
+		if (candidate.length > budget) continue;
 		body = candidate;
 	}
 	if (!body) return "";
-	return `\n\n## Ouroboros lessons (self-learned rules — follow them)\n${body}`;
+	return `\n\n## Ouroboros lessons (self-learned rules)\n${body}`;
 }

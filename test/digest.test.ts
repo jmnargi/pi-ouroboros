@@ -31,18 +31,34 @@ function assistantMessage(over: Record<string, unknown> = {}): Record<string, un
 	});
 }
 
+// Real session shape: isError/toolName live on entry.message (session-format.md).
 function toolError(toolName: string, text: string): Record<string, unknown> {
 	return entry({
-		message: { role: "toolResult", content: [{ type: "text", text }] },
-		isError: true,
-		toolName,
+		message: { role: "toolResult", content: [{ type: "text", text }], isError: true, toolName },
+	});
+}
+// Real session shape: bash tool calls are toolResult entries with the exit
+// code in the text; the command lives on the matching assistant toolCall.
+function bashToolCall(id: string, command: string): Record<string, unknown> {
+	return entry({
+		message: {
+			role: "assistant",
+			content: [{ type: "toolCall", id, name: "bash", arguments: { command } }],
+			stopReason: "toolUse",
+		},
 	});
 }
 
-function bashFailure(command: string, exitCode = 1): Record<string, unknown> {
-	return entry({ message: { role: "bashExecution" }, command, exitCode });
+function bashToolResult(id: string, text: string): Record<string, unknown> {
+	return entry({
+		message: { role: "toolResult", toolCallId: id, toolName: "bash", content: [{ type: "text", text }], isError: false },
+	});
 }
 
+// Documented bashExecution role (command/exitCode on the message).
+function bashFailure(command: string, exitCode = 1): Record<string, unknown> {
+	return entry({ message: { role: "bashExecution", command, exitCode } });
+}
 describe("buildDigest", () => {
 	test("extracts user prompts, errors, failed commands, stop reasons, usage", () => {
 		const entries = [
@@ -67,6 +83,32 @@ describe("buildDigest", () => {
 		expect(d.models).toEqual(["vitruvix-code", "vitruvix-high"]);
 		expect(d.usage).toEqual({ input: 200, output: 100, cost: 0.002 });
 		expect(d.messageCount).toBe(6);
+	});
+
+	test("captures failed bash tool calls from the real toolResult shape", () => {
+		const entries = [
+			bashToolCall("call-1", "false; echo \"exit code: $?\""),
+			bashToolResult("call-1", "exit code: 1\n"),
+			bashToolCall("call-2", "ls /nonexistent-dir-xyz; echo \"exit code: $?\""),
+			bashToolResult("call-2", "ls: cannot access '/nonexistent-dir-xyz': No such file or directory\nexit code: 2\n"),
+			bashToolCall("call-3", "echo ok"),
+			bashToolResult("call-3", "ok\nexit code: 0\n"),
+		];
+		const d = buildDigest(entries, SID, CWD, END);
+		expect(d.failedCommands).toEqual([
+			'false; echo "exit code: $?"',
+			"ls /nonexistent-dir-xyz; echo \"exit code: $?\"",
+		]);
+	});
+
+	test("records unknown command when the toolCall is missing", () => {
+		const d = buildDigest([bashToolResult("orphan", "exit code: 1\n")], SID, CWD, END);
+		expect(d.failedCommands).toEqual(["(unknown command)"]);
+	});
+
+	test("uses the caller-provided startedAt when no header entry exists", () => {
+		const d = buildDigest([userMessage("hi")], SID, CWD, END, "2026-08-30T09:00:00.000Z");
+		expect(d.startedAt).toBe("2026-08-30T09:00:00.000Z");
 	});
 
 	test("dedupes identical errors and failed commands", () => {
@@ -98,8 +140,8 @@ describe("buildDigest", () => {
 
 	test("ignores successful bash and non-error tool results", () => {
 		const entries = [
-			entry({ message: { role: "bashExecution" }, command: "npm test", exitCode: 0 }),
-			entry({ message: { role: "toolResult", content: [{ type: "text", text: "ok" }] }, isError: false, toolName: "edit" }),
+			entry({ message: { role: "bashExecution", command: "npm test", exitCode: 0 } }),
+			entry({ message: { role: "toolResult", content: [{ type: "text", text: "ok" }], isError: false, toolName: "edit" } }),
 		];
 		const d = buildDigest(entries, SID, CWD, END);
 		expect(d.failedCommands).toHaveLength(0);
@@ -126,10 +168,11 @@ describe("buildDigest", () => {
 describe("isNotable", () => {
 	const base = () => buildDigest([], SID, CWD, END);
 
-	test("true on errors, failed commands, length stops, compactions", () => {
+	test("true on errors, failed commands, any stop reason, compactions", () => {
 		expect(isNotable({ ...base(), errors: [{ tool: "edit", summary: "x" }] }, 5)).toBe(true);
 		expect(isNotable({ ...base(), failedCommands: ["npm test"] }, 5)).toBe(true);
 		expect(isNotable({ ...base(), stopReasons: { length: 1 } }, 5)).toBe(true);
+		expect(isNotable({ ...base(), stopReasons: { stop: 4, toolUse: 3 } }, 5)).toBe(true);
 		expect(isNotable({ ...base(), compactions: 1 }, 5)).toBe(true);
 	});
 

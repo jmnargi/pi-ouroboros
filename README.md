@@ -39,6 +39,16 @@ Run this command:
 pi install ./pi-ouroboros
 ```
 
+## Trust model
+
+The model writes the rules and the skills.
+The model can write bad rules.
+The model can write rules that conflict with your instructions.
+Review the rules with `/ouroboros`.
+Clear the rules with `/ouroboros reset`.
+The rules apply to all projects.
+The rules do not override your explicit instructions.
+
 ## Usage
 
 The plugin works automatically.

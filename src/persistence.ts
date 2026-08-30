@@ -20,6 +20,10 @@ import type { OuroborosDigest } from "./digest.ts";
 export const DEFAULT_RULES_CAP = 50;
 export const DEFAULT_RULES_MAX_CHARS = 3000;
 export const DEFAULT_REFLECT_MIN_PROMPTS = 5;
+export const MAX_RULE_CHARS = 500;
+
+/** Session ids are UUIDs; anything else is hashed before touching the fs. */
+const SAFE_ID = /^[a-zA-Z0-9_-]+$/;
 
 export function ouroborosDir(dataDir: string): string {
 	return path.join(dataDir, "ouroboros");
@@ -33,8 +37,16 @@ export function digestsDir(dataDir: string): string {
 	return path.join(ouroborosDir(dataDir), "digests");
 }
 
+/** Sanitize a session id into a safe filename fragment (hash fallback). */
+export function safeSessionId(sessionId: string): string {
+	if (SAFE_ID.test(sessionId) && !sessionId.includes("..")) return sessionId;
+	let h = 5381;
+	for (let i = 0; i < sessionId.length; i++) h = ((h << 5) + h + sessionId.charCodeAt(i)) | 0;
+	return `sid-${(h >>> 0).toString(36)}`;
+}
+
 export function digestFile(dataDir: string, sessionId: string): string {
-	return path.join(digestsDir(dataDir), `${sessionId}.json`);
+	return path.join(digestsDir(dataDir), `${safeSessionId(sessionId)}.json`);
 }
 
 export function skillsDir(dataDir: string): string {
@@ -61,11 +73,11 @@ export function loadRules(dataDir: string): string[] {
 /**
  * Append a rule, deduped against existing lines. Returns whether it was added
  * and the resulting count. When at cap, the oldest rule is dropped so the
- * freshest lessons always win.
+ * freshest lessons always win. Oversized rules are truncated.
  */
 export function appendRule(dataDir: string, rule: string, cap: number = DEFAULT_RULES_CAP): { added: boolean; count: number; cap: number } {
-	const normalized = rule.trim().replace(/\s+/g, " ");
-	if (!normalized) return { added: false, count: 0, cap };
+	const normalized = rule.trim().replace(/\s+/g, " ").slice(0, MAX_RULE_CHARS);
+	if (!normalized) return { added: false, count: loadRules(dataDir).length, cap };
 	const rules = loadRules(dataDir);
 	if (rules.includes(normalized)) return { added: false, count: rules.length, cap };
 	const next = [...rules, normalized];
@@ -88,6 +100,36 @@ function writeRules(dataDir: string, rules: string[]): void {
 // ---------------------------------------------------------------------------
 // Digests
 // ---------------------------------------------------------------------------
+/** Mark a digest as injected (renamed so listDigests skips it). */
+export function markDigestInjected(dataDir: string, sessionId: string): boolean {
+	const from = digestFile(dataDir, sessionId);
+	const to = `${from.slice(0, -".json".length)}.injected.json`;
+	if (!fs.existsSync(from)) return false;
+	fs.renameSync(from, to);
+	return true;
+}
+
+/** Injected digest session ids (awaiting delivery, then cleanup). */
+export function listInjectedDigests(dataDir: string): string[] {
+	try {
+		const dir = digestsDir(dataDir);
+		if (!fs.existsSync(dir)) return [];
+		return fs
+			.readdirSync(dir)
+			.filter((f) => f.endsWith(".injected.json"))
+			.map((f) => f.slice(0, -".injected.json".length));
+	} catch {
+		return [];
+	}
+}
+
+export function deleteInjectedDigest(dataDir: string, sessionId: string): boolean {
+	const file = `${digestFile(dataDir, sessionId).slice(0, -".json".length)}.injected.json`;
+	if (!fs.existsSync(file)) return false;
+	fs.rmSync(file);
+	return true;
+}
+
 
 export function saveDigest(dataDir: string, digest: OuroborosDigest): void {
 	const file = digestFile(dataDir, digest.sessionId);
@@ -118,7 +160,7 @@ export function listDigests(dataDir: string): string[] {
 		if (!fs.existsSync(dir)) return [];
 		return fs
 			.readdirSync(dir)
-			.filter((f) => f.endsWith(".json"))
+			.filter((f) => f.endsWith(".json") && !f.endsWith(".injected.json"))
 			.map((f) => f.slice(0, -".json".length))
 			.sort((a, b) => {
 				const ma = fs.statSync(path.join(dir, `${a}.json`)).mtimeMs;
@@ -158,12 +200,17 @@ export function isValidSkillName(name: string): boolean {
 	return /^[a-z0-9]+(-[a-z0-9]+)*$/.test(name) && name.length <= 64;
 }
 
+/** Normalize a description for safe YAML frontmatter (single line). */
+export function normalizeDescription(description: string): string {
+	return description.trim().replace(/\s+/g, " ");
+}
+
 /** Write a skill and return its SKILL.md path. */
 export function writeSkill(dataDir: string, name: string, description: string, body: string): string {
 	const dir = path.join(skillsDir(dataDir), name);
 	const file = path.join(dir, "SKILL.md");
 	fs.mkdirSync(dir, { recursive: true });
-	const content = `---\nname: ${name}\ndescription: ${description}\n---\n\n${body.trim()}\n`;
+	const content = `---\nname: ${name}\ndescription: ${normalizeDescription(description)}\n---\n\n${body.trim()}\n`;
 	atomicWrite(file, content);
 	return file;
 }
@@ -184,7 +231,7 @@ export function listSkills(dataDir: string): string[] {
 }
 
 function atomicWrite(file: string, content: string): void {
-	const tmp = `${file}.tmp`;
+	const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
 	fs.writeFileSync(tmp, content);
 	fs.renameSync(tmp, file);
 }
