@@ -1,16 +1,18 @@
 /**
  * src/digest.ts — session → digest extraction (pure, no pi imports).
  *
- * A digest is a compact, lossy summary of a session that is cheap enough to
- * hand back to the model for reflection: user prompts, failed tool calls,
- * failed bash commands, assistant stop reasons, compaction pressure, and
- * token/cost totals. Everything else (thinking traces, full outputs, tool
- * arguments) is deliberately dropped.
+ * A digest is a compact, lossy summary of a session.
+ * It is cheap enough to hand back to the model for reflection.
+ * It contains user prompts, failed tool calls, failed bash commands,
+ * assistant stop reasons, compaction pressure, and token/cost totals.
+ * The plugin deliberately drops everything else: thinking traces, full
+ * outputs, and tool arguments.
  *
- * The extractor is defensive: it walks unknown entry shapes with optional
- * chaining and never throws on a malformed entry — a corrupt session must
- * degrade to an empty digest, not crash the shutdown hook.
- *
+ * The extractor is defensive.
+ * It walks unknown entry shapes with optional chaining.
+ * It never throws on a malformed entry.
+ * A corrupt session must degrade to an empty digest, not crash the shutdown
+ * hook.
  * Session entry shape (verified against real pi.dev 0.82.1 session files):
  * every message is `{ type: "message", message: AgentMessage }`.
  *   - Tool results: `message.role === "toolResult"` with `isError`/`toolName`
@@ -181,6 +183,9 @@ export function buildDigest(
 	const seenCommands = new Set<string>();
 	/** toolCallId → bash command, from assistant toolCalls. */
 	const bashCommands = new Map<string, string>();
+	/** Raw (unstringified) trace buffers — stringify only the kept calls. */
+	const rawToolCalls: Array<{ tool: string; args: unknown }> = [];
+	const rawAssistantText: string[] = [];
 
 	for (const raw of entries) {
 		if (!raw || typeof raw !== "object") continue;
@@ -255,12 +260,15 @@ export function buildDigest(
 					}
 					// Assistant trace: what the model actually DID, so the
 					// reflection can see silent mistakes (wrong file edited,
-					// destructive command that succeeded).
+					// destructive command that succeeded). Bounded DURING the
+					// loop (shift+push keeps the newest) so a 10k-call
+					// session does not build a 10k-element array.
 					if (b.type === "toolCall" && typeof b.name === "string") {
-						const args = typeof b.arguments === "object" && b.arguments !== null ? JSON.stringify(b.arguments) : "";
-						digest.toolCalls.push({ tool: b.name, args: truncate(args, TOOL_ARGS_MAX_CHARS) });
+						if (rawToolCalls.length >= TOOL_CALL_CAP) rawToolCalls.shift();
+						rawToolCalls.push({ tool: b.name, args: b.arguments });
 					} else if (b.type === "text" && typeof b.text === "string" && b.text.trim()) {
-						digest.assistantText.push(truncate(b.text, PROMPT_MAX_CHARS));
+						if (rawAssistantText.length >= ASSISTANT_TEXT_CAP) rawAssistantText.shift();
+						rawAssistantText.push(b.text);
 					}
 				}
 			}
@@ -311,11 +319,13 @@ export function buildDigest(
 	if (digest.failedCommands.length > COMMAND_CAP) {
 		digest.failedCommands = digest.failedCommands.slice(-COMMAND_CAP);
 	}
-	if (digest.toolCalls.length > TOOL_CALL_CAP) {
-		digest.toolCalls = digest.toolCalls.slice(-TOOL_CALL_CAP);
+	// Stringify the kept trace calls (the raw buffers are already bounded).
+	for (const t of rawToolCalls) {
+		const args = typeof t.args === "object" && t.args !== null ? JSON.stringify(t.args) : "";
+		digest.toolCalls.push({ tool: t.tool, args: truncate(args, TOOL_ARGS_MAX_CHARS) });
 	}
-	if (digest.assistantText.length > ASSISTANT_TEXT_CAP) {
-		digest.assistantText = digest.assistantText.slice(-ASSISTANT_TEXT_CAP);
+	for (const t of rawAssistantText) {
+		digest.assistantText.push(truncate(t, PROMPT_MAX_CHARS));
 	}
 
 	return digest;

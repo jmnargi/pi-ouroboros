@@ -2,26 +2,27 @@
  * pi-ouroboros — self-improving pi coding agent.
  *
  * The loop:
- *  1. Session end (quit / new): a compact digest of the session is written to
- *     `<agentDir>/ouroboros/digests/<sessionId>.json` — user prompts, failed
- *     tool calls, failed commands, stop reasons, compaction pressure, usage.
- *  2. Next session start: if a pending digest is notable, a reflection message
- *     is queued (deliverAs "nextTurn") so the agent extracts lessons from its
- *     own past as part of its first turn — no startup delay, no extra API
- *     calls. The digest is consumed after injection.
- *  3. Every turn: self-learned rules from `<agentDir>/ouroboros/rules.md` are
- *     appended to the system prompt, so a lesson recorded mid-session is
- *     active the very next turn.
- *  4. `ouroboros_learn` lets the agent record a lesson immediately: kind=rule
- *     appends to rules.md (deduped, capped); kind=skill writes a SKILL.md that
- *     pi auto-discovers on the next startup.
+ *  1. Session end. The plugin writes a compact digest of the session to
+ *     `<agentDir>/ouroboros/digests/<sessionId>.json`. The digest contains
+ *     user prompts, failed tool calls, failed commands, stop reasons,
+ *     compaction pressure, and usage.
+ *  2. Next session start. If a pending digest is notable, the plugin queues
+ *     a reflection message (deliverAs "nextTurn"). The agent extracts lessons
+ *     from its own past as part of its first turn. There is no startup delay
+ *     and no extra API call. The plugin consumes the digest after injection.
+ *  3. Every turn. The plugin appends self-learned rules from
+ *     `<agentDir>/ouroboros/rules.md` to the system prompt. A lesson recorded
+ *     mid-session is active the very next turn.
+ *  4. `ouroboros_learn` lets the agent record a lesson immediately. kind=rule
+ *     appends to rules.md (deduped, capped). kind=skill writes a SKILL.md
+ *     that pi auto-discovers on the next startup.
  *
- * The agent does the reflection itself (in its own loop, with its own tools);
- * ouroboros is pure plumbing: deterministic digesting, file IO, and prompt
+ * The agent does the reflection itself (in its own loop, with its own tools).
+ * Ouroboros is pure plumbing: deterministic digesting, file IO, and prompt
  * injection. Nothing here calls the model directly.
  */
 
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Text } from "@earendil-works/pi-tui";
@@ -45,7 +46,6 @@ import {
 	listSkills,
 	loadRules,
 	rulesFile,
-	skillsDir,
 	saveDigest,
 	writeSkill,
 	isValidSkillName,
@@ -76,6 +76,28 @@ function envInt(name: string, fallback: number): number {
 	if (!raw || !/^\d+$/.test(raw)) return fallback;
 	const n = Number.parseInt(raw, 10);
 	return n > 0 ? n : fallback;
+}
+
+/** True when the session file already contains the ouroboros reflection
+ * message. The message is drained (persisted) before the first LLM call, so
+ * a failed first turn leaves it in the history with the marker still set.
+ * Re-injecting on resume would deliver the reflection twice. */
+function sessionHasOuroborosMessage(sessionFile: string): boolean {
+	try {
+		const text = readFileSync(sessionFile, "utf8");
+		for (const line of text.split("\n")) {
+			if (!line.trim()) continue;
+			try {
+				const entry = JSON.parse(line) as { type?: unknown; customType?: unknown };
+				if (entry.type === "custom_message" && entry.customType === OUROBOROS_CUSTOM_TYPE) return true;
+			} catch {
+				// skip malformed lines
+			}
+		}
+	} catch {
+		// unreadable session file — assume not delivered
+	}
+	return false;
 }
 
 export default function (pi: ExtensionAPI): void {
@@ -158,16 +180,33 @@ export default function (pi: ExtensionAPI): void {
 		uiHost = ctx as unknown as UiHost;
 		reflectQueued = false;
 		// Leftover .injected.json files mean the queued reflection was never
-		// delivered (crash, quit before the first turn, failed LLM call) —
-		// unmark them so the loop below re-injects them. A delivered
+		// confirmed delivered (crash, quit before the first turn, failed LLM
+		// call) — unmark them so the loop below re-injects them. A delivered
 		// reflection has its marker deleted at agent_end. Skipped on reload:
 		// the queued message survives in _pendingNextTurnMessages, and
 		// unmarking would deliver the reflection twice.
 		const recovered: string[] = [];
 		if (event.reason !== "reload") {
 			try {
-				for (const sid of listInjectedDigests(dataDir)) {
-					if (unmarkDigestInjected(dataDir, sid)) recovered.push(sid);
+				const injected = listInjectedDigests(dataDir);
+				if (injected.length > 0) {
+					// On resume, the queued reflection may already be in the
+					// resumed session's history: the message is drained
+					// (persisted) before the first LLM call, and a failed
+					// call keeps the marker. If the history already has the
+					// ouroboros message, delete the markers instead of
+					// unmarking — re-injecting would deliver it twice.
+					const alreadyDelivered =
+						event.reason === "resume" && event.previousSessionFile
+							? sessionHasOuroborosMessage(event.previousSessionFile)
+							: false;
+					for (const sid of injected) {
+						if (alreadyDelivered) {
+							deleteInjectedDigest(dataDir, sid);
+						} else if (unmarkDigestInjected(dataDir, sid)) {
+							recovered.push(sid);
+						}
+					}
 				}
 				cleanupStaleTmp(dataDir);
 			} catch {
@@ -176,9 +215,12 @@ export default function (pi: ExtensionAPI): void {
 		}
 		// The list is captured ONCE — a second call would re-sort. Recovered
 		// digests (undelivered reflections) go FIRST so the newest-wins
-		// delete cannot drop them in favor of a newer digest.
+		// delete cannot drop them in favor of a newer digest. `all` is
+		// mtime-sorted, so filtering it keeps the recovered digests in
+		// newest-first order (the freshest undelivered reflection wins).
 		const all = listDigests(dataDir);
-		const ordered = [...recovered, ...all.filter((s) => !recovered.includes(s))];
+		const recoveredSet = new Set(recovered);
+		const ordered = [...all.filter((s) => recoveredSet.has(s)), ...all.filter((s) => !recoveredSet.has(s))];
 		let injected = false;
 		for (const sid of ordered) {
 			// One corrupt digest must not block the rest.
@@ -210,7 +252,7 @@ export default function (pi: ExtensionAPI): void {
 					pi.sendMessage(
 						{
 							customType: OUROBOROS_CUSTOM_TYPE,
-							content: buildReflectionMessage(digest, rulesFile(dataDir), skillsDir(dataDir)),
+							content: buildReflectionMessage(digest),
 							display: true,
 						},
 						{ deliverAs: "nextTurn" },
@@ -238,11 +280,13 @@ export default function (pi: ExtensionAPI): void {
 		return { systemPrompt: `${event.systemPrompt}${buildRulesAppendix(rules, rulesMaxChars)}` };
 	});
 	pi.on("agent_end", (event) => {
-		// The queued reflection was delivered in this turn — the marker is
-		// no longer needed. Deleted here (not before_agent_start): the LLM
-		// call may fail after the message is drained, and the marker must
-		// survive so the next session_start re-injects it. Skipped entirely
-		// when nothing was injected (the common case): zero file IO per turn.
+		// The queued reflection was delivered in this turn.
+		// The marker is no longer needed.
+		// The plugin deletes it here, not at before_agent_start.
+		// The LLM call can fail after the message drains.
+		// The marker must survive so the next session_start re-injects it.
+		// Skipped entirely when nothing was injected (the common case):
+		// zero file IO per turn.
 		if (hasInjectedDigests) {
 			// A FAILED run (API down, auth error, retries exhausted) also
 			// emits agent_end, with a message whose stopReason is
@@ -277,7 +321,7 @@ export default function (pi: ExtensionAPI): void {
 		],
 		description: [
 			"Record a self-learned lesson for future sessions.",
-			"kind=rule: append an imperative rule to the ouroboros rules file; it is injected into the system prompt from the next turn on. Duplicates are skipped; the newest rules replace the oldest when at cap.",
+			"kind=rule: append an imperative rule to the ouroboros rules file. The plugin injects it into the system prompt from the next turn on. The plugin skips duplicates. The newest rules replace the oldest when at cap.",
 			"kind=skill: write a skill (SKILL.md with name + description frontmatter) under the pi agent skills directory; pi discovers it automatically on the next startup.",
 		].join(" "),
 		parameters: Type.Object({
@@ -380,7 +424,7 @@ export default function (pi: ExtensionAPI): void {
 					pi.sendMessage(
 						{
 							customType: OUROBOROS_CUSTOM_TYPE,
-							content: buildReflectionMessage(null, rulesFile(dataDir), skillsDir(dataDir), true),
+							content: buildReflectionMessage(null, true),
 							display: true,
 						},
 						{ deliverAs: "nextTurn" },

@@ -120,15 +120,18 @@ function dedupKey(rule: string): string {
 		.trim();
 }
 /**
- * Append a rule, deduped against existing lines. Returns whether it was added
- * and the resulting count. When at cap, the oldest rule is dropped so the
- * freshest lessons always win. Oversized rules are truncated. Rules are also
- * evicted by total characters so every stored rule fits the appendix budget
- * (a stored rule that never appears in the prompt is a lie to the model).
+ * Append a rule, deduped against existing lines.
+ * Returns whether it was added and the resulting count.
+ * When at cap, the plugin drops the oldest rule.
+ * The freshest lessons always win.
+ * The plugin truncates oversized rules.
+ * The plugin also evicts rules by total characters so every stored rule fits
+ * the appendix budget. A stored rule that never appears in the prompt is a
+ * lie to the model.
  *
  * The read-modify-write is synchronous, so callers within one process cannot
  * interleave. Across processes (two pi instances sharing a dataDir) the last
- * rename wins, so the write is verified and retried: a lost update is
+ * rename wins, so the write is verified and retried. A lost update is
  * re-applied on the next attempt instead of silently dropped.
  */
 export function appendRule(
@@ -151,7 +154,17 @@ export function appendRule(
 		const next = [...rules, normalized];
 		while (next.length > cap) next.shift();
 		// Evict oldest until the file fits the appendix budget (chars).
-		while (next.length > 1 && next.join("\n").length + 1 > maxChars) next.shift();
+		// Track the total once — re-joining per iteration is O(n^2).
+		let total = next.join("\n").length + 1;
+		while (next.length > 1 && total > maxChars) {
+			const dropped = next.shift()!;
+			total -= dropped.length + 1;
+		}
+		// A single rule can still exceed the budget (maxChars < MAX_RULE_CHARS).
+		// Truncate it so the stored file always fits the configured budget.
+		if (next.length === 1 && total > maxChars) {
+			next[0] = next[0]!.slice(0, Math.max(0, maxChars - 1));
+		}
 		writeRules(dataDir, next);
 		// Verify: another instance may have renamed over our write between
 		// the read and the rename. If our rule is gone, retry.
@@ -288,7 +301,8 @@ export function saveLastDigest(dataDir: string, digest: OuroborosDigest): void {
 export function loadLastDigest(dataDir: string): OuroborosDigest | null {
 	try {
 		const parsed: unknown = JSON.parse(fs.readFileSync(lastDigestFile(dataDir), "utf8"));
-		return isValidDigest(parsed) ? parsed : null;
+		const migrated = migrateDigest(parsed);
+		return isValidDigest(migrated) ? (migrated as OuroborosDigest) : null;
 	} catch {
 		return null;
 	}
@@ -368,7 +382,8 @@ function isValidDigest(p: unknown): p is OuroborosDigest {
 				typeof e === "object" &&
 				e !== null &&
 				typeof (e as { tool?: unknown }).tool === "string" &&
-				typeof (e as { args?: unknown }).args === "string",
+				typeof (e as { args?: unknown }).args === "string" &&
+				(e as { args?: string }).args!.length <= 200,
 		);
 	return (
 		d.version === 1 &&

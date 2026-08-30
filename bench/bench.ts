@@ -11,8 +11,8 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { buildDigest } from "../src/digest.ts";
-import { appendRule, listDigests, listSkills, loadRules, saveDigest, writeSkill } from "../src/persistence.ts";
+import { buildDigest, isNotable } from "../src/digest.ts";
+import { appendRule, listDigests, listSkills, loadDigest, loadRules, saveDigest, writeSkill } from "../src/persistence.ts";
 
 function bench(name: string, iterations: number, fn: () => void): void {
 	// Warm up (caches, JIT).
@@ -34,26 +34,61 @@ try {
 	}
 	bench("listDigests (10k digests)", 20, () => listDigests(dir));
 
-	// 2. buildDigest with a 300KB prompt.
+	// 2. buildDigest with a 300KB prompt and a tool-call trace.
 	const bigPrompt = "x".repeat(300_000);
 	const entries = [
 		{ type: "session", id: "sess-1", cwd: "/proj", timestamp: "2026-08-30T10:00:00.000Z" },
 		{ type: "message", message: { role: "user", content: bigPrompt } },
-		{ type: "message", message: { role: "assistant", content: [], stopReason: "stop", model: "m", usage: { input: 1, output: 1, cost: { total: 0 } } } },
+		{
+			type: "message",
+			message: {
+				role: "assistant",
+				content: [
+					{ type: "toolCall", id: "c1", name: "bash", arguments: { command: "npm test" } },
+					{ type: "text", text: "running the tests" },
+				],
+				stopReason: "toolUse",
+				model: "m",
+				usage: { input: 1, output: 1, cost: { total: 0 } },
+			},
+		},
+		{ type: "message", message: { role: "toolResult", toolCallId: "c1", toolName: "bash", isError: true, content: [{ type: "text", text: "1 failing" }] } },
 	];
-	bench("buildDigest (300KB prompt)", 200, () => buildDigest(entries, "sess-1", "/proj", "2026-08-30T12:00:00.000Z"));
+	bench("buildDigest (300KB prompt + trace)", 200, () => buildDigest(entries, "sess-1", "/proj", "2026-08-30T12:00:00.000Z"));
 
 	// 3. loadRules with a full rules file (cached).
 	for (let i = 0; i < 50; i++) appendRule(dir, `rule number ${i}: always do the thing`);
 	bench("loadRules (50 rules, cached)", 10_000, () => loadRules(dir));
 
-	// 4. listSkills (cached).
+	// 4. appendRule at cap (char eviction runs).
+	bench("appendRule at cap (char eviction)", 200, () => appendRule(dir, `new rule ${Date.now()}`));
+
+	// 5. listSkills (cached).
 	writeSkill(dir, "bench-skill", "bench", "body");
 	bench("listSkills (1 skill, cached)", 10_000, () => listSkills(dir));
 
-	// 5. saveDigest (atomic write).
+	// 6. saveDigest (atomic write).
 	const digest = buildDigest(entries, "sess-1", "/proj", "2026-08-30T12:00:00.000Z");
 	bench("saveDigest (atomic write)", 200, () => saveDigest(dir, digest));
+
+	// 7. Session start: list + load + validate + isNotable, with 0/1/50
+	// pending digests (a fresh dir per case so the counts are exact).
+	const sessionStart = (count: number): (() => void) => {
+		const d2 = mkdtempSync(join(tmpdir(), "ouroboros-bench-ss-"));
+		for (let i = 0; i < count; i++) {
+			saveDigest(d2, { ...digest, sessionId: `sess-${i}` });
+		}
+		return () => {
+			const all = listDigests(d2);
+			for (const sid of all) {
+				const d = loadDigest(d2, sid);
+				if (d && isNotable(d, 5)) break;
+			}
+		};
+	};
+	bench("session_start (0 digests)", 200, sessionStart(0));
+	bench("session_start (1 digest)", 200, sessionStart(1));
+	bench("session_start (50 digests)", 200, sessionStart(50));
 } finally {
 	rmSync(dir, { recursive: true, force: true });
 }

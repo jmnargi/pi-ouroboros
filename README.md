@@ -47,8 +47,8 @@ The model can write rules that conflict with your instructions.
 Review the rules with `/ouroboros`.
 Clear the rules with `/ouroboros reset`.
 The rules apply to all projects.
-The rules are suggestions, not instructions.
-The plugin tells the model that your explicit instructions take precedence.
+The rules are self-recorded lessons.
+The plugin tells the model to follow them unless they conflict with your explicit instructions.
 This is a prompt-level mitigation, not a guarantee.
 A model can follow a bad rule despite the warning.
 Review the rules regularly.
@@ -68,25 +68,25 @@ The tool appends, dedupes, and caps the rules.
 The tool strips control characters from rules.
 The tool refuses to overwrite an existing skill.
 The tool caps the skill body and description.
-The model does not write the rules file directly.
-The model's write tool overwrites the file and bypasses the dedup and cap.
+The reflection message tells the model to use the tool, not the write tool.
+If the model uses its write tool anyway, it overwrites the file and bypasses the dedup and cap.
 
 ## Performance
 
-The plugin has minimal performance impact.
+The plugin adds less than 3 ms to a session start.
 pi.dev awaits every event handler.
 The plugin keeps handler work small.
 
 Measured costs:
 
-- Session start with no digests: 0.003 ms.
+- Session start with no digests: 0.002 ms.
 - Session start with 1 digest: 0.017 ms.
-- Session start with 50 digests: 2.6 ms.
+- Session start with 50 digests: 0.090 ms.
 - Rules read per turn (cached): 0.001 ms.
 - Skills read per turn (cached): 0.001 ms.
-- Turn start with no pending reflection: 0.0002 ms.
-- Digest list with 10,000 digests: 21 ms.
-- Digest build with a 300 KB prompt: 0.037 ms.
+- Rule append at cap (char eviction): 0.028 ms.
+- Digest list with 10,000 digests: 22 ms.
+- Digest build with a 300 KB prompt: 0.068 ms.
 - Digest save (atomic write): 0.021 ms.
 
 The plugin caches the rules file.
@@ -95,7 +95,7 @@ The plugin checks the file mtime for external writes.
 The plugin caches the skills list.
 The plugin invalidates the skills cache on its own writes.
 The plugin examines every pending digest at session start.
-The plugin deletes non-notable and corrupt digests as it goes.
+The plugin deletes non-notable and corrupt digests during the scan.
 The plugin skips the per-turn cleanup when nothing is pending.
 Run `bun bench/bench.ts` to re-measure the hot paths.
 
@@ -123,8 +123,8 @@ Use environment variables to change the behavior.
 |---|---|---|
 | `PI_OUROBOROS_DISABLED` | none | Set to `1` to disable the plugin |
 | `PI_OUROBOROS_RULES_CAP` | `50` | Maximum number of rules |
-| `PI_OUROBOROS_RULES_MAX_CHARS` | `3000` | Maximum characters of rules per turn |
-| `PI_OUROBOROS_REFLECT_MIN_PROMPTS` | `5` | Minimum prompts for a notable session |
+| `PI_OUROBOROS_RULES_MAX_CHARS` | `3000` | Maximum characters of rules per turn. The plugin also evicts the oldest rules when the file exceeds this budget. The plugin truncates a single rule at 500 characters. |
+| `PI_OUROBOROS_REFLECT_MIN_PROMPTS` | `5` | Minimum prompts for a clean session to be notable (floor 20) |
 | `PI_CODING_AGENT_DIR` | `~/.pi/agent` | Directory for all ouroboros state (rules, digests, skills) |
 
 All ouroboros state lives under the agent directory.

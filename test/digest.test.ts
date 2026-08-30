@@ -96,6 +96,35 @@ describe("buildDigest", () => {
 		expect(d.assistantText).toEqual(["doing work", "done"]);
 		expect(d.toolCalls).toEqual([{ tool: "bash", args: '{"command":"npm test"}' }]);
 	});
+	test("caps the trace during the loop: newest 20 tool calls, 12 texts, args at 80 chars", () => {
+		const entries: Record<string, unknown>[] = [];
+		for (let i = 0; i < 25; i++) {
+			entries.push(bashToolCall(`call-${i}`, `command ${i}`));
+			entries.push(bashToolResult(`call-${i}`, "ok\n"));
+			entries.push(assistantMessage({ content: [{ type: "text", text: `text ${i}` }] }));
+		}
+		const d = buildDigest(entries, SID, CWD, END);
+		expect(d.toolCalls).toHaveLength(20);
+		expect(d.toolCalls[0]!.tool).toBe("bash");
+		expect(d.toolCalls[0]!.args).toContain("command 5");
+		expect(d.toolCalls[19]!.args).toContain("command 24");
+		expect(d.assistantText).toHaveLength(12);
+		expect(d.assistantText[0]).toBe("text 13");
+		expect(d.assistantText[11]).toBe("text 24");
+	});
+	test("truncates tool-call args to 80 chars", () => {
+		const longArgs = { command: "x".repeat(200) };
+		const d = buildDigest(
+			[entry({ message: { role: "assistant", content: [{ type: "toolCall", id: "c1", name: "bash", arguments: longArgs }], stopReason: "toolUse" } })],
+			SID,
+			CWD,
+			END,
+		);
+		expect(d.toolCalls).toHaveLength(1);
+		// truncate keeps 80 chars plus an ellipsis.
+		expect(d.toolCalls[0]!.args.length).toBeLessThanOrEqual(81);
+		expect(d.toolCalls[0]!.args.endsWith("…")).toBe(true);
+	});
 	test("captures failed bash tool calls from the real toolResult shape", () => {
 		const entries = [
 			bashToolCall("call-1", "ls /nonexistent-dir-xyz"),

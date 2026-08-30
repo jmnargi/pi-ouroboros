@@ -8,7 +8,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -87,9 +87,9 @@ function makeAPI(): MockAPI {
 
 
 /** A session entry list that produces a NOTABLE digest (has an error). */
-function notableEntries(): unknown[] {
+function notableEntries(id = "sess-1"): unknown[] {
 	return [
-		{ type: "session", id: "sess-1", cwd: "/proj", timestamp: "2026-08-30T10:00:00.000Z" },
+		{ type: "session", id, cwd: "/proj", timestamp: "2026-08-30T10:00:00.000Z" },
 		{ type: "message", message: { role: "user", content: "fix the bug" } },
 		{
 			type: "message",
@@ -256,6 +256,55 @@ describe("session_start", () => {
 		expect(api.messages).toHaveLength(0);
 		expect(readdirSync(digestsDir(dataDir))).toEqual(["sess-1.injected.json"]);
 	});
+	test("recovered digests are injected ahead of newer pending digests", () => {
+		// Digest A (older, notable) has an undelivered reflection marker.
+		// Digest B (newer, notable) is pending. The recovered A must be
+		// injected FIRST; B is then deleted by the newest-wins rule.
+		saveDigest(dataDir, buildDigest(notableEntries("sess-a"), "sess-a", "/proj", "2026-08-30T10:00:00.000Z"));
+		markDigestInjected(dataDir, "sess-a");
+		saveDigest(dataDir, buildDigest(notableEntries("sess-b"), "sess-b", "/proj", "2026-08-30T11:00:00.000Z"));
+		const handler = api.fire.bind(api, "session_start");
+		handler({}, fakeCtx());
+		expect(api.messages).toHaveLength(1);
+		expect(api.messages[0]!.message.content).toContain("sess-a");
+		expect(readdirSync(digestsDir(dataDir))).toEqual(["sess-a.injected.json"]);
+	});
+	test("a corrupt digest after an injected one is deleted by filename without parsing", () => {
+		saveDigest(dataDir, buildDigest(notableEntries("sess-a"), "sess-a", "/proj", "2026-08-30T10:00:00.000Z"));
+		markDigestInjected(dataDir, "sess-a");
+		// sess-b is corrupt (not JSON). The injected flag is checked BEFORE
+		// loadDigest, so sess-b is deleted without a parse attempt.
+		writeFileSync(join(digestsDir(dataDir), "sess-b.json"), "{not json");
+		const handler = api.fire.bind(api, "session_start");
+		handler({}, fakeCtx());
+		expect(api.messages).toHaveLength(1);
+		expect(readdirSync(digestsDir(dataDir))).toEqual(["sess-a.injected.json"]);
+	});
+	test("resume with the reflection already in history deletes the marker, no re-inject", () => {
+		saveDigest(dataDir, buildDigest(notableEntries(), "sess-1", "/proj", "2026-08-30T12:00:00.000Z"));
+		markDigestInjected(dataDir, "sess-1");
+		// The resumed session file already contains the ouroboros message
+		// (drained before a failed first turn).
+		const sessionFile = join(dataDir, "resumed.jsonl");
+		writeFileSync(sessionFile, `${JSON.stringify({ type: "custom_message", customType: OUROBOROS_CUSTOM_TYPE, content: "reflect" })}\n`);
+		const handler = api.fire.bind(api, "session_start");
+		handler({ reason: "resume", previousSessionFile: sessionFile }, fakeCtx());
+		expect(api.messages).toHaveLength(0);
+		expect(readdirSync(digestsDir(dataDir))).toEqual([]);
+	});
+	test("resume without the reflection in history re-injects it", () => {
+		saveDigest(dataDir, buildDigest(notableEntries(), "sess-1", "/proj", "2026-08-30T12:00:00.000Z"));
+		markDigestInjected(dataDir, "sess-1");
+		// The resumed session file has no ouroboros message (crash before
+		// the first turn drained) — the reflection was never delivered.
+		const sessionFile = join(dataDir, "resumed.jsonl");
+		writeFileSync(sessionFile, `${JSON.stringify({ type: "message", message: { role: "user", content: "hi" } })}\n`);
+		const handler = api.fire.bind(api, "session_start");
+		handler({ reason: "resume", previousSessionFile: sessionFile }, fakeCtx());
+		expect(api.messages).toHaveLength(1);
+		expect(api.messages[0]!.message.customType).toBe(OUROBOROS_CUSTOM_TYPE);
+		expect(readdirSync(digestsDir(dataDir))).toEqual(["sess-1.injected.json"]);
+	});
 });
 
 describe("before_agent_start", () => {
@@ -290,7 +339,20 @@ describe("before_agent_start", () => {
 		api.fire("agent_end", { messages: [{ role: "assistant", stopReason: "error" }] });
 		expect(readdirSync(digestsDir(dataDir))).toEqual(["sess-1.injected.json"]);
 	});
-});
+	test("agent_end keeps the marker when the run was aborted (stopReason aborted)", () => {
+		saveDigest(dataDir, buildDigest(notableEntries(), "sess-1", "/proj", "2026-08-30T12:00:00.000Z"));
+		api.fire("session_start", {}, fakeCtx());
+		expect(readdirSync(digestsDir(dataDir))).toEqual(["sess-1.injected.json"]);
+		api.fire("agent_end", { messages: [{ role: "assistant", stopReason: "aborted" }] });
+		expect(readdirSync(digestsDir(dataDir))).toEqual(["sess-1.injected.json"]);
+	});
+	test("agent_end deletes the marker when the last message is benign", () => {
+		saveDigest(dataDir, buildDigest(notableEntries(), "sess-1", "/proj", "2026-08-30T12:00:00.000Z"));
+		api.fire("session_start", {}, fakeCtx());
+		api.fire("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }] });
+		expect(readdirSync(digestsDir(dataDir))).toEqual([]);
+ 	});
+ });
 describe("ouroboros_learn tool", () => {
 	const tool = (): MockTool => api.tools.find((t) => t.name === "ouroboros_learn")!;
 

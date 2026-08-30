@@ -14,6 +14,7 @@ import {
 	deleteDigest,
 	deleteInjectedDigest,
 	digestFile,
+	lastDigestFile,
 	loadDigest,
 	loadLastDigest,
 	loadRules,
@@ -263,6 +264,53 @@ describe("digests", () => {
 		const d = digest();
 		saveLastDigest(dir, d);
 		expect(loadLastDigest(dir)).toEqual(d);
+	});
+	test("loadLastDigest migrates legacy digests too (FixAudit3 P2)", () => {
+		const dir = tmpDataDir();
+		const file = lastDigestFile(dir);
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		const base = digest();
+		// Round-4 shape: no toolCalls/assistantText, string[] failedCommands.
+		const { toolCalls: _t, assistantText: _a, ...round4 } = base as unknown as Record<string, unknown>;
+		fs.writeFileSync(file, JSON.stringify({ ...round4, failedCommands: ["npm test"] }));
+		const migrated = loadLastDigest(dir);
+		expect(migrated).not.toBeNull();
+		expect(migrated!.toolCalls).toEqual([]);
+		expect(migrated!.assistantText).toEqual([]);
+		expect(migrated!.failedCommands).toEqual([{ command: "npm test", error: "" }]);
+	});
+	test("migration edge cases: string userPromptCount migrates, junk failedCommands rejected", () => {
+		const dir = tmpDataDir();
+		const file = digestFile(dir, "sess-edge");
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		const base = digest();
+		// userPromptCount: "x" is not a number — migrateDigest derives it
+		// from userPrompts (a migration, not a rejection).
+		fs.writeFileSync(file, JSON.stringify({ ...base, userPromptCount: "x" }));
+		const migrated = loadDigest(dir, "sess-edge");
+		expect(migrated).not.toBeNull();
+		expect(migrated!.userPromptCount).toBe(base.userPrompts.length);
+		// failedCommands: [42] is neither string[] nor {command,error}[] —
+		// migrateDigest leaves it, isValidDigest rejects it.
+		fs.writeFileSync(file, JSON.stringify({ ...base, failedCommands: [42] }));
+		expect(loadDigest(dir, "sess-edge")).toBeNull();
+	});
+	test("appendRule truncates a single oversized rule to the char budget", () => {
+		const dir = tmpDataDir();
+		// maxChars 50 < MAX_RULE_CHARS 500: the single rule must be truncated
+		// so the stored file fits the configured budget.
+		appendRule(dir, "z".repeat(200), 50, 50);
+		const rules = loadRules(dir);
+		expect(rules[0]!.length).toBeLessThanOrEqual(50);
+		expect(rules.join("\n").length + 1).toBeLessThanOrEqual(50);
+	});
+	test("isValidDigest rejects tool-call args longer than 200 chars", () => {
+		const dir = tmpDataDir();
+		const file = digestFile(dir, "sess-args");
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		const base = digest();
+		fs.writeFileSync(file, JSON.stringify({ ...base, toolCalls: [{ tool: "bash", args: "x".repeat(201) }] }));
+		expect(loadDigest(dir, "sess-args")).toBeNull();
 	});
 
 	test("cleanupStaleTmp removes old tmp files and keeps fresh ones", () => {

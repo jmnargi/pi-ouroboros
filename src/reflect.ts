@@ -70,12 +70,11 @@ function hasFailureSignal(digest: OuroborosDigest): boolean {
 
 /**
  * The reflection message injected at the start of a new session.
- * `rulesPath` and `skillsPath` are the real directories the plugin reads and
- * writes. `midSession` rewords the message for the /ouroboros reflect
- * command: the model already has the current session in context, so no
- * digest is included.
+ * `midSession` rewords the message for the /ouroboros reflect command.
+ * The model already has the current session in context, so no digest is
+ * included.
  */
-export function buildReflectionMessage(digest: OuroborosDigest | null, rulesPath: string, skillsPath: string, midSession: boolean = false): string {
+export function buildReflectionMessage(digest: OuroborosDigest | null, midSession: boolean = false): string {
 	const sessionLabel = midSession ? "the current session" : "your previous session";
 	// Mid-session the model already has the session in context — the digest
 	// and its untrusted-data warning are omitted even when one is passed.
