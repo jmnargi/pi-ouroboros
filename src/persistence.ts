@@ -94,7 +94,7 @@ export function loadRules(dataDir: string): string[] {
 		// older plugin versions (or hand-edited) bypass appendRule's strip.
 		const rules = text
 			.split("\n")
-			.map((l) => l.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u2028\u2029]/g, "").trim())
+			.map((l) => l.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f]/g, "").trim())
 			.filter((l) => l.length > 0);
 		rulesCache = { file, mtimeMs: stat.mtimeMs, size: stat.size, rules };
 		return rules;
@@ -140,13 +140,19 @@ export function appendRule(
 	cap: number = DEFAULT_RULES_CAP,
 	maxChars: number = DEFAULT_RULES_MAX_CHARS,
 ): { added: boolean; reason: "added" | "duplicate" | "conflict" | "empty"; count: number; cap: number } {
+	// Bypass the negative cache: a rules.md created by another process
+	// within the 1s window must be seen, or this write would clobber it.
+	invalidateRulesCache();
 	// Strip control chars: a rule is injected into the system prompt verbatim.
 	const normalized = rule
-		.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u2028\u2029]/g, "")
+		.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f]/g, "")
 		.trim()
 		.replace(/\s+/g, " ")
 		.slice(0, MAX_RULE_CHARS);
-	if (!normalized) return { added: false, reason: "empty", count: loadRules(dataDir).length, cap };
+	// A rule with no alphanumeric content ('!!!', emoji-only) is not a
+	// lesson — and every such rule shares the empty dedupKey, so the first
+	// would silently shadow all later ones as 'duplicate'.
+	if (!normalized || !/[a-z0-9]/i.test(normalized)) return { added: false, reason: "empty", count: loadRules(dataDir).length, cap };
 	for (let attempt = 0; attempt < 3; attempt++) {
 		const rules = loadRules(dataDir);
 		const key = dedupKey(normalized);
@@ -229,15 +235,22 @@ export function unmarkDigestInjected(dataDir: string, sessionId: string): boolea
 		return false;
 	}
 }
-/** Injected digest session ids (awaiting delivery, then cleanup). */
+/** Injected digest session ids, newest first (by mtime, then name). */
 export function listInjectedDigests(dataDir: string): string[] {
 	try {
 		const dir = digestsDir(dataDir);
 		if (!fs.existsSync(dir)) return [];
-		return fs
-			.readdirSync(dir)
-			.filter((f) => f.endsWith(".injected.json"))
-			.map((f) => f.slice(0, -".injected.json".length));
+		const entries: Array<{ name: string; mtime: number }> = [];
+		for (const f of fs.readdirSync(dir)) {
+			if (!f.endsWith(".injected.json")) continue;
+			try {
+				entries.push({ name: f, mtime: fs.statSync(path.join(dir, f)).mtimeMs });
+			} catch {
+				// unstatable — skip it
+			}
+		}
+		entries.sort((a, b) => b.mtime - a.mtime || a.name.localeCompare(b.name));
+		return entries.map((e) => e.name.slice(0, -".injected.json".length));
 	} catch {
 		return [];
 	}
@@ -259,8 +272,10 @@ export function saveDigest(dataDir: string, digest: OuroborosDigest): void {
 
 /** Migrate a legacy digest shape to the current schema (upgrade path).
  * Pre-round-4 digests lack userPromptCount and had string[] failedCommands;
- * pre-round-5 digests lack toolCalls/assistantText. Deleting them at
- * session_start would silently lose the reflection. */
+ * pre-round-5 digests lack toolCalls/assistantText; pre-round-8 digests may
+ * carry unsanitized stopReason keys, model strings, and tool names that the
+ * current validator rejects. Deleting them at session_start would silently
+ * lose the reflection. */
 function migrateDigest(p: unknown): unknown {
 	if (typeof p !== "object" || p === null) return p;
 	const d = p as Record<string, unknown>;
@@ -273,6 +288,62 @@ function migrateDigest(p: unknown): unknown {
 	}
 	if (!Array.isArray(d.toolCalls)) d.toolCalls = [];
 	if (!Array.isArray(d.assistantText)) d.assistantText = [];
+	// Sanitize fields the round-8 validator rejects: strip the control-char
+	// class (including format controls) and re-bound lengths/counts so a
+	// pre-round-8 digest survives validation instead of being deleted.
+	// Only WELL-SHAPED elements are sanitized — a wrong-shaped element
+	// (never produced by any writer) is left untouched so the validator
+	// still rejects the digest as corrupt.
+	const strip = (s: unknown): string => (typeof s === "string" ? s.replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f]/g, "") : "");
+	// Fields the round-7 writer already bounded are only control-char
+	// stripped (a longer value is corruption and must stay rejected).
+	if (Array.isArray(d.userPrompts)) d.userPrompts = d.userPrompts.map((s) => (typeof s === "string" ? strip(s) : s)).slice(0, 12);
+	if (Array.isArray(d.assistantText)) d.assistantText = d.assistantText.map((s) => (typeof s === "string" ? strip(s) : s)).slice(0, 12);
+	if (Array.isArray(d.toolCalls)) {
+		d.toolCalls = d.toolCalls
+			.map((t) => {
+				if (typeof t !== "object" || t === null) return t;
+				const tc = t as { tool?: unknown; args?: unknown };
+				if (typeof tc.tool !== "string" || typeof tc.args !== "string") return t;
+				return { tool: strip(tc.tool), args: strip(tc.args) };
+			})
+			.slice(0, 20);
+	}
+	if (Array.isArray(d.errors)) {
+		d.errors = d.errors
+			.map((e) => {
+				if (typeof e !== "object" || e === null) return e;
+				const er = e as { tool?: unknown; summary?: unknown };
+				if (typeof er.tool !== "string" || typeof er.summary !== "string") return e;
+				// The round-7 writer stored error tool names RAW (unbounded).
+				return { tool: strip(er.tool).slice(0, 100), summary: strip(er.summary) };
+			})
+			.slice(0, 20);
+	}
+	if (Array.isArray(d.failedCommands)) {
+		d.failedCommands = d.failedCommands
+			.map((c) => {
+				if (typeof c !== "object" || c === null) return c;
+				const fc = c as { command?: unknown; error?: unknown };
+				if (typeof fc.command !== "string" || typeof fc.error !== "string") return c;
+				return { command: strip(fc.command), error: strip(fc.error) };
+			})
+			.slice(0, 20);
+	}
+	// The round-7 writer stored models RAW and unbounded — re-bound both.
+	if (Array.isArray(d.models)) d.models = d.models.map((s) => (typeof s === "string" ? strip(s).slice(0, 200) : s)).slice(0, 20);
+	if (typeof d.stopReasons === "object" && d.stopReasons !== null) {
+		const cleaned: Record<string, number> = {};
+		for (const [k, v] of Object.entries(d.stopReasons as Record<string, unknown>)) {
+			// Keys are sanitized (the round-7 writer stored them raw); values
+			// are kept as-is so a non-numeric value still fails validation.
+			const key = strip(k).slice(0, 100);
+			if (key && Object.keys(cleaned).length < 20) {
+				cleaned[key] = v as number;
+			}
+		}
+		d.stopReasons = cleaned;
+	}
 	return d;
 }
 
@@ -366,11 +437,15 @@ export function isValidDigest(p: unknown): p is OuroborosDigest {
 	if (typeof p !== "object" || p === null) return false;
 	const d = p as OuroborosDigest;
 	const isCount = (v: unknown): boolean => typeof v === "number" && Number.isFinite(v) && v >= 0;
+	// The writer caps by CODE POINTS (truncate/truncateTail/cleanName use
+	// Array.from) — the validator must measure the same way, or astral-heavy
+	// content (emoji) would fail validation and lose the reflection.
+	const cpLen = (s: string): number => Array.from(s).length;
 	const clean = (v: unknown, max: number): v is string =>
-		typeof v === "string" && v.length <= max && !/[\u0000-\u001f\u007f\u0085\u2028\u2029]/.test(v);
-	const noControl = (s: string): boolean => !/[\u0000-\u001f\u007f\u0085\u2028\u2029]/.test(s);
+		typeof v === "string" && cpLen(v) <= max && !/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f]/.test(v);
+	const noControl = (s: string): boolean => !/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f]/.test(s);
 	const strArr = (v: unknown, max: number, maxLen: number): boolean =>
-		Array.isArray(v) && v.length <= max && v.every((e) => typeof e === "string" && e.length <= maxLen && noControl(e));
+		Array.isArray(v) && v.length <= max && v.every((e) => typeof e === "string" && cpLen(e) <= maxLen && noControl(e));
 	const errArr = (v: unknown, max: number): boolean =>
 		Array.isArray(v) &&
 		v.length <= max &&
@@ -379,10 +454,10 @@ export function isValidDigest(p: unknown): p is OuroborosDigest {
 				typeof e === "object" &&
 				e !== null &&
 				typeof (e as { tool?: unknown }).tool === "string" &&
-				(e as { tool?: string }).tool!.length <= 100 &&
+				cpLen((e as { tool: string }).tool) <= 100 &&
 				noControl((e as { tool: string }).tool) &&
 				typeof (e as { summary?: unknown }).summary === "string" &&
-				(e as { summary?: string }).summary!.length <= 200 &&
+				cpLen((e as { summary: string }).summary) <= 200 &&
 				noControl((e as { summary: string }).summary),
 		);
 	const cmdArr = (v: unknown, max: number): boolean =>
@@ -393,10 +468,10 @@ export function isValidDigest(p: unknown): p is OuroborosDigest {
 				typeof e === "object" &&
 				e !== null &&
 				typeof (e as { command?: unknown }).command === "string" &&
-				(e as { command?: string }).command!.length <= 200 &&
+				cpLen((e as { command: string }).command) <= 200 &&
 				noControl((e as { command: string }).command) &&
 				typeof (e as { error?: unknown }).error === "string" &&
-				(e as { error?: string }).error!.length <= 200 &&
+				cpLen((e as { error: string }).error) <= 200 &&
 				noControl((e as { error: string }).error),
 		);
 	const toolCallArr = (v: unknown, max: number): boolean =>
@@ -407,10 +482,10 @@ export function isValidDigest(p: unknown): p is OuroborosDigest {
 				typeof e === "object" &&
 				e !== null &&
 				typeof (e as { tool?: unknown }).tool === "string" &&
-				(e as { tool?: string }).tool!.length <= 100 &&
+				cpLen((e as { tool: string }).tool) <= 100 &&
 				noControl((e as { tool: string }).tool) &&
 				typeof (e as { args?: unknown }).args === "string" &&
-				(e as { args?: string }).args!.length <= 200 &&
+				cpLen((e as { args: string }).args) <= 200 &&
 				noControl((e as { args: string }).args),
 		);
 	return (
@@ -427,7 +502,7 @@ export function isValidDigest(p: unknown): p is OuroborosDigest {
 		typeof d.stopReasons === "object" &&
 		d.stopReasons !== null &&
 		Object.keys(d.stopReasons).length <= 20 &&
-		Object.keys(d.stopReasons).every((k) => k.length <= 100 && !/[\u0000-\u001f\u007f\u0085\u2028\u2029]/.test(k)) &&
+		Object.keys(d.stopReasons).every((k) => cpLen(k) <= 100 && !/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f]/.test(k)) &&
 		Object.values(d.stopReasons).every((v) => typeof v === "number" && Number.isFinite(v) && v >= 0) &&
 		strArr(d.models, 20, 200) &&
 		isCount(d.compactions) &&

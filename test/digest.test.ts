@@ -234,14 +234,23 @@ describe("buildDigest", () => {
 		const d = buildDigest([userMessage("\u0000\u0000\u0000")], SID, CWD, END);
 		expect(d.userPrompts).toEqual([]);
 	});
+	test("format-control characters (zero-width, bidi overrides) are stripped", () => {
+		// U+200B zero-width space, U+202E bidi override, U+2060 word joiner.
+		const d = buildDigest([userMessage("a\u200bb\u202ec\u2060d")], SID, CWD, END);
+		expect(d.userPrompts[0]).toBe("abcd");
+		expect(isValidDigest(d)).toBe(true);
+	});
 
-	test("truncation never splits surrogate pairs", () => {
+	test("truncation never splits surrogate pairs and the digest round-trips (SEC-ROUND9-01)", () => {
 		const emoji = "😀".repeat(300); // 600 UTF-16 units, 300 code points
 		const d = buildDigest([userMessage(emoji)], SID, CWD, END);
 		expect(Array.from(d.userPrompts[0]!).length).toBe(241); // 240 code points + ellipsis
 		expect(d.userPrompts[0]!.endsWith("…")).toBe(true);
 		// No lone surrogates: every char must round-trip through JSON.
 		expect(JSON.parse(JSON.stringify(d.userPrompts[0]))).toBe(d.userPrompts[0]);
+		// The validator measures CODE POINTS like the writer — a 481-unit
+		// prompt must not fail validation (which would delete the digest).
+		expect(isValidDigest(d)).toBe(true);
 	});
 
 	test("records version, dedupes models, and falls back usage fields", () => {
@@ -281,6 +290,30 @@ describe("buildDigest", () => {
 		expect(d.stopReasons).toEqual({ constructor: 2, toString: 1 });
 		// The digest must pass validation (numeric counts).
 		expect(isValidDigest(d)).toBe(true);
+	});
+	test("'__proto__' stop reason is recorded as an own property (FixAudit6)", () => {
+		const d = buildDigest([assistantMessage({ stopReason: "__proto__" })], SID, CWD, END);
+		expect(Object.hasOwn(d.stopReasons, "__proto__")).toBe(true);
+		expect(d.stopReasons["__proto__"]).toBe(1);
+		expect(isValidDigest(d)).toBe(true);
+	});
+	test("cleanName never splits a surrogate pair in tool names (FixAudit6)", () => {
+		// A 100-unit tool name ending in an emoji: the code-point cut must
+		// not leave a lone surrogate.
+		const name = "x".repeat(99) + "😀";
+		const d = buildDigest(
+			[entry({ message: { role: "assistant", content: [{ type: "toolCall", id: "c1", name, arguments: { command: "x" } }], stopReason: "toolUse" } })],
+			SID,
+			CWD,
+			END,
+		);
+		// 100 code points kept (the emoji counts as one), never a lone surrogate.
+		expect(Array.from(d.toolCalls[0]!.tool)).toHaveLength(100);
+		// No lone surrogates: every code point is outside the surrogate range.
+		for (const ch of d.toolCalls[0]!.tool) {
+			const cp = ch.codePointAt(0)!;
+			expect(cp < 0xd800 || cp > 0xdfff).toBe(true);
+		}
 	});
 	test("tool names and models with control chars are sanitized at capture (SEC-ROUND8-02)", () => {
 		const d = buildDigest(

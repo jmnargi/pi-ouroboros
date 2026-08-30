@@ -89,6 +89,17 @@ describe("formatDigest", () => {
 		expect(text).not.toContain("<s>");
 		expect(text).toContain("&lt;s>");
 	});
+	test("caps the total digest block size (EdgeCases)", () => {
+		const d = digest();
+		d.userPrompts = Array.from({ length: 12 }, () => "x".repeat(300));
+		d.toolCalls = Array.from({ length: 20 }, () => ({ tool: "bash", args: "y".repeat(200) }));
+		d.assistantText = Array.from({ length: 12 }, () => "z".repeat(300));
+		d.errors = Array.from({ length: 20 }, () => ({ tool: "edit", summary: "w".repeat(200) }));
+		d.failedCommands = Array.from({ length: 20 }, () => ({ command: "v".repeat(200), error: "u".repeat(200) }));
+		const text = formatDigest(d);
+		expect(Array.from(text).length).toBeLessThanOrEqual(4001);
+		expect(text.endsWith("…")).toBe(true);
+	});
  });
 describe("buildReflectionMessage", () => {
 	test("contains digest, recording instructions, and the untrusted framing", () => {

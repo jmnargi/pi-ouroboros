@@ -63,6 +63,14 @@ describe("rules", () => {
 		expect(loadRules(dir)).toEqual(["a b"]);
 		expect((await appendRule(dir, "   ")).added).toBe(false);
 	});
+	test("appendRule rejects lessons with no alphanumeric content (EdgeCases)", async () => {
+		const dir = tmpDataDir();
+		// '!!!' and emoji-only are not lessons — and they share the empty
+		// dedupKey, so the first would shadow all later ones as 'duplicate'.
+		expect((await appendRule(dir, "!!!")).reason).toBe("empty");
+		expect((await appendRule(dir, "😀😀")).reason).toBe("empty");
+		expect(loadRules(dir)).toEqual([]);
+	});
 
 	test("appendRule drops the oldest rule at cap", async () => {
 		const dir = tmpDataDir();
@@ -282,6 +290,27 @@ describe("digests", () => {
 			{ command: "npm test", error: "" },
 			{ command: "ls /x", error: "" },
 		]);
+	});
+	test("migrateDigest sanitizes round-7 digests with dirty fields (Concurrency3)", () => {
+		const dir = tmpDataDir();
+		const file = digestFile(dir, "sess-legacy");
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		const base = digest();
+		// Round-7 writer output: raw stopReason key with a tab, raw model
+		// string with ESC, 25 models (unbounded), raw error tool name.
+		const round7 = {
+			...base,
+			stopReasons: { "stop\treason": 1 },
+			models: ["vitruvix\u001bcode", ...Array.from({ length: 25 }, (_, i) => `model-${i}`)],
+			errors: [{ tool: "edit\u2028evil", summary: "boom" }],
+		};
+		fs.writeFileSync(file, JSON.stringify(round7));
+		const migrated = loadDigest(dir, "sess-legacy");
+		expect(migrated).not.toBeNull();
+		expect(migrated!.stopReasons).toEqual({ stopreason: 1 });
+		expect(migrated!.models).toHaveLength(20);
+		expect(migrated!.models[0]).toBe("vitruvixcode");
+		expect(migrated!.errors[0]!.tool).toBe("editevil");
 	});
 
 	test("last digest round-trips for /ouroboros digest (UX-2)", () => {

@@ -273,12 +273,11 @@ describe("session_start", () => {
 		expect(api.messages[0]!.message.content).toContain("sess-a");
 		expect(readdirSync(digestsDir(dataDir))).toEqual(["sess-a.injected.json"]);
 	});
-	test("digests marked injected at entry are never deleted as stale (Concurrency2)", () => {
+	test("digests marked injected at entry are never deleted as stale (Concurrency2/3)", () => {
 		// Both sess-a (older) and sess-b (newer) are marked injected at
-		// entry. The unmark loop recovers both; the newest (sess-b) is
-		// injected. sess-a is in initialInjected, so the stale-delete must
-		// SKIP it — it stays pending for the next session start. Reverting
-		// the skip deletes sess-a, failing this test.
+		// entry. Both are recovered (markers kept — the atomic claim). The
+		// newest (sess-b) is injected; sess-a keeps its marker for the next
+		// session start. Reverting the recovered-skip deletes sess-a.
 		saveDigest(dataDir, buildDigest(notableEntries("sess-a"), "sess-a", "/proj", "2026-08-30T10:00:00.000Z"));
 		markDigestInjected(dataDir, "sess-a");
 		saveDigest(dataDir, buildDigest(notableEntries("sess-b"), "sess-b", "/proj", "2026-08-30T11:00:00.000Z"));
@@ -287,7 +286,7 @@ describe("session_start", () => {
 		handler({}, fakeCtx());
 		expect(api.messages).toHaveLength(1);
 		expect(api.messages[0]!.message.content).toContain("sess-b");
-		expect(readdirSync(digestsDir(dataDir)).sort()).toEqual(["sess-a.json", "sess-b.injected.json"]);
+		expect(readdirSync(digestsDir(dataDir)).sort()).toEqual(["sess-a.injected.json", "sess-b.injected.json"]);
 	});
 	test("a corrupt digest after an injected one is deleted by filename without parsing", () => {
 		saveDigest(dataDir, buildDigest(notableEntries("sess-a"), "sess-a", "/proj", "2026-08-30T10:00:00.000Z"));
@@ -323,6 +322,18 @@ describe("session_start", () => {
 		handler({ reason: "startup" }, fakeCtx({ sessionManager: { getEntries: () => entries } }));
 		expect(api.messages).toHaveLength(1);
 		expect(api.messages[0]!.message.customType).toBe(OUROBOROS_CUSTOM_TYPE);
+		expect(readdirSync(digestsDir(dataDir))).toEqual(["sess-1.injected.json"]);
+	});
+	test("a different digest's reflection mentioning 'session: sess-1' in its DATA does not match (EdgeCases)", () => {
+		saveDigest(dataDir, buildDigest(notableEntries(), "sess-1", "/proj", "2026-08-30T12:00:00.000Z"));
+		markDigestInjected(dataDir, "sess-1");
+		// The reflection for sess-other contains a user prompt that literally
+		// says '- session: sess-1'. The needle must match the digest-block
+		// LINE (\nsession: sess-1\n), not a bare substring.
+		const entries = [{ type: "custom_message", customType: OUROBOROS_CUSTOM_TYPE, content: "[Ouroboros] ...\nsession: sess-other\ncwd: /proj\n\nuser prompts:\n- session: sess-1" }];
+		const handler = api.fire.bind(api, "session_start");
+		handler({ reason: "startup" }, fakeCtx({ sessionManager: { getEntries: () => entries } }));
+		expect(api.messages).toHaveLength(1);
 		expect(readdirSync(digestsDir(dataDir))).toEqual(["sess-1.injected.json"]);
 	});
 	test("resume without the reflection in history re-injects it", () => {

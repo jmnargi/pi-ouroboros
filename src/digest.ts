@@ -120,7 +120,7 @@ function truncate(s: string, max: number): string {
 	while (true) {
 		cleaned = s
 			.slice(0, bound)
-			.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u2028\u2029]/g, "")
+			.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f]/g, "")
 			.trim()
 			.replace(/\s+/g, " ");
 		if (Array.from(cleaned).length > max || bound >= s.length) break;
@@ -134,15 +134,19 @@ function truncate(s: string, max: number): string {
 
 /** Lightweight sanitizer for short identifiers (tool names, models):
  * strips the same control-char class the validator rejects, then slices.
- * Cheaper than truncate (no whitespace collapse, no ellipsis). */
+ * Cheaper than truncate (no whitespace collapse, no ellipsis). The fast
+ * path (short names) avoids Array.from; only over-long names pay for the
+ * code-point cut (never mid-surrogate-pair). */
 function cleanName(s: string, max: number): string {
-	return s.replace(/[\u0000-\u001f\u007f\u0085\u2028\u2029]/g, "").slice(0, max);
+	const cleaned = s.replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f]/g, "");
+	if (cleaned.length <= max) return cleaned;
+	return Array.from(cleaned).slice(0, max).join("");
 }
 
 /** Keep the LAST max code points — bash errors put the exit code at the end. */
 function truncateTail(s: string, max: number): string {
 	const cleaned = s
-		.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u2028\u2029]/g, "")
+		.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f]/g, "")
 		.trim()
 		.replace(/\s+/g, " ");
 	const chars = Array.from(cleaned);
@@ -179,7 +183,9 @@ export function buildDigest(
 		assistantText: [],
 		errors: [],
 		failedCommands: [],
-		stopReasons: {},
+		// Null prototype: a stopReason key named '__proto__' must be an own
+		// property, not swallowed by the Object.prototype setter.
+		stopReasons: Object.create(null) as Record<string, number>,
 		models: [],
 		compactions: 0,
 		usage: { input: 0, output: 0, cost: 0 },
@@ -204,10 +210,13 @@ export function buildDigest(
 		const entry = raw as RawEntry;
 
 		// Session header (present in tests; getEntries() excludes it in pi).
+		// Metadata is sanitized at capture: a control char in the project
+		// directory name must not make the digest fail validation on load
+		// (which would silently delete it and lose the reflection).
 		if (entry.type === "session") {
-			if (typeof entry.cwd === "string" && entry.cwd) digest.cwd = entry.cwd;
-			if (typeof entry.id === "string" && entry.id) digest.sessionId = entry.id;
-			if (typeof entry.timestamp === "string" && entry.timestamp) digest.startedAt = entry.timestamp;
+			if (typeof entry.cwd === "string" && entry.cwd) digest.cwd = cleanName(entry.cwd, 2000);
+			if (typeof entry.id === "string" && entry.id) digest.sessionId = cleanName(entry.id, 200);
+			if (typeof entry.timestamp === "string" && entry.timestamp) digest.startedAt = cleanName(entry.timestamp, 100);
 			continue;
 		}
 
@@ -256,7 +265,7 @@ export function buildDigest(
 				// not insert control chars into the reflection.
 				// Same control-char class the validator rejects — a key that
 				// survives here must round-trip through isValidDigest.
-				const key = msg.stopReason.replace(/[\u0000-\u001f\u007f\u0085\u2028\u2029]/g, "").slice(0, 100);
+				const key = msg.stopReason.replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f]/g, "").slice(0, 100);
 				if (key) {
 					// Object.hasOwn: a key naming an Object.prototype property
 					// ('constructor', 'toString', ...) must not be treated as
@@ -268,11 +277,15 @@ export function buildDigest(
 					}
 				}
 			}
-			if (typeof msg.model === "string" && msg.model && !seenModels.has(msg.model) && seenModels.size < 20) {
-				seenModels.add(msg.model);
+			if (typeof msg.model === "string" && msg.model) {
 				// cleanName strips control chars — a crafted model string
-				// must not carry ESC/U+2028 into the reflection.
-				digest.models.push(cleanName(msg.model, 200));
+				// must not carry ESC/U+2028 into the reflection. Dedup on
+				// the CLEANED name so raw-vs-cleaned duplicates collapse.
+				const model = cleanName(msg.model, 200);
+				if (model && !seenModels.has(model) && seenModels.size < 20) {
+					seenModels.add(model);
+					digest.models.push(model);
+				}
 			}
 			const usage = msg.usage;
 			if (usage) {

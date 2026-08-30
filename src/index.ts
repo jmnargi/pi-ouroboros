@@ -88,7 +88,11 @@ function envInt(name: string, fallback: number): number {
  * mask an undelivered one. The entries come from the runtime's own parsed
  * session (ctx.sessionManager.getEntries()) — complete, bounded, no file IO. */
 function sessionHasOuroborosMessage(entries: unknown[], sessionId: string): boolean {
-	const needle = `session: ${sessionId}`;
+	// Match the digest-block line, not a bare substring: a reflection for a
+	// DIFFERENT digest whose data contains 'session: <this id>' (e.g. a user
+	// prompt '- session: A') must not count as delivered. The real block
+	// always renders `\nsession: <id>\n` as its first line.
+	const needle = `\nsession: ${sessionId}\n`;
 	for (const raw of entries) {
 		if (!raw || typeof raw !== "object") continue;
 		const entry = raw as { type?: unknown; customType?: unknown; content?: unknown };
@@ -185,14 +189,9 @@ export default function (pi: ExtensionAPI): void {
 		// the queued message survives in _pendingNextTurnMessages, and
 		// unmarking would deliver the reflection twice.
 		const recovered: string[] = [];
-		// Digests that were marked injected at entry may be recovered by a
-		// CONCURRENT instance (unmark race). Never delete them as stale —
-		// the winner may still be about to inject them.
-		const initialInjected = new Set<string>();
 		if (event.reason !== "reload") {
 			try {
 				const injected = listInjectedDigests(dataDir);
-				for (const sid of injected) initialInjected.add(sid);
 				if (injected.length > 0) {
 					// The queued reflection may already be in the CURRENT
 					// session's history: the message is drained (persisted)
@@ -201,16 +200,21 @@ export default function (pi: ExtensionAPI): void {
 					// primary resume path (pi --continue/--resume) emits
 					// reason "startup", not "resume". If the history already
 					// has the reflection for this digest, delete the marker
-					// instead of unmarking — re-injecting would deliver it
-					// twice. The entries come from the runtime's parsed
-					// session (complete, no file IO).
+					// instead of re-injecting — that would deliver it twice.
+					// The entries come from the runtime's parsed session
+					// (complete, no file IO).
 					const entries = (ctx as unknown as { sessionManager?: { getEntries?: () => unknown[] } }).sessionManager?.getEntries?.() ?? [];
 					for (const sid of injected) {
 						const digest = readInjectedDigest(dataDir, sid);
 						const alreadyDelivered = digest ? sessionHasOuroborosMessage(entries, digest.sessionId) : false;
 						if (alreadyDelivered) {
 							deleteInjectedDigest(dataDir, sid);
-						} else if (unmarkDigestInjected(dataDir, sid)) {
+						} else {
+							// Keep the marker (the atomic claim) and process
+							// the digest directly from the injected state.
+							// Unmarking would open a pending window in which
+							// a concurrent instance could delete the digest
+							// as stale before it is re-injected.
 							recovered.push(sid);
 						}
 					}
@@ -220,41 +224,39 @@ export default function (pi: ExtensionAPI): void {
 				// best-effort — a failed cleanup must not block the reflection
 			}
 		}
-		// The list is captured ONCE — a second call would re-sort. Recovered
-		// digests (undelivered reflections) go FIRST so the newest-wins
-		// delete cannot drop them in favor of a newer digest. `all` is
-		// mtime-sorted, so filtering it keeps the recovered digests in
-		// newest-first order (the freshest undelivered reflection wins).
+		// Recovered digests keep their markers (still injected), so they are
+		// NOT in `all` (which lists pending digests only). They go FIRST,
+		// mtime-sorted newest-first (listInjectedDigests sorts), so the
+		// freshest undelivered reflection wins. Pending digests follow.
 		const all = listDigests(dataDir);
 		const recoveredSet = new Set(recovered);
-		const ordered = [...all.filter((s) => recoveredSet.has(s)), ...all.filter((s) => !recoveredSet.has(s))];
+		const ordered = [...recovered, ...all.filter((s) => !recoveredSet.has(s))];
 		let injected = false;
 		for (const sid of ordered) {
 			// One corrupt digest must not block the rest.
 			try {
-			if (injected) {
-				// Skip digests that were marked injected at entry — a
-				// concurrent instance may have recovered them and be
-				// about to inject them. Deleting would drop the
-				// undelivered reflection. They are re-processed at the
-				// next session start if still pending.
-				if (!initialInjected.has(sid)) deleteDigest(dataDir, sid);
-				continue;
-			}
-				const digest = loadDigest(dataDir, sid);
+				if (injected) {
+					// Recovered digests keep their markers (still claimed) —
+					// they are re-processed at the next session start.
+					// Pending digests are stale once one reflection is queued.
+					if (!recoveredSet.has(sid)) deleteDigest(dataDir, sid);
+					continue;
+				}
+				const digest = recoveredSet.has(sid) ? readInjectedDigest(dataDir, sid) : loadDigest(dataDir, sid);
 				if (!digest) {
-					deleteDigest(dataDir, sid);
+					if (recoveredSet.has(sid)) deleteInjectedDigest(dataDir, sid);
+					else deleteDigest(dataDir, sid);
 					continue;
 				}
 				if (!isNotable(digest, minPrompts)) {
 					// Nothing worth reflecting on — don't burn tokens.
-					deleteDigest(dataDir, sid);
+					if (recoveredSet.has(sid)) deleteInjectedDigest(dataDir, sid);
+					else deleteDigest(dataDir, sid);
 					continue;
 				}
-				// Mark injected BEFORE sending: the rename is the atomic
-				// claim. If it fails, another instance won — the digest is
-				// theirs, so leave it alone.
-				if (!markDigestInjected(dataDir, sid)) {
+				// Pending digests are claimed with the rename (the atomic
+				// claim). Recovered digests are already claimed.
+				if (!recoveredSet.has(sid) && !markDigestInjected(dataDir, sid)) {
 					continue;
 				}
 				try {
@@ -269,8 +271,9 @@ export default function (pi: ExtensionAPI): void {
 				} catch {
 					// sendMessage never throws in the current runtime, but if
 					// it ever does, restore the digest for the next session
-					// start instead of losing the reflection.
-					unmarkDigestInjected(dataDir, sid);
+					// start instead of losing the reflection. Recovered
+					// digests keep their marker (still claimed).
+					if (!recoveredSet.has(sid)) unmarkDigestInjected(dataDir, sid);
 					continue;
 				}
 				reflectQueued = true;

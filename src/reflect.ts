@@ -12,7 +12,9 @@
 import type { OuroborosDigest } from "./digest.ts";
 
 export const OUROBOROS_CUSTOM_TYPE = "ouroboros";
-
+/** Total digest-block budget (code points) — a pathological digest must not
+ * inject ~9k tokens into the next session's first turn. */
+export const FORMAT_DIGEST_MAX_CHARS = 4000;
 /** Render a digest as a compact, model-readable block. */
 export function formatDigest(digest: OuroborosDigest): string {
 	const lines: string[] = [];
@@ -51,7 +53,13 @@ export function formatDigest(digest: OuroborosDigest): string {
 		lines.push("", "failed commands:");
 		for (const c of digest.failedCommands) lines.push(`- ${escapeTags(c.command)} → ${escapeTags(c.error)}`);
 	}
-	return lines.join("\n");
+	const text = lines.join("\n");
+	// Total budget: a pathological digest (every field at its cap) would
+	// otherwise inject ~9k tokens into the next session's first turn.
+	if (Array.from(text).length > FORMAT_DIGEST_MAX_CHARS) {
+		return `${Array.from(text).slice(0, FORMAT_DIGEST_MAX_CHARS).join("")}…`;
+	}
+	return text;
 }
 
 /** Neutralize XML-like tags in digest content so they cannot break out of
