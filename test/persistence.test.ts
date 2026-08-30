@@ -134,6 +134,20 @@ describe("rules", () => {
 		fs.mkdirSync(rulesFile(dir), { recursive: true });
 		expect(loadRules(dir)).toEqual([]);
 	});
+	test("rulesMissing negative cache is keyed by file path and cleared by writes", () => {
+		const dir1 = tmpDataDir();
+		const dir2 = tmpDataDir();
+		// dir1's rules are missing — the negative cache records dir1's path.
+		expect(loadRules(dir1)).toEqual([]);
+		// dir2 has rules. A GLOBAL negative cache would return [] from dir1's
+		// entry; the keyed cache re-stats dir2 and returns its rules.
+		fs.mkdirSync(path.dirname(rulesFile(dir2)), { recursive: true });
+		fs.writeFileSync(rulesFile(dir2), "- dir2 rule\n");
+		expect(loadRules(dir2)).toEqual(["- dir2 rule"]);
+		// appendRule clears the negative cache: dir1's rules now exist.
+		appendRule(dir1, "own rule");
+		expect(loadRules(dir1)).toEqual(["own rule"]);
+	});
 	test("appendRule dedupes semantically (case, punctuation, spacing)", async () => {
 		const dir = tmpDataDir();
 		await appendRule(dir, "Always re-read before editing!");

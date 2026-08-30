@@ -80,15 +80,15 @@ The plugin keeps handler work small.
 Measured costs:
 
 - Session start with no digests: 0.002 ms.
-- Session start with 1 digest: 0.023 ms.
-- Session start with 50 digests: 0.117 ms.
+- Session start with 1 digest: 0.019 ms.
+- Session start with 50 digests: 0.092 ms.
 - Rules read per turn (cached): 0.002 ms.
 - Skills read per turn (cached): 0.002 ms.
-- Rule append at cap (char eviction): 0.040 ms.
+- Rule append at cap (char eviction): 0.048 ms.
 - Digest list with 10,000 digests: 21 ms.
-- Digest build with a 300 KB prompt: 0.067 ms.
-- Digest build with 10,000 tool calls (capped): 3.3 ms.
-- Digest save (atomic write): 0.024 ms.
+- Digest build with a 300 KB prompt: 0.055 ms.
+- Digest build with 10,000 tool calls (capped): 4.4 ms.
+- Digest save (atomic write): 0.019 ms.
 
 The plugin caches the rules file.
 The plugin invalidates the cache on its own writes.
@@ -145,7 +145,7 @@ npx tsc --noEmit
 The tests cover digest extraction, persistence, prompt building, and the extension entry point.
 Run `bun bench/bench.ts` to measure the hot paths.
 
-The test suite has 117 tests.
+The test suite has 123 tests.
 
 The reflection happens at the start of the next session.
 The reflection does not happen at shutdown.

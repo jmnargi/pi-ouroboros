@@ -273,6 +273,22 @@ describe("session_start", () => {
 		expect(api.messages[0]!.message.content).toContain("sess-a");
 		expect(readdirSync(digestsDir(dataDir))).toEqual(["sess-a.injected.json"]);
 	});
+	test("digests marked injected at entry are never deleted as stale (Concurrency2)", () => {
+		// Both sess-a (older) and sess-b (newer) are marked injected at
+		// entry. The unmark loop recovers both; the newest (sess-b) is
+		// injected. sess-a is in initialInjected, so the stale-delete must
+		// SKIP it — it stays pending for the next session start. Reverting
+		// the skip deletes sess-a, failing this test.
+		saveDigest(dataDir, buildDigest(notableEntries("sess-a"), "sess-a", "/proj", "2026-08-30T10:00:00.000Z"));
+		markDigestInjected(dataDir, "sess-a");
+		saveDigest(dataDir, buildDigest(notableEntries("sess-b"), "sess-b", "/proj", "2026-08-30T11:00:00.000Z"));
+		markDigestInjected(dataDir, "sess-b");
+		const handler = api.fire.bind(api, "session_start");
+		handler({}, fakeCtx());
+		expect(api.messages).toHaveLength(1);
+		expect(api.messages[0]!.message.content).toContain("sess-b");
+		expect(readdirSync(digestsDir(dataDir)).sort()).toEqual(["sess-a.json", "sess-b.injected.json"]);
+	});
 	test("a corrupt digest after an injected one is deleted by filename without parsing", () => {
 		saveDigest(dataDir, buildDigest(notableEntries("sess-a"), "sess-a", "/proj", "2026-08-30T10:00:00.000Z"));
 		markDigestInjected(dataDir, "sess-a");

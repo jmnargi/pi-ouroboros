@@ -362,15 +362,15 @@ export function listDigests(dataDir: string): string[] {
 		return [];
 	}
 }
-
-function isValidDigest(p: unknown): p is OuroborosDigest {
+export function isValidDigest(p: unknown): p is OuroborosDigest {
 	if (typeof p !== "object" || p === null) return false;
 	const d = p as OuroborosDigest;
 	const isCount = (v: unknown): boolean => typeof v === "number" && Number.isFinite(v) && v >= 0;
 	const clean = (v: unknown, max: number): v is string =>
 		typeof v === "string" && v.length <= max && !/[\u0000-\u001f\u007f\u0085\u2028\u2029]/.test(v);
+	const noControl = (s: string): boolean => !/[\u0000-\u001f\u007f\u0085\u2028\u2029]/.test(s);
 	const strArr = (v: unknown, max: number, maxLen: number): boolean =>
-		Array.isArray(v) && v.length <= max && v.every((e) => typeof e === "string" && e.length <= maxLen);
+		Array.isArray(v) && v.length <= max && v.every((e) => typeof e === "string" && e.length <= maxLen && noControl(e));
 	const errArr = (v: unknown, max: number): boolean =>
 		Array.isArray(v) &&
 		v.length <= max &&
@@ -379,7 +379,11 @@ function isValidDigest(p: unknown): p is OuroborosDigest {
 				typeof e === "object" &&
 				e !== null &&
 				typeof (e as { tool?: unknown }).tool === "string" &&
-				typeof (e as { summary?: unknown }).summary === "string",
+				(e as { tool?: string }).tool!.length <= 100 &&
+				noControl((e as { tool: string }).tool) &&
+				typeof (e as { summary?: unknown }).summary === "string" &&
+				(e as { summary?: string }).summary!.length <= 200 &&
+				noControl((e as { summary: string }).summary),
 		);
 	const cmdArr = (v: unknown, max: number): boolean =>
 		Array.isArray(v) &&
@@ -389,7 +393,11 @@ function isValidDigest(p: unknown): p is OuroborosDigest {
 				typeof e === "object" &&
 				e !== null &&
 				typeof (e as { command?: unknown }).command === "string" &&
-				typeof (e as { error?: unknown }).error === "string",
+				(e as { command?: string }).command!.length <= 200 &&
+				noControl((e as { command: string }).command) &&
+				typeof (e as { error?: unknown }).error === "string" &&
+				(e as { error?: string }).error!.length <= 200 &&
+				noControl((e as { error: string }).error),
 		);
 	const toolCallArr = (v: unknown, max: number): boolean =>
 		Array.isArray(v) &&
@@ -400,8 +408,10 @@ function isValidDigest(p: unknown): p is OuroborosDigest {
 				e !== null &&
 				typeof (e as { tool?: unknown }).tool === "string" &&
 				(e as { tool?: string }).tool!.length <= 100 &&
+				noControl((e as { tool: string }).tool) &&
 				typeof (e as { args?: unknown }).args === "string" &&
-				(e as { args?: string }).args!.length <= 200,
+				(e as { args?: string }).args!.length <= 200 &&
+				noControl((e as { args: string }).args),
 		);
 	return (
 		d.version === 1 &&

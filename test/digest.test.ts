@@ -5,6 +5,7 @@
 import { describe, expect, test } from "bun:test";
 
 import { buildDigest, extractText, isNotable } from "../src/digest.ts";
+import { isValidDigest } from "../src/persistence.ts";
 
 const SID = "sess-123";
 const CWD = "/home/user/proj";
@@ -254,6 +255,60 @@ describe("buildDigest", () => {
 		expect(d.models).toEqual(["vitruvix-code"]);
 		expect(d.usage).toEqual({ input: 105, output: 50, cost: 0.001 }); // missing fields → 0
 		expect(d.errors).toEqual([{ tool: "tool", summary: "boom" }]); // no toolName → "tool"
+	});
+	test("caps stop reasons at 20 and sanitizes keys", () => {
+		const entries = Array.from({ length: 30 }, (_, i) => assistantMessage({ stopReason: `reason-${i}` }));
+		const d = buildDigest(entries, SID, CWD, END);
+		expect(Object.keys(d.stopReasons)).toHaveLength(20);
+		// A crafted stopReason with control chars is sanitized at capture.
+		const dirty = buildDigest([assistantMessage({ stopReason: "ok\u0007reason" })], SID, CWD, END);
+		expect(dirty.stopReasons).toEqual({ okreason: 1 });
+		// Tab/LF/CR are in the validator's rejected class too — a key that
+		// survives the writer must round-trip through saveDigest/loadDigest.
+		const tabbed = buildDigest([assistantMessage({ stopReason: "stop\treason" })], SID, CWD, END);
+		expect(tabbed.stopReasons).toEqual({ stopreason: 1 });
+		expect(isValidDigest(tabbed)).toBe(true);
+	});
+	test("stop reasons named after Object.prototype properties stay numeric (SEC-ROUND8-01)", () => {
+		// 'constructor'/'toString' must not resolve to the inherited function
+		// (which would string-concatenate and corrupt the digest).
+		const d = buildDigest(
+			[assistantMessage({ stopReason: "constructor" }), assistantMessage({ stopReason: "toString" }), assistantMessage({ stopReason: "constructor" })],
+			SID,
+			CWD,
+			END,
+		);
+		expect(d.stopReasons).toEqual({ constructor: 2, toString: 1 });
+		// The digest must pass validation (numeric counts).
+		expect(isValidDigest(d)).toBe(true);
+	});
+	test("tool names and models with control chars are sanitized at capture (SEC-ROUND8-02)", () => {
+		const d = buildDigest(
+			[
+				entry({
+					message: {
+						role: "assistant",
+						content: [{ type: "toolCall", id: "c1", name: "bash\u2028evil", arguments: { command: "x" } }],
+						stopReason: "toolUse",
+						model: "vitruvix\u001bcode",
+					},
+				}),
+			],
+			SID,
+			CWD,
+			END,
+		);
+		expect(d.toolCalls[0]!.tool).not.toContain("\u2028");
+		expect(d.models[0]).not.toContain("\u001b");
+	});
+	test("error tool names with control chars are sanitized and bounded", () => {
+		const d = buildDigest(
+			[entry({ message: { role: "toolResult", content: [{ type: "text", text: "boom" }], isError: true, toolName: "edit\u2028evil" } })],
+			SID,
+			CWD,
+			END,
+		);
+		expect(d.errors[0]!.tool).not.toContain("\u2028");
 	});
 
 	test("caps errors and failed commands at 20 each", () => {

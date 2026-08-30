@@ -1,7 +1,7 @@
 {
   "name": "pi-ouroboros",
   "version": "0.1.0",
-  "description": "Self-improving pi coding agent. Pi digests its own sessions. Pi reflects on its mistakes. Pi writes its own rules and skills. The next session starts smarter.",
+  "description": "Self-improving pi coding agent. Pi digests its own sessions. Pi reflects on its mistakes. Pi writes its own rules and skills. The next session starts with more knowledge.",
   "type": "module",
   "files": [
     "src",

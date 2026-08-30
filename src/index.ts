@@ -18,7 +18,7 @@
  *     that pi auto-discovers on the next startup.
  *
  * The agent does the reflection itself (in its own loop, with its own tools).
- * Ouroboros is pure plumbing: deterministic digesting, file IO, and prompt
+ * Ouroboros does only deterministic digesting, file IO, and prompt
  * injection. Nothing here calls the model directly.
  */
 
@@ -80,13 +80,13 @@ function envInt(name: string, fallback: number): number {
 }
 
 /** True when the session entries already contain the reflection for digest
- * `sessionId`. The message is drained (persisted) before the first LLM call,
- * so a failed first turn leaves it in the history with the marker still set.
- * Re-injecting on resume would deliver the reflection twice. The content is
- * matched per-digest (`session: <sessionId>` in the digest block) so an OLD
- * ouroboros message from a prior successful reflection cannot mask an
- * undelivered one. The entries come from the runtime's own parsed session
- * (ctx.sessionManager.getEntries()) — complete, bounded, no file IO. */
+ * `sessionId`. The message is drained (persisted) before the first LLM call.
+ * A failed first turn leaves it in the history with the marker still set.
+ * Re-injecting on resume would deliver the reflection twice.
+ * The content is matched per-digest (`session: <sessionId>` in the digest
+ * block). An OLD ouroboros message from a prior successful reflection cannot
+ * mask an undelivered one. The entries come from the runtime's own parsed
+ * session (ctx.sessionManager.getEntries()) — complete, bounded, no file IO. */
 function sessionHasOuroborosMessage(entries: unknown[], sessionId: string): boolean {
 	const needle = `session: ${sessionId}`;
 	for (const raw of entries) {
@@ -331,7 +331,7 @@ export default function (pi: ExtensionAPI): void {
 		description: [
 			"Record a self-learned lesson for future sessions.",
 			"kind=rule: append an imperative rule to the ouroboros rules file. The plugin injects it into the system prompt from the next turn on. The plugin skips duplicates. The newest rules replace the oldest when at cap.",
-			"kind=skill: write a skill (SKILL.md with name + description frontmatter) under the pi agent skills directory; pi discovers it automatically on the next startup.",
+			"kind=skill: write a skill (SKILL.md with name + description frontmatter) under the pi agent skills directory. Pi discovers it automatically on the next startup.",
 		].join(" "),
 		parameters: Type.Object({
 			lesson: Type.String({
@@ -465,7 +465,7 @@ export default function (pi: ExtensionAPI): void {
 			const skills = listSkills(dataDir);
 			const pending = listDigests(dataDir);
 			const lines = [
-				`ouroboros: ${rules.length} rules, ${skills.length} skills, ${pending.length} pending digest(s)`,
+				`ouroboros: ${rules.length} rules, ${skills.length} skill${skills.length === 1 ? "" : "s"}, ${pending.length} pending digest(s)`,
 				`rules file: ${rulesFile(dataDir)}`,
 			];
 			if (rules.length > 0) {

@@ -6,7 +6,7 @@
  * It contains user prompts, failed tool calls, failed bash commands,
  * assistant stop reasons, compaction pressure, and token/cost totals.
  * The plugin deliberately drops everything else: thinking traces, full
- * outputs, and tool arguments.
+ * outputs, and full tool arguments.
  *
  * The extractor is defensive.
  * It walks unknown entry shapes with optional chaining.
@@ -26,7 +26,7 @@
  *     is also handled, for other bash paths and future versions.
  *
  * Digest content is UNTRUSTED DATA: it can contain text from files, tools,
- * and other agents. Control characters are stripped so it cannot smuggle
+ * and other agents. Control characters are stripped so they cannot insert
  * formatting or instructions into the reflection message.
  */
 
@@ -130,6 +130,13 @@ function truncate(s: string, max: number): string {
 	// Cut by code points, never mid-surrogate-pair (emoji must survive).
 	const chars = Array.from(cleaned);
 	return `${chars.slice(0, max).join("")}…`;
+}
+
+/** Lightweight sanitizer for short identifiers (tool names, models):
+ * strips the same control-char class the validator rejects, then slices.
+ * Cheaper than truncate (no whitespace collapse, no ellipsis). */
+function cleanName(s: string, max: number): string {
+	return s.replace(/[\u0000-\u001f\u007f\u0085\u2028\u2029]/g, "").slice(0, max);
 }
 
 /** Keep the LAST max code points — bash errors put the exit code at the end. */
@@ -244,11 +251,28 @@ export function buildDigest(
 		}
 		if (msg.role === "assistant") {
 			if (typeof msg.stopReason === "string" && msg.stopReason) {
-				digest.stopReasons[msg.stopReason] = (digest.stopReasons[msg.stopReason] ?? 0) + 1;
+				// Bounded and sanitized: a crafted session must not grow the
+				// stopReasons object without limit, and a crafted key must
+				// not insert control chars into the reflection.
+				// Same control-char class the validator rejects — a key that
+				// survives here must round-trip through isValidDigest.
+				const key = msg.stopReason.replace(/[\u0000-\u001f\u007f\u0085\u2028\u2029]/g, "").slice(0, 100);
+				if (key) {
+					// Object.hasOwn: a key naming an Object.prototype property
+					// ('constructor', 'toString', ...) must not be treated as
+					// an existing count (the inherited value is a function).
+					if (Object.hasOwn(digest.stopReasons, key)) {
+						digest.stopReasons[key] = (digest.stopReasons[key] ?? 0) + 1;
+					} else if (Object.keys(digest.stopReasons).length < 20) {
+						digest.stopReasons[key] = 1;
+					}
+				}
 			}
-			if (typeof msg.model === "string" && msg.model && !seenModels.has(msg.model)) {
+			if (typeof msg.model === "string" && msg.model && !seenModels.has(msg.model) && seenModels.size < 20) {
 				seenModels.add(msg.model);
-				digest.models.push(msg.model);
+				// cleanName strips control chars — a crafted model string
+				// must not carry ESC/U+2028 into the reflection.
+				digest.models.push(cleanName(msg.model, 200));
 			}
 			const usage = msg.usage;
 			if (usage) {
@@ -276,7 +300,9 @@ export function buildDigest(
 					// session does not build a 10k-element array.
 					if (b.type === "toolCall" && typeof b.name === "string") {
 						if (rawToolCalls.length >= TOOL_CALL_CAP) rawToolCalls.shift();
-						rawToolCalls.push({ tool: b.name.slice(0, TOOL_NAME_MAX_CHARS), args: b.arguments });
+						// cleanName strips control chars (a prompt-injected
+						// model can emit a tool name with ESC/U+2028).
+						rawToolCalls.push({ tool: cleanName(b.name, TOOL_NAME_MAX_CHARS), args: b.arguments });
 					} else if (b.type === "text" && typeof b.text === "string" && b.text.trim()) {
 						if (rawAssistantText.length >= ASSISTANT_TEXT_CAP) rawAssistantText.shift();
 						rawAssistantText.push(b.text);
@@ -308,7 +334,9 @@ export function buildDigest(
 
 			// Other failed tools: isError/toolName on the message object.
 			if (msg.isError === true) {
-				const tool = typeof msg.toolName === "string" ? msg.toolName : "tool";
+				// cleanName strips control chars and bounds the length — a
+				// crafted session file must not bloat the digest via toolName.
+				const tool = cleanName(typeof msg.toolName === "string" ? msg.toolName : "tool", TOOL_NAME_MAX_CHARS);
 				const summary = truncate(extractText(msg.content), ERROR_MAX_CHARS) || "(no output)";
 				const key = `${tool}:${summary}`;
 				if (!seenErrors.has(key) && seenErrors.size < DEDUP_CAP) {
@@ -360,7 +388,7 @@ export function isNotable(digest: OuroborosDigest, minPrompts: number): boolean 
 	if (digest.failedCommands.length > 0) return true;
 	// Benign stop reasons (stop/toolUse) fire on every normal turn — only
 	// abnormal ones (length, error, aborted) make a session notable.
-	const hasAbnormalStop = Object.keys(digest.stopReasons).some((k) => !BENIGN_STOP_REASONS[k]);
+	const hasAbnormalStop = Object.keys(digest.stopReasons).some((k) => !Object.hasOwn(BENIGN_STOP_REASONS, k));
 	if (hasAbnormalStop) return true;
 	if (digest.compactions > 0) return true;
 	// A long successful session is worth reflecting on, but only well above
