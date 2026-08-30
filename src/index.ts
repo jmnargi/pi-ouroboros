@@ -88,11 +88,12 @@ function envInt(name: string, fallback: number): number {
  * mask an undelivered one. The entries come from the runtime's own parsed
  * session (ctx.sessionManager.getEntries()) — complete, bounded, no file IO. */
 function sessionHasOuroborosMessage(entries: unknown[], sessionId: string): boolean {
-	// Match the digest-block line, not a bare substring: a reflection for a
-	// DIFFERENT digest whose data contains 'session: <this id>' (e.g. a user
-	// prompt '- session: A') must not count as delivered. The real block
-	// always renders `\nsession: <id>\n` as its first line, with '<' escaped
-	// exactly as formatDigest does — the needle must match the RENDERED form.
+	// Match the digest-block line, not a bare substring.
+	// A reflection for a different digest must not count as delivered.
+	// Its data can contain 'session: <this id>' (for example, a user prompt
+	// '- session: A'). The real block always renders `\nsession: <id>\n` as
+	// its first line, with '<' escaped exactly as formatDigest does — the
+	// needle must match the RENDERED form.
 	const needle = `\nsession: ${escapeTags(sessionId)}\n`;
 	for (const raw of entries) {
 		if (!raw || typeof raw !== "object") continue;
@@ -168,7 +169,7 @@ export default function (pi: ExtensionAPI): void {
 		if (event.reason === "reload" || event.reason === "fork") return;
 		try {
 			// Ephemeral sessions (--no-session) have no session file; their
-			// throwaway digests must not leak into the next real session.
+			// temporary digests must not leak into the next real session.
 			if (!ctx.sessionManager.getSessionFile?.()) return;
 			const sessionId = sessionIdOf(ctx);
 			if (!sessionId) return;
@@ -184,7 +185,7 @@ export default function (pi: ExtensionAPI): void {
 		}
 	});
 
-	pi.on("session_start", (event, ctx) => {
+	pi.on("session_start", async (event, ctx) => {
 		uiHost = ctx as unknown as UiHost;
 		reflectQueued = false;
 		queuedInjected = new Set();
@@ -192,9 +193,7 @@ export default function (pi: ExtensionAPI): void {
 		// confirmed delivered (crash, quit before the first turn, failed LLM
 		// call). Keep their markers (the atomic claim) and process them
 		// directly from the injected state below. A delivered reflection has
-		// its marker deleted at agent_end. Skipped on reload: the queued
-		// message survives in _pendingNextTurnMessages, and re-injecting
-		// would deliver the reflection twice.
+		// its marker deleted at agent_end.
 		const recovered: string[] = [];
 		if (event.reason !== "reload") {
 			try {
@@ -230,17 +229,38 @@ export default function (pi: ExtensionAPI): void {
 			} catch {
 				// best-effort — a failed cleanup must not block the reflection
 			}
+		} else {
+			// Reload re-imports the extension module (fresh state) but keeps
+			// the AgentSession — the queued message survives in
+			// _pendingNextTurnMessages. Reconcile the markers: a marker whose
+			// reflection is already in the session history was delivered
+			// before the reload (delete it). The rest are left alone — a
+			// marker can also be a recovered-but-not-queued digest (kept as
+			// the atomic claim from a prior session_start), whose reflection
+			// is NOT queued; deleting it at agent_end would lose it. The
+			// next session start's recovery reconciles the delivered ones.
+			try {
+				const entries = (ctx as unknown as { sessionManager?: { getEntries?: () => unknown[] } }).sessionManager?.getEntries?.() ?? [];
+				for (const sid of listInjectedDigests(dataDir)) {
+					const digest = readInjectedDigest(dataDir, sid);
+					if (digest && sessionHasOuroborosMessage(entries, digest.sessionId)) {
+						deleteInjectedDigest(dataDir, sid);
+					}
+				}
+			} catch {
+				// best-effort — a failed cleanup must not block the session
+			}
 		}
 		// Recovered digests keep their markers (still injected), so they are
 		// NOT in `all` (which lists pending digests only). They go FIRST,
 		// mtime-sorted newest-first (listInjectedDigests sorts), so the
-		// freshest undelivered reflection wins. Pending digests follow.
+		// freshest undelivered reflection is injected. Pending digests follow.
 		const all = listDigests(dataDir);
 		const recoveredSet = new Set(recovered);
 		const ordered = [...recovered, ...all.filter((s) => !recoveredSet.has(s))];
 		let injected = false;
 		for (const sid of ordered) {
-			// One corrupt digest must not block the rest.
+			// One corrupt digest must not stall the rest.
 			try {
 				if (injected) {
 					// Recovered digests keep their markers (still claimed) —
@@ -267,7 +287,7 @@ export default function (pi: ExtensionAPI): void {
 					continue;
 				}
 				try {
-					pi.sendMessage(
+					await pi.sendMessage(
 						{
 							customType: OUROBOROS_CUSTOM_TYPE,
 							content: buildReflectionMessage(digest),
@@ -406,7 +426,7 @@ export default function (pi: ExtensionAPI): void {
 			if (!body.trim()) throw new Error("skillBody is required for kind=skill");
 			// Bounds: the body is written verbatim and pi advertises the
 			// description in the system prompt — a huge body is a disk-fill
-			// vector and a huge description bloats every future prompt.
+			// vector and a huge description enlarges every future prompt.
 			if (description.length > 200) throw new Error("skillDescription must be 200 characters or fewer");
 			if (body.length > 20_000) throw new Error("skillBody must be 20,000 characters or fewer");
 			const file = writeSkill(dataDir, name, description, body);

@@ -42,7 +42,7 @@ pi install ./pi-ouroboros
 ## Trust model
 
 The model writes the rules and the skills.
-The model can write bad rules.
+The model can write incorrect rules.
 The model can write rules that conflict with your instructions.
 Review the rules with `/ouroboros`.
 Clear the rules with `/ouroboros reset`.
@@ -50,14 +50,16 @@ The rules apply to all projects.
 The rules are self-recorded lessons.
 The plugin tells the model to follow them unless they conflict with your explicit instructions.
 This is a prompt-level mitigation, not a guarantee.
-A model can follow a bad rule despite the warning.
+A model can follow an incorrect rule despite the warning.
 Review the rules regularly.
-The rules file is shared by all pi instances on this machine.
+All pi instances on this machine share the rules file.
 Two pi instances can write rules at the same time.
 The plugin serializes writes within one instance.
 The plugin verifies its writes and retries on conflict.
 The plugin does not lock the file across instances.
 Run one pi instance at a time to avoid lost rules.
+Two concurrent instances can also deliver the same reflection twice.
+The marker protocol has no ownership across processes.
 
 The digest content is untrusted data.
 The digest can contain text from files, tools, or other agents.
@@ -80,15 +82,15 @@ The plugin keeps handler work small.
 Measured costs:
 
 - Session start with no digests: 0.002 ms.
-- Session start with 1 digest: 0.037 ms.
-- Session start with 50 digests: 0.096 ms.
+- Session start with 1 digest: 0.064 ms.
+- Session start with 50 digests: 0.117 ms.
 - Rules read per turn (cached): 0.001 ms.
-- Skills read per turn (cached): 0.002 ms.
-- Rule append at cap (char eviction): 0.058 ms.
+- Skills read per turn (cached): 0.001 ms.
+- Rule append at cap (char eviction): 0.049 ms.
 - Digest list with 10,000 digests: 21 ms.
-- Digest build with a 300 KB prompt: 0.062 ms.
-- Digest build with 10,000 tool calls (capped): 3.9 ms.
-- Digest save (atomic write): 0.021 ms.
+- Digest build with a 300 KB prompt: 0.027 ms.
+- Digest build with 10,000 tool calls (capped): 5.1 ms.
+- Digest save (atomic write): 0.024 ms.
 
 The plugin caches the rules file.
 The plugin invalidates the cache on its own writes.
@@ -128,8 +130,9 @@ Use environment variables to change the behavior.
 | `PI_OUROBOROS_REFLECT_MIN_PROMPTS` | `5` | Minimum prompts for a clean session to be notable (floor 20) |
 | `PI_CODING_AGENT_DIR` | `~/.pi/agent` | Directory for all ouroboros state (rules, digests, skills) |
 
-All ouroboros state lives under the agent directory.
-Changing `PI_CODING_AGENT_DIR` starts fresh: the old rules, digests, and skills stay in the old directory.
+All ouroboros state is stored in the agent directory.
+Changing `PI_CODING_AGENT_DIR` creates a new state directory.
+The old rules, digests, and skills stay in the old directory.
 
 ## Development
 
@@ -144,21 +147,20 @@ npx tsc --noEmit
 
 The tests cover digest extraction, persistence, prompt building, and the extension entry point.
 Run `bun bench/bench.ts` to measure the hot paths.
-
-The test suite has 138 tests.
+The test suite has 153 tests.
 
 The reflection happens at the start of the next session.
 The reflection does not happen at shutdown.
 Shutdown must stay fast.
-The agent loop is the best place to reflect.
+The agent loop is the correct place to reflect.
 The agent already has the tools to write files.
 
-Digests are lossy on purpose.
+Digests are lossy by design.
 The plugin drops thinking traces and full outputs.
-The reflection prompt stays small and cheap.
+The reflection prompt stays small and low-cost.
 
-Rules are injected every turn.
-Skills are loaded on demand.
+The plugin injects the rules every turn.
+Pi loads the skill content on demand.
 A rule must be in context when the mistake can happen.
 
 ## License

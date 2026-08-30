@@ -6,7 +6,7 @@
  *     compact digest of the previous session plus instructions to extract
  *     lessons and write them as rules/skills.
  *  2. The rules appendix appended to the system prompt every turn — the
- *     self-learned rules, capped so they never crowd out the real prompt.
+ *     self-learned rules, capped so they never displace the real prompt.
  */
 
 import type { OuroborosDigest } from "./digest.ts";
@@ -63,9 +63,12 @@ export function formatDigest(digest: OuroborosDigest): string {
 }
 
 /** Neutralize XML-like tags in digest content so they cannot break out of
- * the <digest> block or read as higher-authority instructions. */
+ * the <digest> block or read as higher-authority instructions. '&' is
+ * escaped first so the mapping is injective: 'a<b' and the literal
+ * 'a&lt;b' must not render identically (the resume-guard needle relies on
+ * this). */
 export function escapeTags(s: string): string {
-	return s.replace(/</g, "&lt;");
+	return s.replace(/&/g, "&amp;").replace(/</g, "&lt;");
 }
 
 /** True when the digest carries a failure signal worth reflecting on. */
@@ -116,9 +119,10 @@ export function buildReflectionMessage(digest: OuroborosDigest | null, midSessio
 
 /**
  * System-prompt appendix carrying the self-learned rules (capped).
- * Newest rules come first — the freshest lessons win. Oversized rules are
- * truncated to fit, never dropped. The header frames the rules as lessons
- * to follow, with the user's explicit instructions taking precedence.
+ * Newest rules come first — the freshest lessons take priority. Oversized
+ * rules are truncated to fit, never dropped. The header frames the rules
+ * as lessons to follow, with the user's explicit instructions taking
+ * precedence.
  */
 export function buildRulesAppendix(rules: string[], maxChars: number = 3000): string {
 	const budget = Math.max(200, maxChars);

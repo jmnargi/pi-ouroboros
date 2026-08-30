@@ -261,8 +261,11 @@ describe("digests", () => {
 		expect(loadDigest(dir, "sess-absurd")).toBeNull();
 		fs.writeFileSync(file, JSON.stringify({ ...base, stopReasons: { length: "x" } }));
 		expect(loadDigest(dir, "sess-absurd")).toBeNull();
+		// A control char in a header field is REPAIRED by migration (the
+		// round-7 writer stored header fields raw) — the digest loads with
+		// the char stripped, so the reflection is not lost.
 		fs.writeFileSync(file, JSON.stringify({ ...base, sessionId: "bad\u0000id" }));
-		expect(loadDigest(dir, "sess-absurd")).toBeNull();
+		expect(loadDigest(dir, "sess-absurd")?.sessionId).toBe("badid");
 		// Element shape: a junk failedCommands element is rejected.
 		fs.writeFileSync(file, JSON.stringify({ ...base, failedCommands: [{ command: 42, error: "x" }] }));
 		expect(loadDigest(dir, "sess-absurd")).toBeNull();
@@ -350,6 +353,103 @@ describe("digests", () => {
 		// astral code point is two units (its charCodeAt(0) is the high
 		// surrogate and must NOT count).
 		expect([...tool].some((c) => c.length === 1 && c.charCodeAt(0) >= 0xd800 && c.charCodeAt(0) <= 0xdfff)).toBe(false);
+	});
+	test("migrateDigest repairs dirty header fields (FixAudit8/Lifecycle2)", () => {
+		const dir = tmpDataDir();
+		const file = digestFile(dir, "sess-legacy");
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		const base = digest();
+		// The round-7 writer stored header fields RAW: a control char in
+		// cwd must be repaired, not rejected (rejection deletes the digest
+		// and loses the reflection).
+		fs.writeFileSync(file, JSON.stringify({ ...base, cwd: "/proj\u0007evil", sessionId: "sess\u200b-legacy" }));
+		const migrated = loadDigest(dir, "sess-legacy");
+		expect(migrated).not.toBeNull();
+		expect(migrated!.cwd).toBe("/projevil");
+		expect(migrated!.sessionId).toBe("sess-legacy");
+	});
+	test("migrateDigest cuts toolCalls[].tool by code points (FixAudit8)", () => {
+		const dir = tmpDataDir();
+		const file = digestFile(dir, "sess-legacy");
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		const base = digest();
+		// A round-6/7 tool name longer than 100 code points must be cut,
+		// not rejected (rejection deletes the digest).
+		const round7 = { ...base, toolCalls: [{ tool: "x".repeat(99) + "😀" + "y", args: "{}" }] };
+		fs.writeFileSync(file, JSON.stringify(round7));
+		const migrated = loadDigest(dir, "sess-legacy");
+		expect(migrated).not.toBeNull();
+		expect([...migrated!.toolCalls[0]!.tool]).toHaveLength(100);
+		expect(migrated!.toolCalls[0]!.tool.endsWith("😀")).toBe(true);
+	});
+	test("an array-typed stopReasons stays rejected (Security7)", () => {
+		const dir = tmpDataDir();
+		const file = digestFile(dir, "sess-legacy");
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		const base = digest();
+		// An array is the one wrong shape that satisfies typeof object —
+		// migrateDigest must leave it for the validator to reject.
+		fs.writeFileSync(file, JSON.stringify({ ...base, stopReasons: [] }));
+		expect(loadDigest(dir, "sess-legacy")).toBeNull();
+	});
+	test("a lone surrogate in a legacy field is repaired, not rejected (Security7)", () => {
+		const dir = tmpDataDir();
+		const file = digestFile(dir, "sess-legacy");
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		const base = digest();
+		// A legacy UTF-16 slice artifact: the migration strips the lone
+		// surrogate so the digest loads and the reflection is not lost.
+		fs.writeFileSync(file, JSON.stringify({ ...base, userPrompts: ["fix \ud800 the bug"] }));
+		const migrated = loadDigest(dir, "sess-legacy");
+		expect(migrated).not.toBeNull();
+		expect(migrated!.userPrompts[0]).toBe("fix  the bug");
+	});
+	test("a transient IO error keeps the digest file (Security7)", () => {
+		const dir = tmpDataDir();
+		const file = digestFile(dir, "sess-io");
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		fs.writeFileSync(file, JSON.stringify(digest()));
+		// A directory at the digest path makes readFileSync fail with EISDIR
+		// (an IO error, not corruption) — the loader must throw, not return
+		// null, so the caller keeps the file instead of deleting it.
+		fs.rmSync(file);
+		fs.mkdirSync(file);
+		expect(() => loadDigest(dir, "sess-io")).toThrow();
+		expect(fs.existsSync(file)).toBe(true);
+	});
+	test("listInjectedDigests skips non-round-tripping stems (Security7)", () => {
+		const dir = tmpDataDir();
+		const digests = path.join(dir, "ouroboros", "digests");
+		fs.mkdirSync(digests, { recursive: true });
+		fs.writeFileSync(path.join(digests, "a.b.injected.json"), "{}");
+		fs.writeFileSync(path.join(digests, "sess-ok.injected.json"), "{}");
+		expect(listInjectedDigests(dir)).toEqual(["sess-ok"]);
+	});
+	test("cleanupStaleTmp does not follow symlinked skill dirs (Security7)", () => {
+		const dir = tmpDataDir();
+		const skills = path.join(dir, "ouroboros", "skills");
+		fs.mkdirSync(skills, { recursive: true });
+		// A symlinked skill dir pointing at a directory with an old tmp
+		// file: the cleanup must not delete inside the target.
+		const target = fs.mkdtempSync(path.join(os.tmpdir(), "ouroboros-target-"));
+		tmpDirs.push(target);
+		const oldTmp = path.join(target, "victim.tmp");
+		fs.writeFileSync(oldTmp, "x");
+		const old = new Date(Date.now() - 2 * 60 * 60 * 1000);
+		fs.utimesSync(oldTmp, old, old);
+		fs.symlinkSync(target, path.join(skills, "evil"));
+		cleanupStaleTmp(dir);
+		expect(fs.existsSync(oldTmp)).toBe(true);
+	});
+	test("writeSkill refuses to overwrite atomically (Security7)", () => {
+		const dir = tmpDataDir();
+		writeSkill(dir, "my-skill", "desc", "body");
+		// A second write with the same name must fail even though the
+		// existsSync pre-check is gone (the link is the atomic claim).
+		expect(() => writeSkill(dir, "my-skill", "desc2", "body2")).toThrow(/already exists/);
+		const content = fs.readFileSync(path.join(dir, "skills", "my-skill", "SKILL.md"), "utf8");
+		expect(content).toContain("desc");
+		expect(content).not.toContain("desc2");
 	});
 
 	test("last digest round-trips for /ouroboros digest (UX-2)", () => {

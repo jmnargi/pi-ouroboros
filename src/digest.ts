@@ -2,7 +2,7 @@
  * src/digest.ts — session → digest extraction (pure, no pi imports).
  *
  * A digest is a compact, lossy summary of a session.
- * It is cheap enough to hand back to the model for reflection.
+ * It is small enough to give to the model for reflection.
  * It contains user prompts, failed tool calls, failed bash commands,
  * assistant stop reasons, compaction pressure, and token/cost totals.
  * The plugin deliberately drops everything else: thinking traces, full
@@ -20,8 +20,8 @@
  *   - Bash tool calls: stored as toolResult with `toolName: "bash"`. A real
  *     failure has `isError: true` and text ending "Command exited with code
  *     N" (the tool throws); a success has `isError: false` and no exit code.
- *     The command text lives on the preceding assistant toolCall (matched by
- *     toolCallId).
+ *     The command text is stored on the preceding assistant toolCall
+ *     (matched by toolCallId).
  *   - The documented `bashExecution` role (command/exitCode on the message)
  *     is also handled, for other bash paths and future versions.
  *
@@ -110,11 +110,63 @@ export function extractText(content: unknown): string {
 	}
 	return parts.join("\n");
 }
+/** Count code points, stopping at max+1 — never materializes the array. */
+function cpCountAtMost(s: string, max: number): number {
+	let n = 0;
+	for (const _ of s) {
+		if (++n > max) return n;
+	}
+	return n;
+}
+
+/** The first max code points, without materializing the whole string. */
+function cpPrefix(s: string, max: number): string {
+	if (s.length <= max) return s; // fast path: units <= max implies code points <= max
+	let out = "";
+	let n = 0;
+	for (const ch of s) {
+		if (n >= max) break;
+		out += ch;
+		n++;
+	}
+	return out;
+}
+
+/** The last max code points, without materializing the whole string. */
+function cpSuffix(s: string, max: number): string {
+	if (s.length <= max) return s; // fast path
+	// Walk backwards by code points: a low surrogate at i-1 means the code
+	// point starts at i-2 (never split a pair).
+	let out = "";
+	let i = s.length;
+	let n = 0;
+	while (i > 0 && n < max) {
+		const code = s.charCodeAt(i - 1);
+		if (code >= 0xdc00 && code <= 0xdfff && i >= 2) {
+			const hi = s.charCodeAt(i - 2);
+			if (hi >= 0xd800 && hi <= 0xdbff) {
+				out = s.slice(i - 2, i) + out;
+				i -= 2;
+			} else {
+				out = s[i - 1] + out;
+				i -= 1;
+			}
+		} else {
+			out = s[i - 1] + out;
+			i -= 1;
+		}
+		n++;
+	}
+	return out;
+}
+
 function truncate(s: string, max: number): string {
 	// Cleaning removes characters, so the first max code points of the
 	// cleaned text can start arbitrarily far into the input. Grow the bound
 	// geometrically until enough survive or the string is exhausted — the
-	// common case (no control chars) is one pass over ~max*2 units.
+	// common case (no control chars) is one pass over ~max*2 units. The
+	// count and the final cut are O(max), never O(n): a 10MB input must not
+	// materialize a 10M-element array.
 	let bound = max * 2 + 1;
 	let cleaned = "";
 	while (true) {
@@ -123,22 +175,22 @@ function truncate(s: string, max: number): string {
 			.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f]/g, "")
 			.trim()
 			.replace(/\s+/g, " ");
-		if (Array.from(cleaned).length > max || bound >= s.length) break;
+		if (cpCountAtMost(cleaned, max) > max || bound >= s.length) break;
 		bound = Math.min(s.length, bound * 2);
 	}
-	if (Array.from(cleaned).length <= max) return cleaned;
-	// Cut by code points, never mid-surrogate-pair (emoji must survive).
-	const chars = Array.from(cleaned);
-	return `${chars.slice(0, max).join("")}…`;
+	if (cpCountAtMost(cleaned, max) <= max) return cleaned;
+	return `${cpPrefix(cleaned, max)}…`;
 }
 
 /** Lightweight sanitizer for short identifiers (tool names, models):
- * strips the same control-char class the validator rejects, then slices.
- * Cheaper than truncate (no whitespace collapse, no ellipsis). The fast
- * path (short names) avoids Array.from; only over-long names pay for the
- * code-point cut (never mid-surrogate-pair). */
+ * strips the same control-char class the validator rejects (plus lone
+ * surrogates), then slices. Cheaper than truncate (no whitespace collapse,
+ * no ellipsis). The fast path (short names) avoids Array.from; only
+ * over-long names pay for the code-point cut (never mid-surrogate-pair). */
 function cleanName(s: string, max: number): string {
-	const cleaned = s.replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f]/g, "");
+	const cleaned = s
+		.replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f]/g, "")
+		.replace(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g, "");
 	if (cleaned.length <= max) return cleaned;
 	return Array.from(cleaned).slice(0, max).join("");
 }
@@ -146,7 +198,8 @@ function cleanName(s: string, max: number): string {
 /** Keep the LAST max code points — bash errors put the exit code at the end.
  * The input is bounded before the code-point pass: a 10MB tool output must
  * not materialize a 10M-element array. Grow the tail bound geometrically
- * until enough code points survive or the string is exhausted. */
+ * until enough code points survive or the string is exhausted. The count
+ * and the final cut are O(max), never O(n). */
 function truncateTail(s: string, max: number): string {
 	let bound = max * 2 + 1;
 	let cleaned = "";
@@ -156,12 +209,11 @@ function truncateTail(s: string, max: number): string {
 			.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f]/g, "")
 			.trim()
 			.replace(/\s+/g, " ");
-		if (Array.from(cleaned).length > max || bound >= s.length) break;
+		if (cpCountAtMost(cleaned, max) > max || bound >= s.length) break;
 		bound = Math.min(s.length, bound * 2);
 	}
-	const chars = Array.from(cleaned);
-	if (chars.length <= max) return cleaned;
-	return `…${chars.slice(-max).join("")}`;
+	if (cpCountAtMost(cleaned, max) <= max) return cleaned;
+	return `…${cpSuffix(cleaned, max)}`;
 }
 
 function asNumber(v: unknown): number {
@@ -278,10 +330,10 @@ export function buildDigest(
 			if (typeof msg.stopReason === "string" && msg.stopReason) {
 				// Bounded and sanitized: a crafted session must not grow the
 				// stopReasons object without limit, and a crafted key must
-				// not insert control chars into the reflection.
-				// Same control-char class the validator rejects — a key that
-				// survives here must round-trip through isValidDigest.
-				const key = msg.stopReason.replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f]/g, "").slice(0, 100);
+				// not insert control chars into the reflection. cleanName
+				// cuts by code points (a UTF-16 slice could split a
+				// surrogate pair) and strips lone surrogates.
+				const key = cleanName(msg.stopReason, 100);
 				if (key) {
 					// Object.hasOwn: a key naming an Object.prototype property
 					// ('constructor', 'toString', ...) must not be treated as
@@ -364,7 +416,7 @@ export function buildDigest(
 			// Other failed tools: isError/toolName on the message object.
 			if (msg.isError === true) {
 				// cleanName strips control chars and bounds the length — a
-				// crafted session file must not bloat the digest via toolName.
+				// crafted session file must not enlarge the digest via toolName.
 				const tool = cleanName(typeof msg.toolName === "string" ? msg.toolName : "tool", TOOL_NAME_MAX_CHARS);
 				const summary = truncate(extractText(msg.content), ERROR_MAX_CHARS) || "(no output)";
 				const key = `${tool}:${summary}`;

@@ -406,6 +406,34 @@ describe("buildDigest", () => {
 		expect(d.cwd).toBe("/projdir");
 		expect(isValidDigest(d)).toBe(true);
 	});
+	test("a huge control-char tail is bounded and keeps the last code points (FixAudit8)", () => {
+		// The geometric loop must not materialize a 10M-element array, and
+		// the last max code points of the cleaned text must survive.
+		const big = "A".repeat(5_000_000) + "\u0000".repeat(5_000_000) + "tail";
+		const d = buildDigest([bashFailure("npm test", 1, big)], SID, CWD, END);
+		expect(d.failedCommands[0]!.error).toContain("tail");
+		expect(d.failedCommands[0]!.error.length).toBeLessThan(400);
+	});
+	test("a huge whitespace tail collapses without unbounded work (FixAudit8)", () => {
+		const big = "x".repeat(100) + " ".repeat(5_000_000) + "END";
+		const d = buildDigest([bashFailure("npm test", 1, big)], SID, CWD, END);
+		expect(d.failedCommands[0]!.error).toContain("END");
+	});
+	test("a stopReason key with an astral char at the boundary is cut by code points (FixAudit8)", () => {
+		// 'x'*99 + emoji is 100 code points / 101 units: a UTF-16 slice
+		// would split the pair. cleanName must keep the emoji intact.
+		const d = buildDigest([assistantMessage({ stopReason: "x".repeat(99) + "😀" })], SID, CWD, END);
+		expect(Object.hasOwn(d.stopReasons, "x".repeat(99) + "😀")).toBe(true);
+		expect(isValidDigest(d)).toBe(true);
+	});
+	test("a lone surrogate in a tool name is stripped, not passed through (Security7)", () => {
+		// A crafted session file can carry a lone surrogate (a legacy
+		// UTF-16 slice artifact). cleanName strips it so the digest stays
+		// valid and the reflection is not lost.
+		const d = buildDigest([toolError("edit\uD800x", "boom")], SID, CWD, END);
+		expect(d.errors[0]!.tool).toBe("editx");
+		expect(isValidDigest(d)).toBe(true);
+	});
 });
 
 describe("isNotable", () => {
