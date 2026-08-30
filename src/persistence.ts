@@ -71,17 +71,17 @@ export function skillsDir(dataDir: string): string {
 
 /** In-memory rules cache: rules are read every turn, so avoid re-reading. */
 let rulesCache: { file: string; mtimeMs: number; size: number; rules: string[] } | null = null;
-/** True while rules.md is known to be absent — avoids a throwing statSync. */
-let rulesMissing = false;
-/** When rulesMissing was set — the negative cache is time-bounded so an
+/** File path of the last known-missing rules file (negative cache). */
+let rulesMissingFile: string | null = null;
+/** When rulesMissingFile was set — the negative cache is time-bounded so an
  * externally created rules.md (another pi instance, the user) is picked up. */
 let rulesMissingAt = 0;
 
 /** Load rules as a list of non-empty lines (comments starting with `#` kept). */
 export function loadRules(dataDir: string): string[] {
 	const file = rulesFile(dataDir);
-	if (rulesMissing && Date.now() - rulesMissingAt < 1000) return [];
-	rulesMissing = false;
+	if (rulesMissingFile === file && Date.now() - rulesMissingAt < 1000) return [];
+	rulesMissingFile = null;
 	try {
 		const stat = fs.statSync(file);
 		// mtime + size: on coarse-granularity filesystems (1s), two writes in
@@ -99,7 +99,7 @@ export function loadRules(dataDir: string): string[] {
 		rulesCache = { file, mtimeMs: stat.mtimeMs, size: stat.size, rules };
 		return rules;
 	} catch {
-		rulesMissing = true;
+		rulesMissingFile = file;
 		rulesMissingAt = Date.now();
 		return [];
 	}
@@ -108,7 +108,7 @@ export function loadRules(dataDir: string): string[] {
 /** Drop the cache after our own writes (mtime alone can miss same-ms writes). */
 function invalidateRulesCache(): void {
 	rulesCache = null;
-	rulesMissing = false;
+	rulesMissingFile = null;
 }
 
 /** Normalize a rule for near-duplicate detection (case, punctuation, spaces). */
@@ -162,14 +162,18 @@ export function appendRule(
 		}
 		// A single rule can still exceed the budget (maxChars < MAX_RULE_CHARS).
 		// Truncate it so the stored file always fits the configured budget.
+		// Cut by code points, never mid-surrogate-pair (emoji must survive).
 		if (next.length === 1 && total > maxChars) {
-			next[0] = next[0]!.slice(0, Math.max(0, maxChars - 1));
+			next[0] = Array.from(next[0]!).slice(0, Math.max(0, maxChars - 1)).join("");
 		}
 		writeRules(dataDir, next);
 		// Verify: another instance may have renamed over our write between
-		// the read and the rename. If our rule is gone, retry.
+		// the read and the rename. If our rule is gone, retry. The written
+		// rule may be truncated (single-rule budget), so verify the written
+		// form, not the original key.
+		const written = next[next.length - 1]!;
 		const after = loadRules(dataDir);
-		if (after.some((r) => dedupKey(r) === key)) return { added: true, reason: "added", count: after.length, cap };
+		if (after.some((r) => dedupKey(r) === dedupKey(written))) return { added: true, reason: "added", count: after.length, cap };
 	}
 	return { added: false, reason: "conflict", count: loadRules(dataDir).length, cap };
 }
@@ -282,6 +286,18 @@ export function loadDigest(dataDir: string, sessionId: string): OuroborosDigest 
 	}
 }
 
+/** Load a digest that is currently marked injected (awaiting delivery). */
+export function readInjectedDigest(dataDir: string, sessionId: string): OuroborosDigest | null {
+	try {
+		const file = `${digestFile(dataDir, sessionId).slice(0, -".json".length)}.injected.json`;
+		const parsed: unknown = JSON.parse(fs.readFileSync(file, "utf8"));
+		const migrated = migrateDigest(parsed);
+		return isValidDigest(migrated) ? (migrated as OuroborosDigest) : null;
+	} catch {
+		return null;
+	}
+}
+
 /** The last session's digest, kept for /ouroboros digest (pending digests
  * are consumed at the next session start, so the command reads this copy). */
 export function lastDigestFile(dataDir: string): string {
@@ -351,7 +367,8 @@ function isValidDigest(p: unknown): p is OuroborosDigest {
 	if (typeof p !== "object" || p === null) return false;
 	const d = p as OuroborosDigest;
 	const isCount = (v: unknown): boolean => typeof v === "number" && Number.isFinite(v) && v >= 0;
-	const clean = (v: unknown, max: number): v is string => typeof v === "string" && v.length <= max && !/[\u0000-\u001f\u007f]/.test(v);
+	const clean = (v: unknown, max: number): v is string =>
+		typeof v === "string" && v.length <= max && !/[\u0000-\u001f\u007f\u0085\u2028\u2029]/.test(v);
 	const strArr = (v: unknown, max: number, maxLen: number): boolean =>
 		Array.isArray(v) && v.length <= max && v.every((e) => typeof e === "string" && e.length <= maxLen);
 	const errArr = (v: unknown, max: number): boolean =>
@@ -382,6 +399,7 @@ function isValidDigest(p: unknown): p is OuroborosDigest {
 				typeof e === "object" &&
 				e !== null &&
 				typeof (e as { tool?: unknown }).tool === "string" &&
+				(e as { tool?: string }).tool!.length <= 100 &&
 				typeof (e as { args?: unknown }).args === "string" &&
 				(e as { args?: string }).args!.length <= 200,
 		);
@@ -399,6 +417,7 @@ function isValidDigest(p: unknown): p is OuroborosDigest {
 		typeof d.stopReasons === "object" &&
 		d.stopReasons !== null &&
 		Object.keys(d.stopReasons).length <= 20 &&
+		Object.keys(d.stopReasons).every((k) => k.length <= 100 && !/[\u0000-\u001f\u007f\u0085\u2028\u2029]/.test(k)) &&
 		Object.values(d.stopReasons).every((v) => typeof v === "number" && Number.isFinite(v) && v >= 0) &&
 		strArr(d.models, 20, 200) &&
 		isCount(d.compactions) &&

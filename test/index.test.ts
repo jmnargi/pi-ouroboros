@@ -8,7 +8,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -41,6 +41,8 @@ interface MockAPI {
 	commands: Map<string, MockCommand>;
 	messages: MockMessage[];
 	renderers: Map<string, unknown>;
+	/** When true, sendMessage throws (simulates a future runtime change). */
+	throwOnSend: boolean;
 	on(event: string, handler: Handler): void;
 	registerTool(tool: MockTool): void;
 	registerCommand(name: string, options: MockCommand): void;
@@ -57,6 +59,7 @@ function makeAPI(): MockAPI {
 		commands: new Map(),
 		messages: [],
 		renderers: new Map(),
+		throwOnSend: false,
 		on(event, handler) {
 			const list = api.handlers.get(event) ?? [];
 			list.push(handler);
@@ -72,6 +75,7 @@ function makeAPI(): MockAPI {
 			api.renderers.set(type, renderer);
 		},
 		sendMessage(message, options) {
+			if (api.throwOnSend) throw new Error("sendMessage failed");
 			api.messages.push({ message, options });
 		},
 		fire(event, ...args) {
@@ -283,24 +287,35 @@ describe("session_start", () => {
 	test("resume with the reflection already in history deletes the marker, no re-inject", () => {
 		saveDigest(dataDir, buildDigest(notableEntries(), "sess-1", "/proj", "2026-08-30T12:00:00.000Z"));
 		markDigestInjected(dataDir, "sess-1");
-		// The resumed session file already contains the ouroboros message
-		// (drained before a failed first turn).
-		const sessionFile = join(dataDir, "resumed.jsonl");
-		writeFileSync(sessionFile, `${JSON.stringify({ type: "custom_message", customType: OUROBOROS_CUSTOM_TYPE, content: "reflect" })}\n`);
+		// The resumed session's entries already contain the ouroboros message
+		// for THIS digest (drained before a failed first turn). The real
+		// reflection content carries the digest block with "session: sess-1".
+		const entries = [{ type: "custom_message", customType: OUROBOROS_CUSTOM_TYPE, content: "[Ouroboros] ...\nsession: sess-1\ncwd: /proj" }];
 		const handler = api.fire.bind(api, "session_start");
-		handler({ reason: "resume", previousSessionFile: sessionFile }, fakeCtx());
+		handler({ reason: "startup" }, fakeCtx({ sessionManager: { getEntries: () => entries } }));
 		expect(api.messages).toHaveLength(0);
 		expect(readdirSync(digestsDir(dataDir))).toEqual([]);
+	});
+	test("resume with an ouroboros message for a DIFFERENT digest re-injects (no false positive)", () => {
+		saveDigest(dataDir, buildDigest(notableEntries(), "sess-1", "/proj", "2026-08-30T12:00:00.000Z"));
+		markDigestInjected(dataDir, "sess-1");
+		// The session has an ouroboros message from a PRIOR successful
+		// reflection (session: sess-other). The marker is for sess-1, whose
+		// reflection was never drained — it must be re-injected.
+		const entries = [{ type: "custom_message", customType: OUROBOROS_CUSTOM_TYPE, content: "[Ouroboros] ...\nsession: sess-other\ncwd: /proj" }];
+		const handler = api.fire.bind(api, "session_start");
+		handler({ reason: "startup" }, fakeCtx({ sessionManager: { getEntries: () => entries } }));
+		expect(api.messages).toHaveLength(1);
+		expect(api.messages[0]!.message.customType).toBe(OUROBOROS_CUSTOM_TYPE);
+		expect(readdirSync(digestsDir(dataDir))).toEqual(["sess-1.injected.json"]);
 	});
 	test("resume without the reflection in history re-injects it", () => {
 		saveDigest(dataDir, buildDigest(notableEntries(), "sess-1", "/proj", "2026-08-30T12:00:00.000Z"));
 		markDigestInjected(dataDir, "sess-1");
-		// The resumed session file has no ouroboros message (crash before
-		// the first turn drained) — the reflection was never delivered.
-		const sessionFile = join(dataDir, "resumed.jsonl");
-		writeFileSync(sessionFile, `${JSON.stringify({ type: "message", message: { role: "user", content: "hi" } })}\n`);
+		// The resumed session has no ouroboros message (crash before the
+		// first turn drained) — the reflection was never delivered.
 		const handler = api.fire.bind(api, "session_start");
-		handler({ reason: "resume", previousSessionFile: sessionFile }, fakeCtx());
+		handler({ reason: "startup" }, fakeCtx({ sessionManager: { getEntries: () => [] } }));
 		expect(api.messages).toHaveLength(1);
 		expect(api.messages[0]!.message.customType).toBe(OUROBOROS_CUSTOM_TYPE);
 		expect(readdirSync(digestsDir(dataDir))).toEqual(["sess-1.injected.json"]);
@@ -393,6 +408,34 @@ describe("ouroboros_learn tool", () => {
 			t.execute("call-2", { kind: "skill", lesson: "x", skillName: "Bad Name!", skillDescription: "d", skillBody: "b" }, undefined, undefined, fakeCtx()),
 		).rejects.toThrow("skillName");
 	});
+	test("kind=skill rejects missing and oversized fields", async () => {
+		const t = tool();
+		const base = { kind: "skill", lesson: "x", skillName: "ok-name", skillDescription: "d", skillBody: "b" };
+		await expect(t.execute("c1", { ...base, skillDescription: "" }, undefined, undefined, fakeCtx())).rejects.toThrow("skillDescription is required");
+		await expect(t.execute("c2", { ...base, skillBody: "" }, undefined, undefined, fakeCtx())).rejects.toThrow("skillBody is required");
+		await expect(t.execute("c3", { ...base, skillDescription: "d".repeat(201) }, undefined, undefined, fakeCtx())).rejects.toThrow("200 characters or fewer");
+		await expect(t.execute("c4", { ...base, skillBody: "b".repeat(20_001) }, undefined, undefined, fakeCtx())).rejects.toThrow("20,000 characters or fewer");
+	});
+	test("kind=rule with a whitespace-only lesson reports empty", async () => {
+		const t = tool();
+		const result = await t.execute("c1", { kind: "rule", lesson: "   \n\t " }, undefined, undefined, fakeCtx());
+		expect(result.content[0]!.text).toContain("lesson is empty");
+		expect(loadRules(dataDir)).toHaveLength(0);
+	});
+	test("sendMessage failure restores the digest to pending (defense-in-depth)", () => {
+		saveDigest(dataDir, buildDigest(notableEntries(), "sess-1", "/proj", "2026-08-30T12:00:00.000Z"));
+		api.throwOnSend = true;
+		const handler = api.fire.bind(api, "session_start");
+		handler({}, fakeCtx());
+		// The digest is unmarked so the next session start re-injects it.
+		expect(api.messages).toHaveLength(0);
+		expect(readdirSync(digestsDir(dataDir))).toEqual(["sess-1.json"]);
+	});
+	test("session_shutdown writes the last-digest copy for /ouroboros digest", () => {
+		const handler = api.fire.bind(api, "session_shutdown");
+		handler({ reason: "quit" }, fakeCtx());
+		expect(existsSync(join(dataDir, "ouroboros", "last-digest.json"))).toBe(true);
+	});
 });
 
 describe("/ouroboros command", () => {
@@ -421,5 +464,30 @@ describe("/ouroboros command", () => {
 		const ctx = fakeCtx({ hasUI: true, ui: { setStatus: () => {}, notify: (m: string) => notified.push(m) } });
 		cmd().handler("digest", ctx);
 		expect(notified.join(" ")).toContain("sess-1");
+	});
+	test("default status reports rules, skills, and pending digests", () => {
+		appendRule(dataDir, "always re-read before editing");
+		const notified: string[] = [];
+		const ctx = fakeCtx({ hasUI: true, ui: { setStatus: () => {}, notify: (m: string) => notified.push(m) } });
+		cmd().handler(undefined, ctx);
+		const text = notified.join(" ");
+		expect(text).toContain("1 rules");
+		expect(text).toContain("rules file:");
+		expect(text).toContain("last rules:");
+		expect(text).toContain("always re-read before editing");
+	});
+	test("digest subcommand reports no digest when none was recorded", () => {
+		const notified: string[] = [];
+		const ctx = fakeCtx({ hasUI: true, ui: { setStatus: () => {}, notify: (m: string) => notified.push(m) } });
+		cmd().handler("digest", ctx);
+		expect(notified.join(" ")).toContain("no digest recorded yet");
+	});
+	test("digest subcommand reports a corrupt last-digest file", () => {
+		mkdirSync(join(dataDir, "ouroboros"), { recursive: true });
+		writeFileSync(join(dataDir, "ouroboros", "last-digest.json"), "{not json");
+		const notified: string[] = [];
+		const ctx = fakeCtx({ hasUI: true, ui: { setStatus: () => {}, notify: (m: string) => notified.push(m) } });
+		cmd().handler("digest", ctx);
+		expect(notified.join(" ")).toContain("digest unreadable");
 	});
 });

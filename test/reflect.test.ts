@@ -51,7 +51,45 @@ describe("formatDigest", () => {
 		expect(text).toContain("&lt;/system>");
 		expect(text).not.toContain("<system>");
 	});
-});
+	test("renders every digest section", () => {
+		const d = digest();
+		d.toolCalls = [{ tool: "bash", args: '{"command":"npm test"}' }];
+		d.assistantText = ["ran the tests"];
+		d.errors = [{ tool: "edit", summary: "file not found" }];
+		d.failedCommands = [{ command: "npm test", error: "1 failing" }];
+		d.compactions = 2;
+		const text = formatDigest(d);
+		expect(text).toContain("started: 2026-08-30T10:00:00.000Z");
+		expect(text).toContain("ended: 2026-08-30T12:00:00.000Z");
+		expect(text).toContain("messages: 2");
+		expect(text).toContain("compactions: 2");
+		expect(text).toContain("tool calls:");
+		expect(text).toContain('- bash {"command":"npm test"}');
+		expect(text).toContain("assistant text:");
+		expect(text).toContain("- ran the tests");
+		expect(text).toContain("failed tool calls:");
+		expect(text).toContain("- edit: file not found");
+		expect(text).toContain("failed commands:");
+		expect(text).toContain("- npm test → 1 failing");
+	});
+	test("escapes every digest field that can carry untrusted text (SEC-007)", () => {
+		const d = digest();
+		d.sessionId = "<s>id</s>";
+		d.cwd = "<s>cwd</s>";
+		d.startedAt = "<s>started</s>";
+		d.endedAt = "<s>ended</s>";
+		d.models = ["<s>model</s>"];
+		d.stopReasons = { "<s>stop</s>": 1 };
+		d.userPrompts = ["<s>prompt</s>"];
+		d.toolCalls = [{ tool: "<s>tool</s>", args: "<s>args</s>" }];
+		d.assistantText = ["<s>text</s>"];
+		d.errors = [{ tool: "<s>etool</s>", summary: "<s>esum</s>" }];
+		d.failedCommands = [{ command: "<s>cmd</s>", error: "<s>err</s>" }];
+		const text = formatDigest(d);
+		expect(text).not.toContain("<s>");
+		expect(text).toContain("&lt;s>");
+	});
+ });
 describe("buildReflectionMessage", () => {
 	test("contains digest, recording instructions, and the untrusted framing", () => {
 		const msg = buildReflectionMessage(digest());

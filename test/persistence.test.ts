@@ -241,13 +241,25 @@ describe("digests", () => {
 		const dir = tmpDataDir();
 		const file = digestFile(dir, "sess-legacy");
 		fs.mkdirSync(path.dirname(file), { recursive: true });
-		const base = digest();
+		// Non-empty userPrompts so the derived userPromptCount is meaningful
+		// (a vacuous 0 === 0 would pass even if migrateDigest hardcoded 0).
+		const base = buildDigest(
+			[
+				{ type: "session", id: "sess-legacy", cwd: "/proj", timestamp: "2026-08-30T10:00:00.000Z" },
+				{ type: "message", message: { role: "user", content: "fix the bug" } },
+				{ type: "message", message: { role: "user", content: "now the tests" } },
+			],
+			"sess-legacy",
+			"/proj",
+			"2026-08-30T12:00:00.000Z",
+		);
+		expect(base.userPrompts).toHaveLength(2);
 		// Round-3 shape: no userPromptCount.
 		const { userPromptCount: _drop, ...round3 } = base as unknown as Record<string, unknown>;
 		fs.writeFileSync(file, JSON.stringify(round3));
 		const migrated = loadDigest(dir, "sess-legacy");
 		expect(migrated).not.toBeNull();
-		expect(migrated!.userPromptCount).toBe(base.userPrompts.length);
+		expect(migrated!.userPromptCount).toBe(2);
 		// Round-1/2 shape: failedCommands is a string[].
 		fs.writeFileSync(file, JSON.stringify({ ...round3, failedCommands: ["npm test", "ls /x"] }));
 		const migrated2 = loadDigest(dir, "sess-legacy");
@@ -299,7 +311,11 @@ describe("digests", () => {
 		const dir = tmpDataDir();
 		// maxChars 50 < MAX_RULE_CHARS 500: the single rule must be truncated
 		// so the stored file fits the configured budget.
-		appendRule(dir, "z".repeat(200), 50, 50);
+		const result = appendRule(dir, "z".repeat(200), 50, 50);
+		// The truncated rule IS recorded — the verify must match the written
+		// form, not the original key (was reporting "conflict" before).
+		expect(result.added).toBe(true);
+		expect(result.reason).toBe("added");
 		const rules = loadRules(dir);
 		expect(rules[0]!.length).toBeLessThanOrEqual(50);
 		expect(rules.join("\n").length + 1).toBeLessThanOrEqual(50);

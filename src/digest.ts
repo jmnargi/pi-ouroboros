@@ -67,6 +67,7 @@ export const COMMAND_MAX_CHARS = 160;
 export const ERROR_CAP = 20;
 export const COMMAND_CAP = 20;
 export const TOOL_CALL_CAP = 20;
+export const TOOL_NAME_MAX_CHARS = 100;
 export const TOOL_ARGS_MAX_CHARS = 80;
 export const ASSISTANT_TEXT_CAP = 12;
 
@@ -179,8 +180,12 @@ export function buildDigest(
 	};
 
 	const seenModels = new Set<string>();
+	// Dedup Sets are bounded too: a failure-heavy session must not grow them
+	// without limit. Beyond 100 distinct failures, new ones are not recorded
+	// (the arrays are capped at 20 anyway).
 	const seenErrors = new Set<string>();
 	const seenCommands = new Set<string>();
+	const DEDUP_CAP = 100;
 	/** toolCallId → bash command, from assistant toolCalls. */
 	const bashCommands = new Map<string, string>();
 	/** Raw (unstringified) trace buffers — stringify only the kept calls. */
@@ -215,10 +220,11 @@ export function buildDigest(
 				// Dedup on the RAW command — truncation could collapse two
 				// distinct commands into one key.
 				const raw = msg.command.trim();
-				if (!seenCommands.has(raw)) {
+				if (!seenCommands.has(raw) && seenCommands.size < DEDUP_CAP) {
 					seenCommands.add(raw);
 					const cmd = truncate(raw, COMMAND_MAX_CHARS);
 					const error = truncateTail(extractText(msg.output), ERROR_MAX_CHARS) || "(no output)";
+					if (digest.failedCommands.length >= COMMAND_CAP) digest.failedCommands.shift();
 					digest.failedCommands.push({ command: cmd, error });
 				}
 			}
@@ -228,7 +234,12 @@ export function buildDigest(
 		if (msg.role === "user") {
 			digest.userPromptCount += 1;
 			const text = truncate(extractText(msg.content), PROMPT_MAX_CHARS);
-			if (text) digest.userPrompts.push(text);
+			if (text) {
+				// Bounded DURING the loop (keeps the newest) — a prompt-heavy
+				// session must not build a 100k-element array before the cap.
+				if (digest.userPrompts.length >= PROMPT_CAP) digest.userPrompts.shift();
+				digest.userPrompts.push(text);
+			}
 			continue;
 		}
 		if (msg.role === "assistant") {
@@ -265,7 +276,7 @@ export function buildDigest(
 					// session does not build a 10k-element array.
 					if (b.type === "toolCall" && typeof b.name === "string") {
 						if (rawToolCalls.length >= TOOL_CALL_CAP) rawToolCalls.shift();
-						rawToolCalls.push({ tool: b.name, args: b.arguments });
+						rawToolCalls.push({ tool: b.name.slice(0, TOOL_NAME_MAX_CHARS), args: b.arguments });
 					} else if (b.type === "text" && typeof b.text === "string" && b.text.trim()) {
 						if (rawAssistantText.length >= ASSISTANT_TEXT_CAP) rawAssistantText.shift();
 						rawAssistantText.push(b.text);
@@ -284,10 +295,11 @@ export function buildDigest(
 				if (msg.isError === true) {
 					const raw = typeof msg.toolCallId === "string" ? bashCommands.get(msg.toolCallId) : undefined;
 					const key = raw ?? "(unknown command)";
-					if (!seenCommands.has(key)) {
+					if (!seenCommands.has(key) && seenCommands.size < DEDUP_CAP) {
 						seenCommands.add(key);
 						const cmd = truncate(key, COMMAND_MAX_CHARS);
 						const error = truncateTail(extractText(msg.content), ERROR_MAX_CHARS) || "(no output)";
+						if (digest.failedCommands.length >= COMMAND_CAP) digest.failedCommands.shift();
 						digest.failedCommands.push({ command: cmd, error });
 					}
 				}
@@ -299,8 +311,9 @@ export function buildDigest(
 				const tool = typeof msg.toolName === "string" ? msg.toolName : "tool";
 				const summary = truncate(extractText(msg.content), ERROR_MAX_CHARS) || "(no output)";
 				const key = `${tool}:${summary}`;
-				if (!seenErrors.has(key)) {
+				if (!seenErrors.has(key) && seenErrors.size < DEDUP_CAP) {
 					seenErrors.add(key);
+					if (digest.errors.length >= ERROR_CAP) digest.errors.shift();
 					digest.errors.push({ tool, summary });
 				}
 			}
@@ -320,8 +333,18 @@ export function buildDigest(
 		digest.failedCommands = digest.failedCommands.slice(-COMMAND_CAP);
 	}
 	// Stringify the kept trace calls (the raw buffers are already bounded).
+	// The replacer truncates string values so a huge field (e.g. a crafted
+	// write_file content) is not fully serialized; a circular or too-deep
+	// object throws, and the args are dropped rather than losing the digest.
 	for (const t of rawToolCalls) {
-		const args = typeof t.args === "object" && t.args !== null ? JSON.stringify(t.args) : "";
+		let args = "";
+		if (typeof t.args === "object" && t.args !== null) {
+			try {
+				args = JSON.stringify(t.args, (_k, v) => (typeof v === "string" ? v.slice(0, 200) : v));
+			} catch {
+				args = "";
+			}
+		}
 		digest.toolCalls.push({ tool: t.tool, args: truncate(args, TOOL_ARGS_MAX_CHARS) });
 	}
 	for (const t of rawAssistantText) {

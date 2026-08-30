@@ -18,8 +18,8 @@ export function formatDigest(digest: OuroborosDigest): string {
 	const lines: string[] = [];
 	lines.push(`session: ${escapeTags(digest.sessionId)}`);
 	lines.push(`cwd: ${escapeTags(digest.cwd)}`);
-	if (digest.startedAt) lines.push(`started: ${digest.startedAt}`);
-	lines.push(`ended: ${digest.endedAt}`);
+	if (digest.startedAt) lines.push(`started: ${escapeTags(digest.startedAt)}`);
+	lines.push(`ended: ${escapeTags(digest.endedAt)}`);
 	lines.push(`messages: ${digest.messageCount}`);
 	if (digest.models.length > 0) lines.push(`models: ${digest.models.map(escapeTags).join(", ")}`);
 	lines.push(
@@ -27,7 +27,7 @@ export function formatDigest(digest: OuroborosDigest): string {
 	);
 	if (digest.compactions > 0) lines.push(`compactions: ${digest.compactions}`);
 	const stops = Object.entries(digest.stopReasons)
-		.map(([k, v]) => `${k}: ${v}`)
+		.map(([k, v]) => `${escapeTags(k)}: ${v}`)
 		.join(", ");
 	if (stops) lines.push(`stop reasons: ${stops}`);
 

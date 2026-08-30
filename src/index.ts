@@ -22,7 +22,7 @@
  * injection. Nothing here calls the model directly.
  */
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Text } from "@earendil-works/pi-tui";
@@ -43,6 +43,7 @@ import {
 	deleteDigest,
 	listDigests,
 	loadDigest,
+	readInjectedDigest,
 	listSkills,
 	loadRules,
 	rulesFile,
@@ -78,24 +79,22 @@ function envInt(name: string, fallback: number): number {
 	return n > 0 ? n : fallback;
 }
 
-/** True when the session file already contains the ouroboros reflection
- * message. The message is drained (persisted) before the first LLM call, so
- * a failed first turn leaves it in the history with the marker still set.
- * Re-injecting on resume would deliver the reflection twice. */
-function sessionHasOuroborosMessage(sessionFile: string): boolean {
-	try {
-		const text = readFileSync(sessionFile, "utf8");
-		for (const line of text.split("\n")) {
-			if (!line.trim()) continue;
-			try {
-				const entry = JSON.parse(line) as { type?: unknown; customType?: unknown };
-				if (entry.type === "custom_message" && entry.customType === OUROBOROS_CUSTOM_TYPE) return true;
-			} catch {
-				// skip malformed lines
-			}
+/** True when the session entries already contain the reflection for digest
+ * `sessionId`. The message is drained (persisted) before the first LLM call,
+ * so a failed first turn leaves it in the history with the marker still set.
+ * Re-injecting on resume would deliver the reflection twice. The content is
+ * matched per-digest (`session: <sessionId>` in the digest block) so an OLD
+ * ouroboros message from a prior successful reflection cannot mask an
+ * undelivered one. The entries come from the runtime's own parsed session
+ * (ctx.sessionManager.getEntries()) — complete, bounded, no file IO. */
+function sessionHasOuroborosMessage(entries: unknown[], sessionId: string): boolean {
+	const needle = `session: ${sessionId}`;
+	for (const raw of entries) {
+		if (!raw || typeof raw !== "object") continue;
+		const entry = raw as { type?: unknown; customType?: unknown; content?: unknown };
+		if (entry.type === "custom_message" && entry.customType === OUROBOROS_CUSTOM_TYPE && typeof entry.content === "string" && entry.content.includes(needle)) {
+			return true;
 		}
-	} catch {
-		// unreadable session file — assume not delivered
 	}
 	return false;
 }
@@ -186,21 +185,29 @@ export default function (pi: ExtensionAPI): void {
 		// the queued message survives in _pendingNextTurnMessages, and
 		// unmarking would deliver the reflection twice.
 		const recovered: string[] = [];
+		// Digests that were marked injected at entry may be recovered by a
+		// CONCURRENT instance (unmark race). Never delete them as stale —
+		// the winner may still be about to inject them.
+		const initialInjected = new Set<string>();
 		if (event.reason !== "reload") {
 			try {
 				const injected = listInjectedDigests(dataDir);
+				for (const sid of injected) initialInjected.add(sid);
 				if (injected.length > 0) {
-					// On resume, the queued reflection may already be in the
-					// resumed session's history: the message is drained
-					// (persisted) before the first LLM call, and a failed
-					// call keeps the marker. If the history already has the
-					// ouroboros message, delete the markers instead of
-					// unmarking — re-injecting would deliver it twice.
-					const alreadyDelivered =
-						event.reason === "resume" && event.previousSessionFile
-							? sessionHasOuroborosMessage(event.previousSessionFile)
-							: false;
+					// The queued reflection may already be in the CURRENT
+					// session's history: the message is drained (persisted)
+					// before the first LLM call, and a failed call keeps the
+					// marker. This fires for every non-reload reason — the
+					// primary resume path (pi --continue/--resume) emits
+					// reason "startup", not "resume". If the history already
+					// has the reflection for this digest, delete the marker
+					// instead of unmarking — re-injecting would deliver it
+					// twice. The entries come from the runtime's parsed
+					// session (complete, no file IO).
+					const entries = (ctx as unknown as { sessionManager?: { getEntries?: () => unknown[] } }).sessionManager?.getEntries?.() ?? [];
 					for (const sid of injected) {
+						const digest = readInjectedDigest(dataDir, sid);
+						const alreadyDelivered = digest ? sessionHasOuroborosMessage(entries, digest.sessionId) : false;
 						if (alreadyDelivered) {
 							deleteInjectedDigest(dataDir, sid);
 						} else if (unmarkDigestInjected(dataDir, sid)) {
@@ -225,13 +232,15 @@ export default function (pi: ExtensionAPI): void {
 		for (const sid of ordered) {
 			// One corrupt digest must not block the rest.
 			try {
-				// Only the newest NOTABLE digest gets reflected on; the rest
-				// are stale. Checked BEFORE loadDigest so a pile of pending
-				// digests is deleted by filename without parsing.
-				if (injected) {
-					deleteDigest(dataDir, sid);
-					continue;
-				}
+			if (injected) {
+				// Skip digests that were marked injected at entry — a
+				// concurrent instance may have recovered them and be
+				// about to inject them. Deleting would drop the
+				// undelivered reflection. They are re-processed at the
+				// next session start if still pending.
+				if (!initialInjected.has(sid)) deleteDigest(dataDir, sid);
+				continue;
+			}
 				const digest = loadDigest(dataDir, sid);
 				if (!digest) {
 					deleteDigest(dataDir, sid);

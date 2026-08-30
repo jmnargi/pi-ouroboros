@@ -54,9 +54,10 @@ function bashToolResult(id: string, text: string, isError = false): Record<strin
 	});
 }
 
-// Documented bashExecution role (command/exitCode on the message).
-function bashFailure(command: string, exitCode = 1): Record<string, unknown> {
-	return entry({ message: { role: "bashExecution", command, exitCode } });
+// Documented bashExecution role (command/output/exitCode on the message).
+// Real messages always carry output (agent-session.js:2222-2226).
+function bashFailure(command: string, exitCode = 1, output = ""): Record<string, unknown> {
+	return entry({ message: { role: "bashExecution", command, output, exitCode } });
 }
 describe("buildDigest", () => {
 	test("extracts user prompts, errors, failed commands, stop reasons, usage", () => {
@@ -136,6 +137,18 @@ describe("buildDigest", () => {
 		];
 		const d = buildDigest(entries, SID, CWD, END);
 		expect(d.failedCommands).toEqual([{ command: "ls /nonexistent-dir-xyz", error: "ls: cannot access '/nonexistent-dir-xyz': No such file or directory Command exited with code 2" }, { command: "npm test", error: "1 failing Command exited with code 1" }]);
+	});
+	test("bashExecution records the real output tail, not the no-output fallback", () => {
+		const d = buildDigest([bashFailure("npm test", 1, "1 failing\n\n\nCommand exited with code 1")], SID, CWD, END);
+		expect(d.failedCommands).toHaveLength(1);
+		expect(d.failedCommands[0]!.error).toContain("Command exited with code 1");
+		expect(d.failedCommands[0]!.error).not.toBe("(no output)");
+	});
+	test("user messages with the real array-content shape land in userPrompts", () => {
+		// Real session files carry user content as a block array.
+		const d = buildDigest([entry({ message: { role: "user", content: [{ type: "text", text: "fix the bug" }] } })], SID, CWD, END);
+		expect(d.userPrompts).toEqual(["fix the bug"]);
+		expect(d.userPromptCount).toBe(1);
 	});
 
 	test("ignores successful bash results even when they print exit codes", () => {

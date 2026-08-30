@@ -56,6 +56,23 @@ try {
 	];
 	bench("buildDigest (300KB prompt + trace)", 200, () => buildDigest(entries, "sess-1", "/proj", "2026-08-30T12:00:00.000Z"));
 
+	// 2b. buildDigest with 10k tool calls — the trace caps must keep the
+	// cost flat (a revert to unbounded collection shows up in the numbers).
+	const manyCalls: Array<Record<string, unknown>> = [
+		{ type: "session", id: "sess-1", cwd: "/proj", timestamp: "2026-08-30T10:00:00.000Z" },
+	];
+	for (let i = 0; i < 10_000; i++) {
+		manyCalls.push({
+			type: "message",
+			message: {
+				role: "assistant",
+				content: [{ type: "toolCall", id: `c${i}`, name: "bash", arguments: { command: `command ${i}` } }],
+				stopReason: "toolUse",
+			},
+		});
+	}
+	bench("buildDigest (10k tool calls, capped)", 20, () => buildDigest(manyCalls, "sess-1", "/proj", "2026-08-30T12:00:00.000Z"));
+
 	// 3. loadRules with a full rules file (cached).
 	for (let i = 0; i < 50; i++) appendRule(dir, `rule number ${i}: always do the thing`);
 	bench("loadRules (50 rules, cached)", 10_000, () => loadRules(dir));

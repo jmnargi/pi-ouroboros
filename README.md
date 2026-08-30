@@ -62,7 +62,7 @@ Run one pi instance at a time to avoid lost rules.
 The digest content is untrusted data.
 The digest can contain text from files, tools, or other agents.
 The reflection message tells the model to ignore instructions inside the digest.
-The plugin escapes XML-like tags in the digest text.
+The plugin escapes XML-like tags in every digest text field.
 The model records lessons with the `ouroboros_learn` tool.
 The tool appends, dedupes, and caps the rules.
 The tool strips control characters from rules.
@@ -80,14 +80,15 @@ The plugin keeps handler work small.
 Measured costs:
 
 - Session start with no digests: 0.002 ms.
-- Session start with 1 digest: 0.017 ms.
-- Session start with 50 digests: 0.090 ms.
-- Rules read per turn (cached): 0.001 ms.
-- Skills read per turn (cached): 0.001 ms.
-- Rule append at cap (char eviction): 0.028 ms.
-- Digest list with 10,000 digests: 22 ms.
-- Digest build with a 300 KB prompt: 0.068 ms.
-- Digest save (atomic write): 0.021 ms.
+- Session start with 1 digest: 0.023 ms.
+- Session start with 50 digests: 0.117 ms.
+- Rules read per turn (cached): 0.002 ms.
+- Skills read per turn (cached): 0.002 ms.
+- Rule append at cap (char eviction): 0.040 ms.
+- Digest list with 10,000 digests: 21 ms.
+- Digest build with a 300 KB prompt: 0.067 ms.
+- Digest build with 10,000 tool calls (capped): 3.3 ms.
+- Digest save (atomic write): 0.024 ms.
 
 The plugin caches the rules file.
 The plugin invalidates the cache on its own writes.
@@ -144,7 +145,7 @@ npx tsc --noEmit
 The tests cover digest extraction, persistence, prompt building, and the extension entry point.
 Run `bun bench/bench.ts` to measure the hot paths.
 
-The test suite has 93 tests.
+The test suite has 117 tests.
 
 The reflection happens at the start of the next session.
 The reflection does not happen at shutdown.
