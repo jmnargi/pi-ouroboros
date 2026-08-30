@@ -343,6 +343,48 @@ describe("session_start", () => {
 		expect(api.messages).toHaveLength(0);
 		expect(readdirSync(digestsDir(dataDir))).toEqual([]);
 	});
+	test("one unreadable marker does not stall recovery of the rest (TestQuality4)", async () => {
+		// sess-a's marker path is a directory (readInjectedDigest throws);
+		// sess-b is a valid recovered digest. The per-digest isolation must
+		// skip sess-a (marker kept) and still inject sess-b.
+		saveDigest(dataDir, buildDigest(notableEntries("sess-a"), "sess-a", "/proj", "2026-08-30T10:00:00.000Z"));
+		markDigestInjected(dataDir, "sess-a");
+		const markerA = join(digestsDir(dataDir), "sess-a.injected.json");
+		rmSync(markerA);
+		mkdirSync(markerA);
+		saveDigest(dataDir, buildDigest(notableEntries("sess-b"), "sess-b", "/proj", "2026-08-30T11:00:00.000Z"));
+		markDigestInjected(dataDir, "sess-b");
+		const handler = api.fire.bind(api, "session_start");
+		await handler({}, fakeCtx());
+		expect(api.messages).toHaveLength(1);
+		expect(api.messages[0]!.message.content).toContain("sess-b");
+		expect(readdirSync(digestsDir(dataDir)).sort()).toEqual(["sess-a.injected.json", "sess-b.injected.json"]);
+	});
+	test("agent_end deletes a marker whose reflection is in the run's messages (RuntimeIntegration2)", async () => {
+		// A reload re-imported the module (fresh queuedInjected), so the
+		// queued marker is not in the set. The run's messages contain the
+		// drained reflection — agent_end must delete the marker.
+		saveDigest(dataDir, buildDigest(notableEntries(), "sess-1", "/proj", "2026-08-30T12:00:00.000Z"));
+		markDigestInjected(dataDir, "sess-1");
+		const handler = api.fire.bind(api, "session_start");
+		await handler({ reason: "reload" }, fakeCtx());
+		expect(readdirSync(digestsDir(dataDir))).toEqual(["sess-1.injected.json"]);
+		// The run's messages include the drained custom message.
+		const reflection = "[Ouroboros] ...\nsession: sess-1\ncwd: /proj";
+		await api.fire("agent_end", { messages: [{ role: "custom", customType: OUROBOROS_CUSTOM_TYPE, content: reflection }, { role: "assistant", stopReason: "stop" }] });
+		expect(readdirSync(digestsDir(dataDir))).toEqual([]);
+	});
+	test("agent_end keeps a marker whose reflection is NOT in the run's messages (RuntimeIntegration2)", async () => {
+		// A recovered-but-not-queued marker: its reflection was never
+		// delivered, so the run's messages do not contain it — the marker
+		// must survive for the next session start.
+		saveDigest(dataDir, buildDigest(notableEntries(), "sess-1", "/proj", "2026-08-30T12:00:00.000Z"));
+		markDigestInjected(dataDir, "sess-1");
+		const handler = api.fire.bind(api, "session_start");
+		await handler({ reason: "reload" }, fakeCtx());
+		await api.fire("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }] });
+		expect(readdirSync(digestsDir(dataDir))).toEqual(["sess-1.injected.json"]);
+	});
 	test("a recovered digest that is no longer notable has its marker removed (TestQuality3)", async () => {
 		// PI_OUROBOROS_REFLECT_MIN_PROMPTS can be raised between sessions:
 		// a digest that was notable at capture is not notable now. The

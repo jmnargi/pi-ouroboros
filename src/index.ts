@@ -189,6 +189,10 @@ export default function (pi: ExtensionAPI): void {
 		uiHost = ctx as unknown as UiHost;
 		reflectQueued = false;
 		queuedInjected = new Set();
+		// Reset the stale flag: a previous session's failed run can leave it
+		// true, and a spurious marker-deletion pass at the next agent_end
+		// would do an unnecessary readdir.
+		hasInjectedDigests = false;
 		// Leftover .injected.json files mean the queued reflection was never
 		// confirmed delivered (crash, quit before the first turn, failed LLM
 		// call). Keep their markers (the atomic claim) and process them
@@ -211,7 +215,15 @@ export default function (pi: ExtensionAPI): void {
 					// (complete, no file IO).
 					const entries = (ctx as unknown as { sessionManager?: { getEntries?: () => unknown[] } }).sessionManager?.getEntries?.() ?? [];
 					for (const sid of injected) {
-						const digest = readInjectedDigest(dataDir, sid);
+						// Per-digest isolation: a transient IO error on one
+						// marker (EMFILE, EACCES) must not stall the rest —
+						// the marker is kept for the next session start.
+						let digest: OuroborosDigest | null = null;
+						try {
+							digest = readInjectedDigest(dataDir, sid);
+						} catch {
+							continue;
+						}
 						const alreadyDelivered = digest ? sessionHasOuroborosMessage(entries, digest.sessionId) : false;
 						if (alreadyDelivered) {
 							deleteInjectedDigest(dataDir, sid);
@@ -245,6 +257,11 @@ export default function (pi: ExtensionAPI): void {
 					const digest = readInjectedDigest(dataDir, sid);
 					if (digest && sessionHasOuroborosMessage(entries, digest.sessionId)) {
 						deleteInjectedDigest(dataDir, sid);
+					} else {
+						// A marker remains: agent_end must check the run's
+						// messages and delete any marker whose reflection
+						// was actually delivered in this run.
+						hasInjectedDigests = true;
 					}
 				}
 			} catch {
@@ -343,6 +360,22 @@ export default function (pi: ExtensionAPI): void {
 				// next session start.
 				for (const sid of queuedInjected) {
 					deleteInjectedDigest(dataDir, sid);
+				}
+				// A reload re-imported the module, so a marker queued before
+				// the reload is not in queuedInjected. Delete any injected
+				// marker whose reflection is verifiably in THIS run's
+				// messages — the drained custom message carries the digest
+				// block. A marker whose reflection is not in the messages
+				// (recovered-but-not-queued) is left for the next recovery.
+				for (const sid of listInjectedDigests(dataDir)) {
+					const digest = readInjectedDigest(dataDir, sid);
+					if (!digest) continue;
+					const needle = `\nsession: ${escapeTags(digest.sessionId)}\n`;
+					const delivered = messages.some((m) => {
+						const content = (m as { content?: unknown })?.content;
+						return typeof content === "string" && content.includes(needle);
+					});
+					if (delivered) deleteInjectedDigest(dataDir, sid);
 				}
 			} catch {
 				// best-effort — a failed cleanup must not skip the status

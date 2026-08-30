@@ -16,6 +16,8 @@ import {
 	digestFile,
 	lastDigestFile,
 	loadDigest,
+	isValidDigest,
+	readInjectedDigest,
 	loadLastDigest,
 	loadRules,
 	listDigests,
@@ -79,6 +81,28 @@ describe("rules", () => {
 		expect(loadRules(dir)).toEqual(["編集前にファイルを再読込する", "テストを実行する"]);
 		// A near-duplicate CJK rule (punctuation differs) is still deduped.
 		expect((await appendRule(dir, "編集前にファイルを再読込する！")).reason).toBe("duplicate");
+	});
+	test("appendRule cuts by code points, never storing a lone surrogate (Security8)", async () => {
+		const dir = tmpDataDir();
+		// 499 ASCII chars + an emoji is 500 code points / 501 units: a
+		// UTF-16 slice at 500 would split the pair. The stored rule must
+		// keep the emoji intact and contain no lone surrogate.
+		const rule = "x".repeat(499) + "😀";
+		expect((await appendRule(dir, rule)).added).toBe(true);
+		const stored = loadRules(dir)[0]!;
+		expect([...stored]).toHaveLength(500);
+		expect(stored.endsWith("😀")).toBe(true);
+		expect([...stored].some((c) => c.length === 1 && c.charCodeAt(0) >= 0xd800 && c.charCodeAt(0) <= 0xdfff)).toBe(false);
+	});
+	test("loadRules passes through U+FFFD; the lone-surrogate strip is defense-in-depth (Security8)", async () => {
+		const dir = tmpDataDir();
+		fs.mkdirSync(path.dirname(rulesFile(dir)), { recursive: true });
+		// A lone surrogate written to a UTF-8 file becomes U+FFFD (Node's
+		// encoder cannot represent it), so the strip cannot be exercised
+		// through normal file IO — it guards non-UTF-8 files. Normal rules
+		// pass through unchanged.
+		fs.writeFileSync(rulesFile(dir), "fix \ud800 the bug\n");
+		expect(loadRules(dir)).toEqual(["fix \ufffd the bug"]);
 	});
 
 	test("appendRule drops the oldest rule at cap", async () => {
@@ -382,6 +406,33 @@ describe("digests", () => {
 		expect([...migrated!.toolCalls[0]!.tool]).toHaveLength(100);
 		expect(migrated!.toolCalls[0]!.tool.endsWith("😀")).toBe(true);
 	});
+	test("a digest with more than 20 stopReasons keys is rejected (FixAudit9)", () => {
+		// migrateDigest re-caps legacy digests at 20, so this exercises the
+		// validator directly — the last line of defense against a crafted
+		// digest that bypasses migration.
+		const base = digest();
+		const stops: Record<string, number> = {};
+		for (let i = 0; i < 21; i++) stops[`stop-${i}`] = 1;
+		expect(isValidDigest({ ...base, stopReasons: stops })).toBe(false);
+		// 20 keys is the writer's cap and must pass.
+		const stops20: Record<string, number> = {};
+		for (let i = 0; i < 20; i++) stops20[`stop-${i}`] = 1;
+		expect(isValidDigest({ ...base, stopReasons: stops20 })).toBe(true);
+	});
+	test("cleanupStaleTmp does not follow a symlinked ouroboros dir (Security8)", () => {
+		const dir = tmpDataDir();
+		// A symlinked ouroboros dir pointing at a directory with an old
+		// tmp file: the cleanup must not delete inside the target.
+		const target = fs.mkdtempSync(path.join(os.tmpdir(), "ouroboros-target-"));
+		tmpDirs.push(target);
+		const oldTmp = path.join(target, "victim.tmp");
+		fs.writeFileSync(oldTmp, "x");
+		const old = new Date(Date.now() - 2 * 60 * 60 * 1000);
+		fs.utimesSync(oldTmp, old, old);
+		fs.symlinkSync(target, path.join(dir, "ouroboros"));
+		cleanupStaleTmp(dir);
+		expect(fs.existsSync(oldTmp)).toBe(true);
+	});
 	test("an array-typed stopReasons stays rejected (Security7)", () => {
 		const dir = tmpDataDir();
 		const file = digestFile(dir, "sess-legacy");
@@ -417,6 +468,19 @@ describe("digests", () => {
 		expect(() => loadDigest(dir, "sess-io")).toThrow();
 		expect(fs.existsSync(file)).toBe(true);
 	});
+	test("readInjectedDigest throws on IO errors, keeping the marker (TestQuality4)", () => {
+		const dir = tmpDataDir();
+		const file = `${digestFile(dir, "sess-io").slice(0, -".json".length)}.injected.json`;
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		fs.writeFileSync(file, JSON.stringify(digest()));
+		// A directory at the marker path makes readFileSync fail with EISDIR
+		// — the loader must throw (not return null), so the caller keeps the
+		// marker instead of deleting it.
+		fs.rmSync(file);
+		fs.mkdirSync(file);
+		expect(() => readInjectedDigest(dir, "sess-io")).toThrow();
+		expect(fs.existsSync(file)).toBe(true);
+	});
 	test("listInjectedDigests skips non-round-tripping stems (Security7)", () => {
 		const dir = tmpDataDir();
 		const digests = path.join(dir, "ouroboros", "digests");
@@ -427,7 +491,8 @@ describe("digests", () => {
 	});
 	test("cleanupStaleTmp does not follow symlinked skill dirs (Security7)", () => {
 		const dir = tmpDataDir();
-		const skills = path.join(dir, "ouroboros", "skills");
+		// cleanupStaleTmp scans skillsDir(dataDir) = <dataDir>/skills.
+		const skills = path.join(dir, "skills");
 		fs.mkdirSync(skills, { recursive: true });
 		// A symlinked skill dir pointing at a directory with an old tmp
 		// file: the cleanup must not delete inside the target.
@@ -442,6 +507,9 @@ describe("digests", () => {
 		expect(fs.existsSync(oldTmp)).toBe(true);
 	});
 	test("writeSkill refuses to overwrite atomically (Security7)", () => {
+		// The no-overwrite contract is pinned here; the atomicity property
+		// (two concurrent writers cannot both pass the check) is verified
+		// by code inspection — the link is the atomic claim.
 		const dir = tmpDataDir();
 		writeSkill(dir, "my-skill", "desc", "body");
 		// A second write with the same name must fail even though the
@@ -450,6 +518,18 @@ describe("digests", () => {
 		const content = fs.readFileSync(path.join(dir, "skills", "my-skill", "SKILL.md"), "utf8");
 		expect(content).toContain("desc");
 		expect(content).not.toContain("desc2");
+		// No leftover tmp files after the EEXIST throw.
+		expect(fs.readdirSync(path.join(dir, "skills", "my-skill")).filter((f) => f.endsWith(".tmp"))).toEqual([]);
+	});
+	test("writeSkill re-throws a non-EEXIST link error and cleans its tmp (TestQuality4)", () => {
+		const dir = tmpDataDir();
+		// A directory at the SKILL.md path makes linkSync fail with EPERM
+		// on Linux — the error must be re-thrown (not 'already exists') and
+		// the tmp file must be removed.
+		const skillDir = path.join(dir, "skills", "my-skill");
+		fs.mkdirSync(path.join(skillDir, "SKILL.md"), { recursive: true });
+		expect(() => writeSkill(dir, "my-skill", "desc", "body")).toThrow();
+		expect(fs.readdirSync(skillDir).filter((f) => f.endsWith(".tmp"))).toEqual([]);
 	});
 
 	test("last digest round-trips for /ouroboros digest (UX-2)", () => {

@@ -90,11 +90,18 @@ export function loadRules(dataDir: string): string[] {
 			return rulesCache.rules;
 		}
 		const text = fs.readFileSync(file, "utf8");
-		// Strip control chars at the injection boundary too: rules written by
-		// older plugin versions (or hand-edited) bypass appendRule's strip.
+		// Strip control chars and lone surrogates at the injection boundary
+		// too: rules written by older plugin versions (or hand-edited)
+		// bypass appendRule's strip. A lone surrogate in the system prompt
+		// can make the provider reject the request.
 		const rules = text
 			.split("\n")
-			.map((l) => l.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f]/g, "").trim())
+			.map((l) =>
+				l
+					.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f]/g, "")
+					.replace(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g, "")
+					.trim(),
+			)
 			.filter((l) => l.length > 0);
 		rulesCache = { file, mtimeMs: stat.mtimeMs, size: stat.size, rules };
 		return rules;
@@ -145,22 +152,26 @@ export function appendRule(
 	// Bypass the negative cache: a rules.md created by another process
 	// within the 1s window must be seen, or this write would clobber it.
 	invalidateRulesCache();
-	// Strip control chars: a rule is injected into the system prompt verbatim.
+	// Strip control chars and lone surrogates: a rule is injected into the
+	// system prompt verbatim. The cap is by code points — a UTF-16 slice
+	// could split a surrogate pair and store a lone surrogate.
 	const normalized = rule
 		.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f]/g, "")
+		.replace(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g, "")
 		.trim()
-		.replace(/\s+/g, " ")
-		.slice(0, MAX_RULE_CHARS);
+		.replace(/\s+/g, " ");
+	const chars = Array.from(normalized);
+	const capped = chars.length <= MAX_RULE_CHARS ? normalized : chars.slice(0, MAX_RULE_CHARS).join("");
 	// A rule with no letter or number content ('!!!', emoji-only) is not a
 	// lesson — and every such rule shares the empty dedupKey, so the first
 	// would silently shadow all later ones as 'duplicate'. Unicode-aware:
 	// CJK lessons (the model can write in any language) must be accepted.
-	if (!normalized || !/[\p{L}\p{N}]/u.test(normalized)) return { added: false, reason: "empty", count: loadRules(dataDir).length, cap };
+	if (!capped || !/[\p{L}\p{N}]/u.test(capped)) return { added: false, reason: "empty", count: loadRules(dataDir).length, cap };
 	for (let attempt = 0; attempt < 3; attempt++) {
 		const rules = loadRules(dataDir);
-		const key = dedupKey(normalized);
+		const key = dedupKey(capped);
 		if (rules.some((r) => dedupKey(r) === key)) return { added: false, reason: "duplicate", count: rules.length, cap };
-		const next = [...rules, normalized];
+		const next = [...rules, capped];
 		while (next.length > cap) next.shift();
 		// Evict oldest until the file fits the appendix budget (chars).
 		// Track the total once — re-joining per iteration is O(n^2).
@@ -554,6 +565,7 @@ export function isValidDigest(p: unknown): p is OuroborosDigest {
 		typeof d.stopReasons === "object" &&
 		d.stopReasons !== null &&
 		!Array.isArray(d.stopReasons) &&
+		Object.keys(d.stopReasons).length <= 20 &&
 		Object.keys(d.stopReasons).every((k) => cpLen(k) <= 100 && !/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f]/.test(k) && !LONE_SURROGATE.test(k)) &&
 		Object.values(d.stopReasons).every((v) => typeof v === "number" && Number.isFinite(v) && v >= 0) &&
 		strArr(d.models, 20, 200) &&
@@ -599,6 +611,10 @@ export function writeSkill(dataDir: string, name: string, description: string, b
 	try {
 		fs.writeFileSync(fd, content);
 		fs.fsyncSync(fd);
+	} catch (err) {
+		// A failed write (disk full, IO error) must not leak the tmp.
+		fs.rmSync(tmp, { force: true });
+		throw err;
 	} finally {
 		fs.closeSync(fd);
 	}
@@ -606,8 +622,31 @@ export function writeSkill(dataDir: string, name: string, description: string, b
 		fs.linkSync(tmp, file);
 	} catch (err) {
 		fs.rmSync(tmp, { force: true });
-		if ((err as NodeJS.ErrnoException).code === "EEXIST") {
+		const code = (err as NodeJS.ErrnoException).code;
+		if (code === "EEXIST") {
 			throw new Error(`skill "${name}" already exists at ${file} — pick a different name or remove it first`);
+		}
+		if (code === "EPERM" || code === "ENOTSUP" || code === "ENOSYS" || code === "EOPNOTSUPP") {
+			// The filesystem has no hard links (FAT32, exFAT, some network
+			// mounts): fall back to an exclusive open of the final path
+			// ('wx' = O_CREAT|O_EXCL). The no-overwrite guarantee holds; a
+			// crash mid-write can leave a partial file (accepted).
+			try {
+				const fd2 = fs.openSync(file, "wx");
+				try {
+					fs.writeFileSync(fd2, content);
+					fs.fsyncSync(fd2);
+				} finally {
+					fs.closeSync(fd2);
+				}
+			} catch (err2) {
+				if ((err2 as NodeJS.ErrnoException).code === "EEXIST") {
+					throw new Error(`skill "${name}" already exists at ${file} — pick a different name or remove it first`);
+				}
+				throw err2;
+			}
+			skillsCache = null;
+			return file;
 		}
 		throw err;
 	}
@@ -647,7 +686,17 @@ export function cleanupStaleTmp(dataDir: string, maxAgeMs: number = 60 * 60 * 10
 	const cutoff = Date.now() - maxAgeMs;
 	// atomicWrite is used for rules, digests, AND skills. Skill tmps are
 	// stored one level deeper: skills/<name>/SKILL.md.*.tmp.
-	const dirs = [ouroborosDir(dataDir), digestsDir(dataDir)];
+	// The top-level dirs are lstat-checked too: a symlinked ouroboros or
+	// digests dir must not make the cleanup delete *.tmp files inside an
+	// arbitrary target (readdirSync follows links).
+	const dirs: string[] = [];
+	for (const dir of [ouroborosDir(dataDir), digestsDir(dataDir)]) {
+		try {
+			if (!fs.lstatSync(dir).isSymbolicLink()) dirs.push(dir);
+		} catch {
+			// missing — nothing to scan
+		}
+	}
 	try {
 		// Only real directories are scanned — a symlinked skill dir must
 		// not make the cleanup delete *.tmp files inside an arbitrary
@@ -695,6 +744,10 @@ function atomicWrite(file: string, content: string): void {
 		// make the rename durable before the data blocks, leaving an empty
 		// file.
 		fs.fsyncSync(fd);
+	} catch (err) {
+		// A failed write (disk full, IO error) must not leak the tmp.
+		fs.rmSync(tmp, { force: true });
+		throw err;
 	} finally {
 		fs.closeSync(fd);
 	}

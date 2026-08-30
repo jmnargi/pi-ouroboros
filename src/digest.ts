@@ -30,6 +30,10 @@
  * formatting or instructions into the reflection message.
  */
 
+/** A lone surrogate (a UTF-16 slice artifact) — stripped so writer output
+ * always passes the validator's LONE_SURROGATE check. */
+const LONE_SURROGATE = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g;
+
 export interface OuroborosDigest {
 	version: 1;
 	sessionId: string;
@@ -132,12 +136,14 @@ function cpPrefix(s: string, max: number): string {
 	return out;
 }
 
-/** The last max code points, without materializing the whole string. */
+/** The last max code points, without materializing the whole string.
+ * O(max) iterations and O(max) copies: the code points are collected in
+ * reverse order and joined once (no quadratic string concatenation). */
 function cpSuffix(s: string, max: number): string {
 	if (s.length <= max) return s; // fast path
 	// Walk backwards by code points: a low surrogate at i-1 means the code
 	// point starts at i-2 (never split a pair).
-	let out = "";
+	const parts: string[] = [];
 	let i = s.length;
 	let n = 0;
 	while (i > 0 && n < max) {
@@ -145,19 +151,20 @@ function cpSuffix(s: string, max: number): string {
 		if (code >= 0xdc00 && code <= 0xdfff && i >= 2) {
 			const hi = s.charCodeAt(i - 2);
 			if (hi >= 0xd800 && hi <= 0xdbff) {
-				out = s.slice(i - 2, i) + out;
+				parts.push(s.slice(i - 2, i));
 				i -= 2;
 			} else {
-				out = s[i - 1] + out;
+				parts.push(s.slice(i - 1, i));
 				i -= 1;
 			}
 		} else {
-			out = s[i - 1] + out;
+			parts.push(s.slice(i - 1, i));
 			i -= 1;
 		}
 		n++;
 	}
-	return out;
+	parts.reverse();
+	return parts.join("");
 }
 
 function truncate(s: string, max: number): string {
@@ -173,6 +180,7 @@ function truncate(s: string, max: number): string {
 		cleaned = s
 			.slice(0, bound)
 			.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f]/g, "")
+			.replace(LONE_SURROGATE, "")
 			.trim()
 			.replace(/\s+/g, " ");
 		if (cpCountAtMost(cleaned, max) > max || bound >= s.length) break;
@@ -190,7 +198,7 @@ function truncate(s: string, max: number): string {
 function cleanName(s: string, max: number): string {
 	const cleaned = s
 		.replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f]/g, "")
-		.replace(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g, "");
+		.replace(LONE_SURROGATE, "");
 	if (cleaned.length <= max) return cleaned;
 	return Array.from(cleaned).slice(0, max).join("");
 }
@@ -207,6 +215,7 @@ function truncateTail(s: string, max: number): string {
 		cleaned = s
 			.slice(-bound)
 			.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f]/g, "")
+			.replace(LONE_SURROGATE, "")
 			.trim()
 			.replace(/\s+/g, " ");
 		if (cpCountAtMost(cleaned, max) > max || bound >= s.length) break;

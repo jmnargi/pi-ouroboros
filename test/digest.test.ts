@@ -407,8 +407,10 @@ describe("buildDigest", () => {
 		expect(isValidDigest(d)).toBe(true);
 	});
 	test("a huge control-char tail is bounded and keeps the last code points (FixAudit8)", () => {
-		// The geometric loop must not materialize a 10M-element array, and
-		// the last max code points of the cleaned text must survive.
+		// Performance guard: the geometric loop must not materialize a
+		// 10M-element array (the pre-fix Array.from implementation passes
+		// the content assertions but is slow/OOM on this input), and the
+		// last max code points of the cleaned text must survive.
 		const big = "A".repeat(5_000_000) + "\u0000".repeat(5_000_000) + "tail";
 		const d = buildDigest([bashFailure("npm test", 1, big)], SID, CWD, END);
 		expect(d.failedCommands[0]!.error).toContain("tail");
@@ -432,6 +434,33 @@ describe("buildDigest", () => {
 		// valid and the reflection is not lost.
 		const d = buildDigest([toolError("edit\uD800x", "boom")], SID, CWD, END);
 		expect(d.errors[0]!.tool).toBe("editx");
+		expect(isValidDigest(d)).toBe(true);
+	});
+	test("a lone surrogate in a user prompt round-trips through validation (TestQuality4)", () => {
+		// truncate/truncateTail must strip lone surrogates too — the writer
+		// contract is that buildDigest output always passes isValidDigest.
+		const d = buildDigest([userMessage("fix \ud800 the bug")], SID, CWD, END);
+		expect(d.userPrompts[0]).toBe("fix the bug");
+		expect(isValidDigest(d)).toBe(true);
+	});
+	test("content beyond the initial bound survives stripped chars (TestQuality4)", () => {
+		// The geometric loop must grow past 2*max+1 units when the cleaned
+		// content still fits: a fixed-bound implementation would drop the
+		// leading 'x'*100 (it sits beyond the initial slice).
+		const big = "x".repeat(100) + "\u0000".repeat(1000) + "y".repeat(50) + "END";
+		const d = buildDigest([bashFailure("npm test", 1, big)], SID, CWD, END);
+		expect(d.failedCommands[0]!.error).toContain("x".repeat(100));
+		expect(d.failedCommands[0]!.error).toContain("END");
+	});
+	test("a lone surrogate at the tail boundary is handled without a split pair (TestQuality4)", () => {
+		// The output ends in a lone high surrogate after a long run: the
+		// tail must keep the last code points with no split pair and no
+		// lone surrogate in the result.
+		const big = "x".repeat(100) + "\ud800" + "y".repeat(60);
+		const d = buildDigest([bashFailure("npm test", 1, big)], SID, CWD, END);
+		const error = d.failedCommands[0]!.error;
+		expect(error).toContain("y".repeat(60));
+		expect([...error].some((c) => c.length === 1 && c.charCodeAt(0) >= 0xd800 && c.charCodeAt(0) <= 0xdfff)).toBe(false);
 		expect(isValidDigest(d)).toBe(true);
 	});
 });

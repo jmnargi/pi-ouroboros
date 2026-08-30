@@ -60,6 +60,8 @@ The plugin does not lock the file across instances.
 Run one pi instance at a time to avoid lost rules.
 Two concurrent instances can also deliver the same reflection twice.
 The marker protocol has no ownership across processes.
+After a reload, a queued reflection can be delivered twice.
+The plugin does not persist the queued flag across a reload.
 
 The digest content is untrusted data.
 The digest can contain text from files, tools, or other agents.
@@ -82,15 +84,15 @@ The plugin keeps handler work small.
 Measured costs:
 
 - Session start with no digests: 0.002 ms.
-- Session start with 1 digest: 0.064 ms.
-- Session start with 50 digests: 0.117 ms.
-- Rules read per turn (cached): 0.001 ms.
-- Skills read per turn (cached): 0.001 ms.
-- Rule append at cap (char eviction): 0.049 ms.
+- Session start with 1 digest: 0.057 ms.
+- Session start with 50 digests: 0.105 ms.
+- Rules read per turn (cached): 0.002 ms.
+- Skills read per turn (cached): 0.002 ms.
+- Rule append at cap (char eviction): 0.047 ms.
 - Digest list with 10,000 digests: 21 ms.
-- Digest build with a 300 KB prompt: 0.027 ms.
-- Digest build with 10,000 tool calls (capped): 5.1 ms.
-- Digest save (atomic write): 0.024 ms.
+- Digest build with a 300 KB prompt: 0.022 ms.
+- Digest build with 10,000 tool calls (capped): 4.6 ms.
+- Digest save (atomic write): 0.021 ms.
 
 The plugin caches the rules file.
 The plugin invalidates the cache on its own writes.
@@ -147,7 +149,7 @@ npx tsc --noEmit
 
 The tests cover digest extraction, persistence, prompt building, and the extension entry point.
 Run `bun bench/bench.ts` to measure the hot paths.
-The test suite has 153 tests.
+The test suite has 165 tests.
 
 The reflection happens at the start of the next session.
 The reflection does not happen at shutdown.
