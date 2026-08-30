@@ -48,10 +48,9 @@ function bashToolCall(id: string, command: string): Record<string, unknown> {
 		},
 	});
 }
-
-function bashToolResult(id: string, text: string): Record<string, unknown> {
+function bashToolResult(id: string, text: string, isError = false): Record<string, unknown> {
 	return entry({
-		message: { role: "toolResult", toolCallId: id, toolName: "bash", content: [{ type: "text", text }], isError: false },
+		message: { role: "toolResult", toolCallId: id, toolName: "bash", content: [{ type: "text", text }], isError },
 	});
 }
 
@@ -87,25 +86,32 @@ describe("buildDigest", () => {
 
 	test("captures failed bash tool calls from the real toolResult shape", () => {
 		const entries = [
-			bashToolCall("call-1", "false; echo \"exit code: $?\""),
-			bashToolResult("call-1", "exit code: 1\n"),
-			bashToolCall("call-2", "ls /nonexistent-dir-xyz; echo \"exit code: $?\""),
-			bashToolResult("call-2", "ls: cannot access '/nonexistent-dir-xyz': No such file or directory\nexit code: 2\n"),
+			bashToolCall("call-1", "ls /nonexistent-dir-xyz"),
+			bashToolResult("call-1", "ls: cannot access '/nonexistent-dir-xyz': No such file or directory\n\n\nCommand exited with code 2", true),
+			bashToolCall("call-2", "npm test"),
+			bashToolResult("call-2", "1 failing\n\n\nCommand exited with code 1", true),
 			bashToolCall("call-3", "echo ok"),
-			bashToolResult("call-3", "ok\nexit code: 0\n"),
+			bashToolResult("call-3", "ok\n"),
 		];
 		const d = buildDigest(entries, SID, CWD, END);
-		expect(d.failedCommands).toEqual([
-			'false; echo "exit code: $?"',
-			"ls /nonexistent-dir-xyz; echo \"exit code: $?\"",
-		]);
+		expect(d.failedCommands).toEqual(["ls /nonexistent-dir-xyz", "npm test"]);
 	});
 
-	test("records unknown command when the toolCall is missing", () => {
-		const d = buildDigest([bashToolResult("orphan", "exit code: 1\n")], SID, CWD, END);
+	test("ignores successful bash results even when they print exit codes", () => {
+		const entries = [
+			bashToolCall("call-1", "false; echo \"exit code: $?\""),
+			bashToolResult("call-1", "exit code: 1\n"), // command exited 0 (echo succeeded)
+			bashToolCall("call-2", "echo \"exit code: 5\""),
+			bashToolResult("call-2", "exit code: 5\n"),
+		];
+		const d = buildDigest(entries, SID, CWD, END);
+		expect(d.failedCommands).toEqual([]);
+	});
+
+	test("records unknown command for orphan failed bash results", () => {
+		const d = buildDigest([bashToolResult("orphan", "Command exited with code 1", true)], SID, CWD, END);
 		expect(d.failedCommands).toEqual(["(unknown command)"]);
 	});
-
 	test("uses the caller-provided startedAt when no header entry exists", () => {
 		const d = buildDigest([userMessage("hi")], SID, CWD, END, "2026-08-30T09:00:00.000Z");
 		expect(d.startedAt).toBe("2026-08-30T09:00:00.000Z");
@@ -138,6 +144,22 @@ describe("buildDigest", () => {
 		expect(d.failedCommands[0]).toHaveLength(161);
 	});
 
+	test("strips control characters from digest text", () => {
+		const d = buildDigest([userMessage("hello\u0000world\u001b[31mred")], SID, CWD, END);
+		expect(d.userPrompts[0]).toBe("helloworld[31mred"); // ESC stripped, text remains
+	});
+
+	test("caps errors and failed commands at 20 each", () => {
+		const entries = [
+			...Array.from({ length: 30 }, (_, i) => toolError("edit", `error ${i}`)),
+			...Array.from({ length: 30 }, (_, i) => bashFailure(`cmd ${i}`, 1)),
+		];
+		const d = buildDigest(entries, SID, CWD, END);
+		expect(d.errors).toHaveLength(20);
+		expect(d.failedCommands).toHaveLength(20);
+		expect(d.errors[19]!.summary).toBe("error 29"); // newest kept
+	});
+
 	test("ignores successful bash and non-error tool results", () => {
 		const entries = [
 			entry({ message: { role: "bashExecution", command: "npm test", exitCode: 0 } }),
@@ -168,12 +190,16 @@ describe("buildDigest", () => {
 describe("isNotable", () => {
 	const base = () => buildDigest([], SID, CWD, END);
 
-	test("true on errors, failed commands, any stop reason, compactions", () => {
+	test("true on errors, failed commands, abnormal stops, compactions", () => {
 		expect(isNotable({ ...base(), errors: [{ tool: "edit", summary: "x" }] }, 5)).toBe(true);
 		expect(isNotable({ ...base(), failedCommands: ["npm test"] }, 5)).toBe(true);
 		expect(isNotable({ ...base(), stopReasons: { length: 1 } }, 5)).toBe(true);
-		expect(isNotable({ ...base(), stopReasons: { stop: 4, toolUse: 3 } }, 5)).toBe(true);
+		expect(isNotable({ ...base(), stopReasons: { error: 1 } }, 5)).toBe(true);
 		expect(isNotable({ ...base(), compactions: 1 }, 5)).toBe(true);
+	});
+
+	test("benign stop reasons alone do not make a session notable", () => {
+		expect(isNotable({ ...base(), stopReasons: { stop: 4, toolUse: 3 } }, 5)).toBe(false);
 	});
 
 	test("true when enough prompts, false for a quiet clean session", () => {

@@ -15,11 +15,17 @@
  * every message is `{ type: "message", message: AgentMessage }`.
  *   - Tool results: `message.role === "toolResult"` with `isError`/`toolName`
  *     on the message object.
- *   - Bash tool calls: stored as toolResult with `toolName: "bash"` and the
- *     exit code embedded in the text content ("exit code: N"); the command
- *     text lives on the preceding assistant toolCall (matched by toolCallId).
+ *   - Bash tool calls: stored as toolResult with `toolName: "bash"`. A real
+ *     failure has `isError: true` and text ending "Command exited with code
+ *     N" (the tool throws); a success has `isError: false` and no exit code.
+ *     The command text lives on the preceding assistant toolCall (matched by
+ *     toolCallId).
  *   - The documented `bashExecution` role (command/exitCode on the message)
  *     is also handled, for other bash paths and future versions.
+ *
+ * Digest content is UNTRUSTED DATA: it can contain text from files, tools,
+ * and other agents. Control characters are stripped so it cannot smuggle
+ * formatting or instructions into the reflection message.
  */
 
 export interface OuroborosDigest {
@@ -49,9 +55,11 @@ export const PROMPT_CAP = 12;
 export const PROMPT_MAX_CHARS = 240;
 export const ERROR_MAX_CHARS = 160;
 export const COMMAND_MAX_CHARS = 160;
+export const ERROR_CAP = 20;
+export const COMMAND_CAP = 20;
 
-/** Matches "exit code: 1" / "exit code 2" / "exit code: 0" in bash output. */
-const EXIT_CODE_RE = /exit code:?\s*(\d+)/i;
+/** Stop reasons that do not indicate a problem (benign). */
+const BENIGN_STOP_REASONS: Record<string, true> = { stop: true, toolUse: true };
 
 /** Minimal structural view of a session entry (defensive). */
 interface RawEntry {
@@ -90,7 +98,12 @@ export function extractText(content: unknown): string {
 }
 
 function truncate(s: string, max: number): string {
-	const t = s.trim().replace(/\s+/g, " ");
+	// Strip control characters: digest content is untrusted data and must not
+	// smuggle formatting or instructions into the reflection message.
+	const t = s
+		.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "")
+		.trim()
+		.replace(/\s+/g, " ");
 	return t.length > max ? `${t.slice(0, max)}…` : t;
 }
 
@@ -202,11 +215,12 @@ export function buildDigest(
 		}
 
 		if (msg.role === "toolResult") {
-			// Bash tool results carry the exit code in the text content.
+			// Real bash failures: the tool throws, so isError is true and the
+			// text ends with "Command exited with code N". A command that
+			// merely PRINTS "exit code: 5" (e.g. `echo "exit code: 5"`) exits
+			// 0 with isError false — it is not a failure.
 			if (msg.toolName === "bash") {
-				const text = extractText(msg.content);
-				const match = EXIT_CODE_RE.exec(text);
-				if (match && match[1] !== "0") {
+				if (msg.isError === true) {
 					const command = typeof msg.toolCallId === "string" ? bashCommands.get(msg.toolCallId) : undefined;
 					const cmd = truncate(command ?? "(unknown command)", COMMAND_MAX_CHARS);
 					if (!seenCommands.has(cmd)) {
@@ -230,9 +244,15 @@ export function buildDigest(
 		}
 	}
 
-	// Keep the newest prompts; cap the rest.
 	if (digest.userPrompts.length > PROMPT_CAP) {
 		digest.userPrompts = digest.userPrompts.slice(-PROMPT_CAP);
+	}
+	// Cap failures too — a failure-heavy session must not blow up the digest.
+	if (digest.errors.length > ERROR_CAP) {
+		digest.errors = digest.errors.slice(-ERROR_CAP);
+	}
+	if (digest.failedCommands.length > COMMAND_CAP) {
+		digest.failedCommands = digest.failedCommands.slice(-COMMAND_CAP);
 	}
 
 	return digest;
@@ -242,7 +262,10 @@ export function buildDigest(
 export function isNotable(digest: OuroborosDigest, minPrompts: number): boolean {
 	if (digest.errors.length > 0) return true;
 	if (digest.failedCommands.length > 0) return true;
-	if (Object.keys(digest.stopReasons).length > 0) return true;
+	// Benign stop reasons (stop/toolUse) fire on every normal turn — only
+	// abnormal ones (length, error, aborted) make a session notable.
+	const hasAbnormalStop = Object.keys(digest.stopReasons).some((k) => !BENIGN_STOP_REASONS[k]);
+	if (hasAbnormalStop) return true;
 	if (digest.compactions > 0) return true;
 	return digest.userPrompts.length >= minPrompts;
 }

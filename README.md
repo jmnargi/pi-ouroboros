@@ -48,6 +48,11 @@ Review the rules with `/ouroboros`.
 Clear the rules with `/ouroboros reset`.
 The rules apply to all projects.
 The rules do not override your explicit instructions.
+The rules file is shared by all pi instances on this machine.
+Two pi instances can write rules at the same time.
+The plugin serializes writes within one instance.
+The plugin does not lock the file across instances.
+Run one pi instance at a time to avoid lost rules.
 
 ## Usage
 
@@ -86,7 +91,7 @@ bun test
 npx tsc --noEmit
 ```
 
-The test suite has 27 tests.
+The test suite has 43 tests.
 The tests cover digest extraction, persistence, and prompt building.
 
 ## Design notes

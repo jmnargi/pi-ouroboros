@@ -41,6 +41,7 @@ import {
 	loadDigest,
 	listSkills,
 	loadRules,
+	skillsDir,
 	rulesFile,
 	saveDigest,
 	writeSkill,
@@ -79,19 +80,22 @@ export default function (pi: ExtensionAPI): void {
 	const minPrompts = envInt("PI_OUROBOROS_REFLECT_MIN_PROMPTS", DEFAULT_REFLECT_MIN_PROMPTS);
 
 	let uiHost: UiHost | undefined = undefined;
-
+	/** True while a /ouroboros reflect message is queued (dedupe). */
+	let reflectQueued = false;
 	const updateStatus = (): void => {
 		const host = uiHost;
 		if (!host?.hasUI) return;
 		try {
 			const rules = loadRules(dataDir);
 			const skills = listSkills(dataDir);
-			if (rules.length === 0 && skills.length === 0) {
+			const pendingReflection = listInjectedDigests(dataDir).length > 0;
+			if (rules.length === 0 && skills.length === 0 && !pendingReflection) {
 				host.ui.setStatus("ouroboros", undefined);
 				return;
 			}
 			const parts = [`⟳ ${rules.length} rules`];
 			if (skills.length > 0) parts.push(`${skills.length} skills`);
+			if (pendingReflection) parts.push("reflection queued");
 			host.ui.setStatus("ouroboros", parts.join(" · "));
 		} catch {
 			// best-effort (print/rpc/teardown)
@@ -118,12 +122,16 @@ export default function (pi: ExtensionAPI): void {
 	// Session end: digest the session that just finished
 	// ------------------------------------------------------------------
 	pi.on("session_shutdown", (event, ctx) => {
-		// Digest every finished session (quit/new/resume/fork). "reload" keeps
-		// the same session alive, so it must not produce a digest.
-		if (event.reason === "reload") return;
+		// Digest finished sessions: quit, new, and resume-away (the abandoned
+		// file is finalized at teardown). "fork" continues in the copy and
+		// "reload" keeps the session alive — neither must produce a digest.
+		if (event.reason === "reload" || event.reason === "fork") return;
 		try {
+			// Ephemeral sessions (--no-session) have no session file; their
+			// throwaway digests must not leak into the next real session.
+			if (!ctx.sessionManager.getSessionFile?.()) return;
 			const sessionId = sessionIdOf(ctx);
-			if (!sessionId) return; // ephemeral/teardown — nothing to key on
+			if (!sessionId) return;
 			const entries = ctx.sessionManager.getEntries() as unknown[];
 			const header = ctx.sessionManager.getHeader?.() as { timestamp?: string } | undefined;
 			const digest = buildDigest(entries, sessionId, cwdOf(ctx), new Date().toISOString(), header?.timestamp ?? "");
@@ -135,9 +143,11 @@ export default function (pi: ExtensionAPI): void {
 
 	pi.on("session_start", (_event, ctx) => {
 		uiHost = ctx as unknown as UiHost;
-		try {
-			const pending = listDigests(dataDir);
-			for (const sid of pending) {
+		const pending = listDigests(dataDir);
+		let injected = false;
+		for (const sid of pending) {
+			// One corrupt digest must not block the rest.
+			try {
 				const digest = loadDigest(dataDir, sid);
 				if (!digest) {
 					deleteDigest(dataDir, sid);
@@ -148,22 +158,31 @@ export default function (pi: ExtensionAPI): void {
 					deleteDigest(dataDir, sid);
 					continue;
 				}
-				// Only the most recent digest gets reflected on; older ones are stale.
-				if (sid !== pending[0]) {
+				// Only the newest NOTABLE digest gets reflected on; older
+				// ones (and non-notable ones) are stale.
+				if (injected) {
+					deleteDigest(dataDir, sid);
+					continue;
+				}
+				// Mark injected BEFORE sending: if the rename fails, the
+				// digest stays pending and the message is not queued.
+				if (!markDigestInjected(dataDir, sid)) {
 					deleteDigest(dataDir, sid);
 					continue;
 				}
 				pi.sendMessage(
-					{ customType: OUROBOROS_CUSTOM_TYPE, content: buildReflectionMessage(digest, rulesFile(dataDir)), display: true },
+					{
+						customType: OUROBOROS_CUSTOM_TYPE,
+						content: buildReflectionMessage(digest, rulesFile(dataDir), skillsDir(dataDir)),
+						display: true,
+					},
 					{ deliverAs: "nextTurn" },
 				);
-				// Mark injected, do not delete: if the user quits before the
-				// next prompt, the digest survives (marked) and is cleaned up
-				// when a turn actually starts.
-				markDigestInjected(dataDir, sid);
+				reflectQueued = true;
+				injected = true;
+			} catch {
+				// best-effort — one bad digest must not stall the rest
 			}
-		} catch {
-			// best-effort
 		}
 		updateStatus();
 	});
@@ -178,6 +197,7 @@ export default function (pi: ExtensionAPI): void {
 		for (const sid of listInjectedDigests(dataDir)) {
 			deleteInjectedDigest(dataDir, sid);
 		}
+		reflectQueued = false;
 		const rules = loadRules(dataDir);
 		if (rules.length === 0) return;
 		return { systemPrompt: `${event.systemPrompt}${buildRulesAppendix(rules, rulesMaxChars)}` };
@@ -230,7 +250,7 @@ export default function (pi: ExtensionAPI): void {
 		},
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			if (params.kind === "rule") {
-				const { added, count, cap } = appendRule(dataDir, params.lesson, rulesCap);
+				const { added, count, cap } = await appendRule(dataDir, params.lesson, rulesCap);
 				updateStatus();
 				return {
 					content: [
@@ -278,13 +298,22 @@ export default function (pi: ExtensionAPI): void {
 			}
 
 			if (sub === "reflect") {
+				if (reflectQueued) {
+					if (cmdCtx.hasUI) cmdCtx.ui.notify("ouroboros: a reflection is already queued", "info");
+					return;
+				}
 				try {
 					const entries = cmdCtx.sessionManager.getEntries() as unknown[];
 					const digest = buildDigest(entries, sessionIdOf(cmdCtx), cwdOf(cmdCtx), new Date().toISOString());
 					pi.sendMessage(
-						{ customType: OUROBOROS_CUSTOM_TYPE, content: buildReflectionMessage(digest, rulesFile(dataDir)), display: true },
+						{
+							customType: OUROBOROS_CUSTOM_TYPE,
+							content: buildReflectionMessage(digest, rulesFile(dataDir), skillsDir(dataDir), true),
+							display: true,
+						},
 						{ deliverAs: "nextTurn" },
 					);
+					reflectQueued = true;
 					if (cmdCtx.hasUI) cmdCtx.ui.notify("ouroboros: reflection queued for the next turn", "info");
 				} catch (err) {
 					if (cmdCtx.hasUI) cmdCtx.ui.notify(`ouroboros: reflection failed: ${String(err)}`, "error");

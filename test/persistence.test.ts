@@ -44,41 +44,47 @@ afterEach(() => {
 });
 
 describe("rules", () => {
-	test("appendRule adds, dedupes, and reports counts", () => {
+	test("appendRule adds, dedupes, and reports counts", async () => {
 		const dir = tmpDataDir();
-		expect(appendRule(dir, "Always re-read before editing")).toEqual({ added: true, count: 1, cap: 50 });
-		expect(appendRule(dir, "Always re-read before editing")).toEqual({ added: false, count: 1, cap: 50 });
-		expect(appendRule(dir, "Run tests after refactors")).toEqual({ added: true, count: 2, cap: 50 });
+		expect(await appendRule(dir, "Always re-read before editing")).toEqual({ added: true, count: 1, cap: 50 });
+		expect(await appendRule(dir, "Always re-read before editing")).toEqual({ added: false, count: 1, cap: 50 });
+		expect(await appendRule(dir, "Run tests after refactors")).toEqual({ added: true, count: 2, cap: 50 });
 		expect(loadRules(dir)).toEqual(["Always re-read before editing", "Run tests after refactors"]);
 	});
 
-	test("appendRule normalizes whitespace and rejects empty", () => {
+	test("appendRule normalizes whitespace and rejects empty", async () => {
 		const dir = tmpDataDir();
-		expect(appendRule(dir, "  a   b  ")).toEqual({ added: true, count: 1, cap: 50 });
+		expect(await appendRule(dir, "  a   b  ")).toEqual({ added: true, count: 1, cap: 50 });
 		expect(loadRules(dir)).toEqual(["a b"]);
-		expect(appendRule(dir, "   ").added).toBe(false);
+		expect((await appendRule(dir, "   ")).added).toBe(false);
 	});
 
-	test("appendRule drops the oldest rule at cap", () => {
+	test("appendRule drops the oldest rule at cap", async () => {
 		const dir = tmpDataDir();
-		for (let i = 0; i < 5; i++) appendRule(dir, `rule ${i}`);
+		for (let i = 0; i < 5; i++) await appendRule(dir, `rule ${i}`);
 		expect(loadRules(dir)).toHaveLength(5);
-		appendRule(dir, "rule 5", 5);
+		await appendRule(dir, "rule 5", 5);
 		expect(loadRules(dir)).toEqual(["rule 1", "rule 2", "rule 3", "rule 4", "rule 5"]);
 	});
 
-	test("appendRule truncates oversized rules and reports real count on empty", () => {
+	test("appendRule truncates oversized rules and reports real count on empty", async () => {
 		const dir = tmpDataDir();
-		appendRule(dir, "keep me");
+		await appendRule(dir, "keep me");
 		const long = "x".repeat(2000);
-		expect(appendRule(dir, long).added).toBe(true);
+		expect((await appendRule(dir, long)).added).toBe(true);
 		expect(loadRules(dir)[1]).toHaveLength(500);
-		expect(appendRule(dir, "   ")).toEqual({ added: false, count: 2, cap: 50 });
+		expect(await appendRule(dir, "   ")).toEqual({ added: false, count: 2, cap: 50 });
 	});
 
-	test("clearRules empties the file", () => {
+	test("concurrent appendRule calls do not lose rules", async () => {
 		const dir = tmpDataDir();
-		appendRule(dir, "a rule");
+		await Promise.all([appendRule(dir, "rule a"), appendRule(dir, "rule b"), appendRule(dir, "rule c")]);
+		expect(loadRules(dir)).toEqual(["rule a", "rule b", "rule c"]);
+	});
+
+	test("clearRules empties the file", async () => {
+		const dir = tmpDataDir();
+		await appendRule(dir, "a rule");
 		clearRules(dir);
 		expect(loadRules(dir)).toEqual([]);
 	});
@@ -165,9 +171,17 @@ describe("skills", () => {
 		expect(file.endsWith(path.join("skills", "debug-flaky-tests", "SKILL.md"))).toBe(true);
 		const content = fs.readFileSync(file, "utf8");
 		expect(content).toContain("name: debug-flaky-tests");
-		expect(content).toContain("description: Find and fix flaky tests");
+		expect(content).toContain('description: "Find and fix flaky tests"');
 		expect(content).toContain("## Steps");
 		expect(listSkills(dir)).toEqual(["debug-flaky-tests"]);
+	});
+
+	test("writeSkill quotes descriptions with YAML-reserved characters", () => {
+		const dir = tmpDataDir();
+		writeSkill(dir, "yaml-safe", "Fix flaky tests: run them 10 times", "body");
+		const content = fs.readFileSync(path.join(dir, "skills", "yaml-safe", "SKILL.md"), "utf8");
+		expect(content).toContain('description: "Fix flaky tests: run them 10 times"');
+		expect(content).not.toContain("Nested mappings");
 	});
 
 	test("listSkills ignores dirs without SKILL.md", () => {

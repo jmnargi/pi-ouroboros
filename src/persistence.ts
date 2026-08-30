@@ -74,16 +74,25 @@ export function loadRules(dataDir: string): string[] {
  * Append a rule, deduped against existing lines. Returns whether it was added
  * and the resulting count. When at cap, the oldest rule is dropped so the
  * freshest lessons always win. Oversized rules are truncated.
+ *
+ * Serialized through an in-process queue: pi executes tool calls in parallel,
+ * and a read-modify-write without a lock silently loses rules.
  */
-export function appendRule(dataDir: string, rule: string, cap: number = DEFAULT_RULES_CAP): { added: boolean; count: number; cap: number } {
+export async function appendRule(
+	dataDir: string,
+	rule: string,
+	cap: number = DEFAULT_RULES_CAP,
+): Promise<{ added: boolean; count: number; cap: number }> {
 	const normalized = rule.trim().replace(/\s+/g, " ").slice(0, MAX_RULE_CHARS);
 	if (!normalized) return { added: false, count: loadRules(dataDir).length, cap };
-	const rules = loadRules(dataDir);
-	if (rules.includes(normalized)) return { added: false, count: rules.length, cap };
-	const next = [...rules, normalized];
-	while (next.length > cap) next.shift();
-	writeRules(dataDir, next);
-	return { added: true, count: next.length, cap };
+	return enqueueWrite(async () => {
+		const rules = loadRules(dataDir);
+		if (rules.includes(normalized)) return { added: false, count: rules.length, cap };
+		const next = [...rules, normalized];
+		while (next.length > cap) next.shift();
+		writeRules(dataDir, next);
+		return { added: true, count: next.length, cap };
+	});
 }
 
 export function clearRules(dataDir: string): void {
@@ -175,19 +184,26 @@ export function listDigests(dataDir: string): string[] {
 function isValidDigest(p: unknown): p is OuroborosDigest {
 	if (typeof p !== "object" || p === null) return false;
 	const d = p as OuroborosDigest;
+	const isNum = (v: unknown): boolean => typeof v === "number" && Number.isFinite(v);
 	return (
 		d.version === 1 &&
 		typeof d.sessionId === "string" &&
 		typeof d.cwd === "string" &&
+		typeof d.startedAt === "string" &&
+		typeof d.endedAt === "string" &&
 		Array.isArray(d.userPrompts) &&
 		Array.isArray(d.errors) &&
 		Array.isArray(d.failedCommands) &&
 		typeof d.stopReasons === "object" &&
 		d.stopReasons !== null &&
 		Array.isArray(d.models) &&
-		typeof d.compactions === "number" &&
+		isNum(d.compactions) &&
+		isNum(d.messageCount) &&
 		typeof d.usage === "object" &&
-		d.usage !== null
+		d.usage !== null &&
+		isNum(d.usage.input) &&
+		isNum(d.usage.output) &&
+		isNum(d.usage.cost)
 	);
 }
 
@@ -210,7 +226,10 @@ export function writeSkill(dataDir: string, name: string, description: string, b
 	const dir = path.join(skillsDir(dataDir), name);
 	const file = path.join(dir, "SKILL.md");
 	fs.mkdirSync(dir, { recursive: true });
-	const content = `---\nname: ${name}\ndescription: ${normalizeDescription(description)}\n---\n\n${body.trim()}\n`;
+	// JSON.stringify produces a valid YAML double-quoted scalar: descriptions
+	// with colons, leading dashes, or YAML-reserved words must not break the
+	// frontmatter (pi silently skips skills with unparseable frontmatter).
+	const content = `---\nname: ${name}\ndescription: ${JSON.stringify(normalizeDescription(description))}\n---\n\n${body.trim()}\n`;
 	atomicWrite(file, content);
 	return file;
 }
@@ -230,8 +249,21 @@ export function listSkills(dataDir: string): string[] {
 	}
 }
 
+/** Serialize read-modify-write operations (rule appends) within this process. */
+let writeQueue: Promise<unknown> = Promise.resolve();
+
+function enqueueWrite<T>(fn: () => Promise<T>): Promise<T> {
+	const run = writeQueue.then(fn, fn);
+	writeQueue = run.catch(() => undefined);
+	return run;
+}
+
+let tmpCounter = 0;
+
 function atomicWrite(file: string, content: string): void {
-	const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
+	// pid + ms + monotonic counter: unique even for concurrent writes from
+	// the same process in the same millisecond.
+	const tmp = `${file}.${process.pid}.${Date.now()}.${tmpCounter++}.tmp`;
 	fs.writeFileSync(tmp, content);
 	fs.renameSync(tmp, file);
 }

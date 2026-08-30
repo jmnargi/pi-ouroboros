@@ -6,8 +6,8 @@ import { describe, expect, test } from "bun:test";
 
 import { buildDigest } from "../src/digest.ts";
 import { buildReflectionMessage, buildRulesAppendix, formatDigest, OUROBOROS_CUSTOM_TYPE } from "../src/reflect.ts";
-
 const RULES_PATH = "/home/user/.pi/agent/ouroboros/rules.md";
+const SKILLS_PATH = "/home/user/.pi/agent/skills";
 
 const digest = () =>
 	buildDigest(
@@ -36,18 +36,18 @@ describe("formatDigest", () => {
 
 describe("buildReflectionMessage", () => {
 	test("contains digest, the real rules path, and writing instructions", () => {
-		const msg = buildReflectionMessage(digest(), RULES_PATH);
+		const msg = buildReflectionMessage(digest(), RULES_PATH, SKILLS_PATH);
 		expect(msg).toContain("[Ouroboros]");
 		expect(msg).toContain(RULES_PATH);
 		expect(msg).toContain("ouroboros_learn");
-		expect(msg).toContain("~/.pi/agent/skills/<name>/SKILL.md");
+		expect(msg).toContain(`${SKILLS_PATH}/<name>/SKILL.md`);
 		expect(msg).toContain("<digest>");
 		expect(msg).toContain("</digest>");
 		expect(msg).toContain("fix the bug");
 	});
 
 	test("warns against rules that conflict with user instructions", () => {
-		const msg = buildReflectionMessage(digest(), RULES_PATH);
+		const msg = buildReflectionMessage(digest(), RULES_PATH, SKILLS_PATH);
 		expect(msg).toContain("Do not record rules that conflict");
 	});
 });
@@ -73,10 +73,11 @@ describe("buildRulesAppendix", () => {
 		expect(appendix).not.toContain("x".repeat(150)); // oldest dropped at cap
 	});
 
-	test("skips oversized rules instead of dropping the whole appendix", () => {
+	test("truncates oversized rules instead of dropping them", () => {
 		const rules = ["a".repeat(5000), "small rule"];
 		const appendix = buildRulesAppendix(rules, 200);
 		expect(appendix).toContain("- small rule");
+		expect(appendix).toContain("a".repeat(180)); // truncated, not dropped
 		expect(appendix).not.toContain("a".repeat(5000));
 	});
 
