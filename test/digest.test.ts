@@ -84,6 +84,18 @@ describe("buildDigest", () => {
 		expect(d.messageCount).toBe(6);
 	});
 
+	test("captures the assistant trace (tool calls and text)", () => {
+		const entries = [
+			userMessage("fix the bug"),
+			assistantMessage(), // text: "doing work"
+			bashToolCall("call-1", "npm test"),
+			bashToolResult("call-1", "ok\n"),
+			assistantMessage({ content: [{ type: "text", text: "done" }] }),
+		];
+		const d = buildDigest(entries, SID, CWD, END);
+		expect(d.assistantText).toEqual(["doing work", "done"]);
+		expect(d.toolCalls).toEqual([{ tool: "bash", args: '{"command":"npm test"}' }]);
+	});
 	test("captures failed bash tool calls from the real toolResult shape", () => {
 		const entries = [
 			bashToolCall("call-1", "ls /nonexistent-dir-xyz"),

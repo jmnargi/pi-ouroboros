@@ -71,13 +71,24 @@ describe("rules", () => {
 		expect(loadRules(dir)).toEqual(["rule 1", "rule 2", "rule 3", "rule 4", "rule 5"]);
 	});
 
+	test("appendRule evicts by characters so every rule fits the appendix budget", async () => {
+		const dir = tmpDataDir();
+		// 3 rules of ~40 chars each exceed a 100-char budget.
+		await appendRule(dir, "a".repeat(40), 50, 100);
+		await appendRule(dir, "b".repeat(40), 50, 100);
+		await appendRule(dir, "c".repeat(40), 50, 100);
+		const rules = loadRules(dir);
+		expect(rules.join("\n").length + 1).toBeLessThanOrEqual(100);
+		// The newest rule survives; the oldest is evicted.
+		expect(rules[rules.length - 1]).toBe("c".repeat(40));
+	});
 	test("appendRule truncates oversized rules and reports real count on empty", async () => {
 		const dir = tmpDataDir();
 		await appendRule(dir, "keep me");
 		const long = "x".repeat(2000);
 		expect((await appendRule(dir, long)).added).toBe(true);
 		expect(loadRules(dir)[1]).toHaveLength(500);
-		expect(await appendRule(dir, "   ")).toEqual({ added: false, reason: "conflict", count: 2, cap: 50 });
+		expect(await appendRule(dir, "   ")).toEqual({ added: false, reason: "empty", count: 2, cap: 50 });
 	});
 
 	test("appendRule calls from one turn do not lose rules", async () => {
@@ -183,13 +194,22 @@ describe("digests", () => {
 	test("safeSessionId hashes distinct unsafe ids distinctly (Data F5)", () => {
 		// The old djb2 hash collided at ~77k ids; sha256-16hex does not.
 		expect(safeSessionId("sess-5s5-5edxhisd")).not.toBe(safeSessionId("sess-vp5-wbt0rpm4"));
-		// Hashed ids live in their own namespace: the sid-h- prefix is
-		// reserved, so a verbatim id with that shape is hashed too.
+		// Hashed names are idempotent: a sid-h-<16hex> id is already safe
+		// (needed so loadDigest finds files saved for dot-containing ids).
 		expect(safeSessionId("../../etc/passwd")).toMatch(/^sid-h-[0-9a-f]{16}$/);
-		expect(safeSessionId("sid-h-3754d6cb3a38e118")).toMatch(/^sid-h-[0-9a-f]{16}$/);
-		expect(safeSessionId("sid-h-3754d6cb3a38e118")).not.toBe("sid-h-3754d6cb3a38e118");
+		expect(safeSessionId("sid-h-3754d6cb3a38e118")).toBe("sid-h-3754d6cb3a38e118");
 	});
 
+	test("listDigests lists hashed names from dot-containing session ids", () => {
+		const dir = tmpDataDir();
+		// A session id with a dot is hashed to sid-h-<16hex>.json; the
+		// round-trip filter must accept it (it does not round-trip).
+		const hashed = safeSessionId("my.session");
+		expect(hashed).toMatch(/^sid-h-[0-9a-f]{16}$/);
+		saveDigest(dir, { ...digest(), sessionId: "my.session" });
+		expect(listDigests(dir)).toEqual([hashed]);
+		expect(loadDigest(dir, hashed)).not.toBeNull();
+	});
 	test("listDigests skips unstatable files instead of failing (Data F3)", () => {
 		const dir = tmpDataDir();
 		saveDigest(dir, digest());
@@ -211,9 +231,30 @@ describe("digests", () => {
 		expect(loadDigest(dir, "sess-absurd")).toBeNull();
 		fs.writeFileSync(file, JSON.stringify({ ...base, sessionId: "bad\u0000id" }));
 		expect(loadDigest(dir, "sess-absurd")).toBeNull();
-		// Element shape: a round-2 digest (failedCommands: string[]) is rejected.
-		fs.writeFileSync(file, JSON.stringify({ ...base, failedCommands: ["npm test"] }));
+		// Element shape: a junk failedCommands element is rejected.
+		fs.writeFileSync(file, JSON.stringify({ ...base, failedCommands: [{ command: 42, error: "x" }] }));
 		expect(loadDigest(dir, "sess-absurd")).toBeNull();
+	});
+
+	test("migrates legacy digests on load (upgrade path)", () => {
+		const dir = tmpDataDir();
+		const file = digestFile(dir, "sess-legacy");
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		const base = digest();
+		// Round-3 shape: no userPromptCount.
+		const { userPromptCount: _drop, ...round3 } = base as unknown as Record<string, unknown>;
+		fs.writeFileSync(file, JSON.stringify(round3));
+		const migrated = loadDigest(dir, "sess-legacy");
+		expect(migrated).not.toBeNull();
+		expect(migrated!.userPromptCount).toBe(base.userPrompts.length);
+		// Round-1/2 shape: failedCommands is a string[].
+		fs.writeFileSync(file, JSON.stringify({ ...round3, failedCommands: ["npm test", "ls /x"] }));
+		const migrated2 = loadDigest(dir, "sess-legacy");
+		expect(migrated2).not.toBeNull();
+		expect(migrated2!.failedCommands).toEqual([
+			{ command: "npm test", error: "" },
+			{ command: "ls /x", error: "" },
+		]);
 	});
 
 	test("last digest round-trips for /ouroboros digest (UX-2)", () => {

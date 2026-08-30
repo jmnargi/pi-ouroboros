@@ -21,6 +21,7 @@
  * injection. Nothing here calls the model directly.
  */
 
+import { existsSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Text } from "@earendil-works/pi-tui";
@@ -50,6 +51,7 @@ import {
 	isValidSkillName,
 	cleanupStaleTmp,
 	loadLastDigest,
+	lastDigestFile,
 	saveLastDigest,
 } from "./persistence.ts";
 import { buildReflectionMessage, buildRulesAppendix, formatDigest, OUROBOROS_CUSTOM_TYPE } from "./reflect.ts";
@@ -152,27 +154,42 @@ export default function (pi: ExtensionAPI): void {
 		}
 	});
 
-	pi.on("session_start", (_event, ctx) => {
+	pi.on("session_start", (event, ctx) => {
 		uiHost = ctx as unknown as UiHost;
 		reflectQueued = false;
 		// Leftover .injected.json files mean the queued reflection was never
 		// delivered (crash, quit before the first turn, failed LLM call) —
 		// unmark them so the loop below re-injects them. A delivered
-		// reflection has its marker deleted at agent_end.
-		try {
-			for (const sid of listInjectedDigests(dataDir)) {
-				unmarkDigestInjected(dataDir, sid);
+		// reflection has its marker deleted at agent_end. Skipped on reload:
+		// the queued message survives in _pendingNextTurnMessages, and
+		// unmarking would deliver the reflection twice.
+		const recovered: string[] = [];
+		if (event.reason !== "reload") {
+			try {
+				for (const sid of listInjectedDigests(dataDir)) {
+					if (unmarkDigestInjected(dataDir, sid)) recovered.push(sid);
+				}
+				cleanupStaleTmp(dataDir);
+			} catch {
+				// best-effort — a failed cleanup must not block the reflection
 			}
-			cleanupStaleTmp(dataDir);
-		} catch {
-			// best-effort — a failed cleanup must not block the reflection
 		}
-		// The list is captured ONCE — a second call would re-sort.
+		// The list is captured ONCE — a second call would re-sort. Recovered
+		// digests (undelivered reflections) go FIRST so the newest-wins
+		// delete cannot drop them in favor of a newer digest.
 		const all = listDigests(dataDir);
+		const ordered = [...recovered, ...all.filter((s) => !recovered.includes(s))];
 		let injected = false;
-		for (const sid of all) {
+		for (const sid of ordered) {
 			// One corrupt digest must not block the rest.
 			try {
+				// Only the newest NOTABLE digest gets reflected on; the rest
+				// are stale. Checked BEFORE loadDigest so a pile of pending
+				// digests is deleted by filename without parsing.
+				if (injected) {
+					deleteDigest(dataDir, sid);
+					continue;
+				}
 				const digest = loadDigest(dataDir, sid);
 				if (!digest) {
 					deleteDigest(dataDir, sid);
@@ -180,12 +197,6 @@ export default function (pi: ExtensionAPI): void {
 				}
 				if (!isNotable(digest, minPrompts)) {
 					// Nothing worth reflecting on — don't burn tokens.
-					deleteDigest(dataDir, sid);
-					continue;
-				}
-				// Only the newest NOTABLE digest gets reflected on; older
-				// ones (and non-notable ones) are stale.
-				if (injected) {
 					deleteDigest(dataDir, sid);
 					continue;
 				}
@@ -226,13 +237,20 @@ export default function (pi: ExtensionAPI): void {
 		if (rules.length === 0) return;
 		return { systemPrompt: `${event.systemPrompt}${buildRulesAppendix(rules, rulesMaxChars)}` };
 	});
-	pi.on("agent_end", () => {
+	pi.on("agent_end", (event) => {
 		// The queued reflection was delivered in this turn — the marker is
 		// no longer needed. Deleted here (not before_agent_start): the LLM
 		// call may fail after the message is drained, and the marker must
 		// survive so the next session_start re-injects it. Skipped entirely
 		// when nothing was injected (the common case): zero file IO per turn.
 		if (hasInjectedDigests) {
+			// A FAILED run (API down, auth error, retries exhausted) also
+			// emits agent_end, with a message whose stopReason is
+			// "error"/"aborted" (pi-agent-core agent.js handleRunFailure).
+			// The reflection was NOT delivered — keep the marker.
+			const messages = (event as { messages?: unknown[] }).messages ?? [];
+			const last = messages[messages.length - 1] as { stopReason?: unknown } | undefined;
+			if (last?.stopReason === "error" || last?.stopReason === "aborted") return;
 			try {
 				for (const sid of listInjectedDigests(dataDir)) {
 					deleteInjectedDigest(dataDir, sid);
@@ -292,14 +310,16 @@ export default function (pi: ExtensionAPI): void {
 		},
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			if (params.kind === "rule") {
-				const { added, reason, count, cap } = appendRule(dataDir, params.lesson, rulesCap);
+				const { added, reason, count, cap } = appendRule(dataDir, params.lesson, rulesCap, rulesMaxChars);
 				updateStatus();
 				const text =
 					reason === "duplicate"
 						? `duplicate rule skipped (${count}/${cap})`
-						: reason === "conflict"
-							? `rule not recorded — concurrent write (${count}/${cap})`
-							: `rule recorded (${count}/${cap}) — active from next turn`;
+						: reason === "empty"
+							? "rule not recorded — lesson is empty after normalization"
+							: reason === "conflict"
+								? `rule not recorded — concurrent write (${count}/${cap})`
+								: `rule recorded (${count}/${cap}) — active from next turn`;
 				return {
 					content: [{ type: "text" as const, text }],
 					details: { added, reason, count, cap },
@@ -377,7 +397,13 @@ export default function (pi: ExtensionAPI): void {
 				// Pending digests are consumed at session start, so the
 				// command reads the last-digest copy written at shutdown.
 				const digest = loadLastDigest(dataDir);
-				if (cmdCtx.hasUI) cmdCtx.ui.notify(digest ? formatDigest(digest) : "ouroboros: no digest recorded yet", "info");
+				if (digest) {
+					if (cmdCtx.hasUI) cmdCtx.ui.notify(formatDigest(digest), "info");
+				} else if (existsSync(lastDigestFile(dataDir))) {
+					if (cmdCtx.hasUI) cmdCtx.ui.notify("ouroboros: digest unreadable (corrupt file)", "error");
+				} else if (cmdCtx.hasUI) {
+					cmdCtx.ui.notify("ouroboros: no digest recorded yet", "info");
+				}
 				return;
 			}
 

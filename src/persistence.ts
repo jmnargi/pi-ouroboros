@@ -48,9 +48,12 @@ function hashSessionId(sessionId: string): string {
 
 /** Sanitize a session id into a safe filename fragment (hash fallback). */
 export function safeSessionId(sessionId: string): string {
-	// The sid-h- prefix is RESERVED for hashed ids — a verbatim id with that
-	// shape would collide with the hash of an unsafe id.
-	if (SAFE_ID.test(sessionId) && !sessionId.includes("..") && !sessionId.startsWith("sid-h-")) return sessionId;
+	// A sid-h-<16hex> id is already a hashed name — return it idempotently
+	// so loadDigest/deleteDigest find the file that saveDigest wrote for a
+	// dot-containing session id. (A verbatim session id with that exact
+	// shape would collide with a hash, but pi generates UUIDv7 ids.)
+	if (/^sid-h-[0-9a-f]{16}$/.test(sessionId)) return sessionId;
+	if (SAFE_ID.test(sessionId) && !sessionId.includes("..")) return sessionId;
 	return hashSessionId(sessionId);
 }
 
@@ -87,9 +90,11 @@ export function loadRules(dataDir: string): string[] {
 			return rulesCache.rules;
 		}
 		const text = fs.readFileSync(file, "utf8");
+		// Strip control chars at the injection boundary too: rules written by
+		// older plugin versions (or hand-edited) bypass appendRule's strip.
 		const rules = text
 			.split("\n")
-			.map((l) => l.trim())
+			.map((l) => l.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u2028\u2029]/g, "").trim())
 			.filter((l) => l.length > 0);
 		rulesCache = { file, mtimeMs: stat.mtimeMs, size: stat.size, rules };
 		return rules;
@@ -117,27 +122,36 @@ function dedupKey(rule: string): string {
 /**
  * Append a rule, deduped against existing lines. Returns whether it was added
  * and the resulting count. When at cap, the oldest rule is dropped so the
- * freshest lessons always win. Oversized rules are truncated.
+ * freshest lessons always win. Oversized rules are truncated. Rules are also
+ * evicted by total characters so every stored rule fits the appendix budget
+ * (a stored rule that never appears in the prompt is a lie to the model).
  *
  * The read-modify-write is synchronous, so callers within one process cannot
  * interleave. Across processes (two pi instances sharing a dataDir) the last
  * rename wins, so the write is verified and retried: a lost update is
  * re-applied on the next attempt instead of silently dropped.
  */
-export function appendRule(dataDir: string, rule: string, cap: number = DEFAULT_RULES_CAP): { added: boolean; reason: "added" | "duplicate" | "conflict"; count: number; cap: number } {
+export function appendRule(
+	dataDir: string,
+	rule: string,
+	cap: number = DEFAULT_RULES_CAP,
+	maxChars: number = DEFAULT_RULES_MAX_CHARS,
+): { added: boolean; reason: "added" | "duplicate" | "conflict" | "empty"; count: number; cap: number } {
 	// Strip control chars: a rule is injected into the system prompt verbatim.
 	const normalized = rule
 		.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u2028\u2029]/g, "")
 		.trim()
 		.replace(/\s+/g, " ")
 		.slice(0, MAX_RULE_CHARS);
-	if (!normalized) return { added: false, reason: "conflict", count: loadRules(dataDir).length, cap };
+	if (!normalized) return { added: false, reason: "empty", count: loadRules(dataDir).length, cap };
 	for (let attempt = 0; attempt < 3; attempt++) {
 		const rules = loadRules(dataDir);
 		const key = dedupKey(normalized);
 		if (rules.some((r) => dedupKey(r) === key)) return { added: false, reason: "duplicate", count: rules.length, cap };
 		const next = [...rules, normalized];
 		while (next.length > cap) next.shift();
+		// Evict oldest until the file fits the appendix budget (chars).
+		while (next.length > 1 && next.join("\n").length + 1 > maxChars) next.shift();
 		writeRules(dataDir, next);
 		// Verify: another instance may have renamed over our write between
 		// the read and the rename. If our rule is gone, retry.
@@ -226,10 +240,30 @@ export function saveDigest(dataDir: string, digest: OuroborosDigest): void {
 	atomicWrite(file, `${JSON.stringify(digest, null, 2)}\n`);
 }
 
+/** Migrate a legacy digest shape to the current schema (upgrade path).
+ * Pre-round-4 digests lack userPromptCount and had string[] failedCommands;
+ * pre-round-5 digests lack toolCalls/assistantText. Deleting them at
+ * session_start would silently lose the reflection. */
+function migrateDigest(p: unknown): unknown {
+	if (typeof p !== "object" || p === null) return p;
+	const d = p as Record<string, unknown>;
+	if (d.version !== 1) return p;
+	if (typeof d.userPromptCount !== "number" && Array.isArray(d.userPrompts)) {
+		d.userPromptCount = d.userPrompts.length;
+	}
+	if (Array.isArray(d.failedCommands) && d.failedCommands.every((c) => typeof c === "string")) {
+		d.failedCommands = d.failedCommands.map((c) => ({ command: c, error: "" }));
+	}
+	if (!Array.isArray(d.toolCalls)) d.toolCalls = [];
+	if (!Array.isArray(d.assistantText)) d.assistantText = [];
+	return d;
+}
+
 export function loadDigest(dataDir: string, sessionId: string): OuroborosDigest | null {
 	try {
 		const parsed: unknown = JSON.parse(fs.readFileSync(digestFile(dataDir, sessionId), "utf8"));
-		return isValidDigest(parsed) ? parsed : null;
+		const migrated = migrateDigest(parsed);
+		return isValidDigest(migrated) ? (migrated as OuroborosDigest) : null;
 	} catch {
 		return null;
 	}
@@ -282,7 +316,8 @@ export function listDigests(dataDir: string): string[] {
 			if (!f.endsWith(".json") || f.endsWith(".injected.json")) continue;
 			// Only names that round-trip through safeSessionId are listed —
 			// a hand-created "a.b.json" would otherwise be listed but never
-			// loadable or deletable.
+			// loadable or deletable. Hashed names (sid-h-<16hex>) round-trip
+			// because safeSessionId is idempotent for that shape.
 			const stem = f.slice(0, -".json".length);
 			if (safeSessionId(stem) !== stem) continue;
 			try {
@@ -325,6 +360,16 @@ function isValidDigest(p: unknown): p is OuroborosDigest {
 				typeof (e as { command?: unknown }).command === "string" &&
 				typeof (e as { error?: unknown }).error === "string",
 		);
+	const toolCallArr = (v: unknown, max: number): boolean =>
+		Array.isArray(v) &&
+		v.length <= max &&
+		v.every(
+			(e) =>
+				typeof e === "object" &&
+				e !== null &&
+				typeof (e as { tool?: unknown }).tool === "string" &&
+				typeof (e as { args?: unknown }).args === "string",
+		);
 	return (
 		d.version === 1 &&
 		clean(d.sessionId, 200) &&
@@ -332,6 +377,8 @@ function isValidDigest(p: unknown): p is OuroborosDigest {
 		clean(d.startedAt, 100) &&
 		clean(d.endedAt, 100) &&
 		strArr(d.userPrompts, 12, 300) &&
+		toolCallArr(d.toolCalls, 20) &&
+		strArr(d.assistantText, 12, 300) &&
 		errArr(d.errors, 20) &&
 		cmdArr(d.failedCommands, 20) &&
 		typeof d.stopReasons === "object" &&

@@ -246,6 +246,16 @@ describe("session_start", () => {
 		expect(api.messages[0]!.message.customType).toBe(OUROBOROS_CUSTOM_TYPE);
 		expect(readdirSync(digestsDir(dataDir))).toEqual(["sess-1.injected.json"]);
 	});
+
+	test("reload does not unmark or re-inject (message survives in the session)", () => {
+		saveDigest(dataDir, buildDigest(notableEntries(), "sess-1", "/proj", "2026-08-30T12:00:00.000Z"));
+		markDigestInjected(dataDir, "sess-1");
+		const handler = api.fire.bind(api, "session_start");
+		handler({ reason: "reload" }, fakeCtx());
+		// The marker stays; the queued message is still pending delivery.
+		expect(api.messages).toHaveLength(0);
+		expect(readdirSync(digestsDir(dataDir))).toEqual(["sess-1.injected.json"]);
+	});
 });
 
 describe("before_agent_start", () => {
@@ -269,6 +279,16 @@ describe("before_agent_start", () => {
 		expect(readdirSync(digestsDir(dataDir))).toEqual(["sess-1.injected.json"]);
 		api.fire("agent_end", {});
 		expect(readdirSync(digestsDir(dataDir))).toEqual([]);
+	});
+
+	test("agent_end keeps the marker when the run failed (stopReason error)", () => {
+		saveDigest(dataDir, buildDigest(notableEntries(), "sess-1", "/proj", "2026-08-30T12:00:00.000Z"));
+		api.fire("session_start", {}, fakeCtx());
+		expect(readdirSync(digestsDir(dataDir))).toEqual(["sess-1.injected.json"]);
+		// A failed run emits agent_end with an error/aborted message — the
+		// reflection was not delivered, so the marker must survive.
+		api.fire("agent_end", { messages: [{ role: "assistant", stopReason: "error" }] });
+		expect(readdirSync(digestsDir(dataDir))).toEqual(["sess-1.injected.json"]);
 	});
 });
 describe("ouroboros_learn tool", () => {

@@ -38,6 +38,11 @@ export interface OuroborosDigest {
 	userPrompts: string[];
 	/** Uncapped count of user prompts (userPrompts is capped at PROMPT_CAP). */
 	userPromptCount: number;
+	/** Assistant tool calls (name + truncated key args), newest-last — the
+	 * reflection needs to see what the model actually DID, not just failures. */
+	toolCalls: Array<{ tool: string; args: string }>;
+	/** Assistant text messages, newest-last, each truncated. */
+	assistantText: string[];
 	/** Failed tool results: tool name + brief text. */
 	errors: Array<{ tool: string; summary: string }>;
 	/** Bash commands that exited non-zero, with the error tail. */
@@ -59,6 +64,9 @@ export const ERROR_MAX_CHARS = 160;
 export const COMMAND_MAX_CHARS = 160;
 export const ERROR_CAP = 20;
 export const COMMAND_CAP = 20;
+export const TOOL_CALL_CAP = 20;
+export const TOOL_ARGS_MAX_CHARS = 80;
+export const ASSISTANT_TEXT_CAP = 12;
 
 /** Stop reasons that do not indicate a problem (benign). */
 const BENIGN_STOP_REASONS: Record<string, true> = { stop: true, toolUse: true };
@@ -157,7 +165,8 @@ export function buildDigest(
 		endedAt,
 		userPrompts: [],
 		userPromptCount: 0,
-
+		toolCalls: [],
+		assistantText: [],
 		errors: [],
 		failedCommands: [],
 		stopReasons: {},
@@ -236,13 +245,22 @@ export function buildDigest(
 			if (Array.isArray(msg.content)) {
 				for (const block of msg.content) {
 					if (!block || typeof block !== "object") continue;
-					const b = block as { type?: unknown; name?: unknown; id?: unknown; arguments?: { command?: unknown } };
+					const b = block as { type?: unknown; name?: unknown; id?: unknown; text?: unknown; arguments?: { command?: unknown } };
 					if (b.type === "toolCall" && b.name === "bash" && typeof b.id === "string" && typeof b.arguments?.command === "string") {
 						bashCommands.set(b.id, b.arguments.command);
 						if (bashCommands.size > 100) {
 							const oldest = bashCommands.keys().next().value;
 							if (oldest !== undefined) bashCommands.delete(oldest);
 						}
+					}
+					// Assistant trace: what the model actually DID, so the
+					// reflection can see silent mistakes (wrong file edited,
+					// destructive command that succeeded).
+					if (b.type === "toolCall" && typeof b.name === "string") {
+						const args = typeof b.arguments === "object" && b.arguments !== null ? JSON.stringify(b.arguments) : "";
+						digest.toolCalls.push({ tool: b.name, args: truncate(args, TOOL_ARGS_MAX_CHARS) });
+					} else if (b.type === "text" && typeof b.text === "string" && b.text.trim()) {
+						digest.assistantText.push(truncate(b.text, PROMPT_MAX_CHARS));
 					}
 				}
 			}
@@ -292,6 +310,12 @@ export function buildDigest(
 	}
 	if (digest.failedCommands.length > COMMAND_CAP) {
 		digest.failedCommands = digest.failedCommands.slice(-COMMAND_CAP);
+	}
+	if (digest.toolCalls.length > TOOL_CALL_CAP) {
+		digest.toolCalls = digest.toolCalls.slice(-TOOL_CALL_CAP);
+	}
+	if (digest.assistantText.length > ASSISTANT_TEXT_CAP) {
+		digest.assistantText = digest.assistantText.slice(-ASSISTANT_TEXT_CAP);
 	}
 
 	return digest;

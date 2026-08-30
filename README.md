@@ -13,7 +13,7 @@ The plugin has four parts.
 
 1. Session end.
    The plugin writes a digest of the session.
-   The digest contains prompts, failures, stop reasons, and usage.
+   The digest contains prompts, tool calls, assistant text, failures, stop reasons, and usage.
    The plugin stores the digest in `~/.pi/agent/ouroboros/digests/`.
 
 2. Next session start.
@@ -81,7 +81,7 @@ Measured costs:
 
 - Session start with no digests: 0.003 ms.
 - Session start with 1 digest: 0.017 ms.
-- Session start with 50 digests: 0.156 ms.
+- Session start with 50 digests: 2.6 ms.
 - Rules read per turn (cached): 0.001 ms.
 - Skills read per turn (cached): 0.001 ms.
 - Turn start with no pending reflection: 0.0002 ms.
@@ -94,8 +94,8 @@ The plugin invalidates the cache on its own writes.
 The plugin checks the file mtime for external writes.
 The plugin caches the skills list.
 The plugin invalidates the skills cache on its own writes.
-The plugin scans at most the newest 5 digests.
-The plugin deletes older digests by name without parsing them.
+The plugin examines every pending digest at session start.
+The plugin deletes non-notable and corrupt digests as it goes.
 The plugin skips the per-turn cleanup when nothing is pending.
 Run `bun bench/bench.ts` to re-measure the hot paths.
 
@@ -125,6 +125,10 @@ Use environment variables to change the behavior.
 | `PI_OUROBOROS_RULES_CAP` | `50` | Maximum number of rules |
 | `PI_OUROBOROS_RULES_MAX_CHARS` | `3000` | Maximum characters of rules per turn |
 | `PI_OUROBOROS_REFLECT_MIN_PROMPTS` | `5` | Minimum prompts for a notable session |
+| `PI_CODING_AGENT_DIR` | `~/.pi/agent` | Directory for all ouroboros state (rules, digests, skills) |
+
+All ouroboros state lives under the agent directory.
+Changing `PI_CODING_AGENT_DIR` starts fresh: the old rules, digests, and skills stay in the old directory.
 
 ## Development
 
@@ -136,11 +140,11 @@ bun test
 npx tsc --noEmit
 ```
 
-The test suite has 86 tests.
+
 The tests cover digest extraction, persistence, prompt building, and the extension entry point.
 Run `bun bench/bench.ts` to measure the hot paths.
 
-## Design notes
+The test suite has 93 tests.
 
 The reflection happens at the start of the next session.
 The reflection does not happen at shutdown.
