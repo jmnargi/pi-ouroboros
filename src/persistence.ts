@@ -111,11 +111,13 @@ function invalidateRulesCache(): void {
 	rulesMissingFile = null;
 }
 
-/** Normalize a rule for near-duplicate detection (case, punctuation, spaces). */
+/** Normalize a rule for near-duplicate detection (case, punctuation, spaces).
+ * Unicode-aware: CJK/kana rules must keep their letters, or every non-Latin
+ * rule would collapse to the empty key and only one could ever be stored. */
 function dedupKey(rule: string): string {
 	return rule
 		.toLowerCase()
-		.replace(/[^a-z0-9\s]/g, "")
+		.replace(/[^\p{L}\p{N}\s]/gu, "")
 		.replace(/\s+/g, " ")
 		.trim();
 }
@@ -126,8 +128,8 @@ function dedupKey(rule: string): string {
  * The freshest lessons always win.
  * The plugin truncates oversized rules.
  * The plugin also evicts rules by total characters so every stored rule fits
- * the appendix budget. A stored rule that never appears in the prompt is a
- * lie to the model.
+ * the appendix budget. A stored rule that never appears in the prompt
+ * misleads the model.
  *
  * The read-modify-write is synchronous, so callers within one process cannot
  * interleave. Across processes (two pi instances sharing a dataDir) the last
@@ -149,10 +151,11 @@ export function appendRule(
 		.trim()
 		.replace(/\s+/g, " ")
 		.slice(0, MAX_RULE_CHARS);
-	// A rule with no alphanumeric content ('!!!', emoji-only) is not a
+	// A rule with no letter or number content ('!!!', emoji-only) is not a
 	// lesson — and every such rule shares the empty dedupKey, so the first
-	// would silently shadow all later ones as 'duplicate'.
-	if (!normalized || !/[a-z0-9]/i.test(normalized)) return { added: false, reason: "empty", count: loadRules(dataDir).length, cap };
+	// would silently shadow all later ones as 'duplicate'. Unicode-aware:
+	// CJK lessons (the model can write in any language) must be accepted.
+	if (!normalized || !/[\p{L}\p{N}]/u.test(normalized)) return { added: false, reason: "empty", count: loadRules(dataDir).length, cap };
 	for (let attempt = 0; attempt < 3; attempt++) {
 		const rules = loadRules(dataDir);
 		const key = dedupKey(normalized);
@@ -173,9 +176,9 @@ export function appendRule(
 			next[0] = Array.from(next[0]!).slice(0, Math.max(0, maxChars - 1)).join("");
 		}
 		writeRules(dataDir, next);
-		// Verify: another instance may have renamed over our write between
+		// Verify: another instance can rename over our write between
 		// the read and the rename. If our rule is gone, retry. The written
-		// rule may be truncated (single-rule budget), so verify the written
+		// rule can be truncated (single-rule budget), so verify the written
 		// form, not the original key.
 		const written = next[next.length - 1]!;
 		const after = loadRules(dataDir);
@@ -214,7 +217,7 @@ export function markDigestInjected(dataDir: string, sessionId: string): boolean 
 	const from = digestFile(dataDir, sessionId);
 	const to = `${from.slice(0, -".json".length)}.injected.json`;
 	// No existsSync pre-check: the rename itself is the atomic claim. A
-	// concurrent instance may have renamed the file first — ENOENT means
+	// concurrent instance can have renamed the file first — ENOENT means
 	// "someone else won", not an error.
 	try {
 		fs.renameSync(from, to);
@@ -272,7 +275,7 @@ export function saveDigest(dataDir: string, digest: OuroborosDigest): void {
 
 /** Migrate a legacy digest shape to the current schema (upgrade path).
  * Pre-round-4 digests lack userPromptCount and had string[] failedCommands;
- * pre-round-5 digests lack toolCalls/assistantText; pre-round-8 digests may
+ * pre-round-5 digests lack toolCalls/assistantText; pre-round-8 digests can
  * carry unsanitized stopReason keys, model strings, and tool names that the
  * current validator rejects. Deleting them at session_start would silently
  * lose the reflection. */
@@ -289,55 +292,62 @@ function migrateDigest(p: unknown): unknown {
 	if (!Array.isArray(d.toolCalls)) d.toolCalls = [];
 	if (!Array.isArray(d.assistantText)) d.assistantText = [];
 	// Sanitize fields the round-8 validator rejects: strip the control-char
-	// class (including format controls) and re-bound lengths/counts so a
+	// class (including format controls) and re-bound the fields the round-7
+	// writer stored RAW (models, error tool names, stopReasons keys) so a
 	// pre-round-8 digest survives validation instead of being deleted.
 	// Only WELL-SHAPED elements are sanitized — a wrong-shaped element
 	// (never produced by any writer) is left untouched so the validator
 	// still rejects the digest as corrupt.
 	const strip = (s: unknown): string => (typeof s === "string" ? s.replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f]/g, "") : "");
+	/** Cut by code points: a UTF-16 slice can split a surrogate pair and
+	 * emit a lone surrogate into the reflection. */
+	const cpCut = (s: string, max: number): string => {
+		const chars = Array.from(s);
+		return chars.length <= max ? s : chars.slice(0, max).join("");
+	};
 	// Fields the round-7 writer already bounded are only control-char
-	// stripped (a longer value is corruption and must stay rejected).
-	if (Array.isArray(d.userPrompts)) d.userPrompts = d.userPrompts.map((s) => (typeof s === "string" ? strip(s) : s)).slice(0, 12);
-	if (Array.isArray(d.assistantText)) d.assistantText = d.assistantText.map((s) => (typeof s === "string" ? strip(s) : s)).slice(0, 12);
+	// stripped (a longer value is corruption and must stay rejected — the
+	// validator's length checks catch it).
+	if (Array.isArray(d.userPrompts)) d.userPrompts = d.userPrompts.map((s) => (typeof s === "string" ? strip(s) : s));
+	if (Array.isArray(d.assistantText)) d.assistantText = d.assistantText.map((s) => (typeof s === "string" ? strip(s) : s));
 	if (Array.isArray(d.toolCalls)) {
-		d.toolCalls = d.toolCalls
-			.map((t) => {
-				if (typeof t !== "object" || t === null) return t;
-				const tc = t as { tool?: unknown; args?: unknown };
-				if (typeof tc.tool !== "string" || typeof tc.args !== "string") return t;
-				return { tool: strip(tc.tool), args: strip(tc.args) };
-			})
-			.slice(0, 20);
+		d.toolCalls = d.toolCalls.map((t) => {
+			if (typeof t !== "object" || t === null) return t;
+			const tc = t as { tool?: unknown; args?: unknown };
+			if (typeof tc.tool !== "string" || typeof tc.args !== "string") return t;
+			return { tool: strip(tc.tool), args: strip(tc.args) };
+		});
 	}
 	if (Array.isArray(d.errors)) {
-		d.errors = d.errors
-			.map((e) => {
-				if (typeof e !== "object" || e === null) return e;
-				const er = e as { tool?: unknown; summary?: unknown };
-				if (typeof er.tool !== "string" || typeof er.summary !== "string") return e;
-				// The round-7 writer stored error tool names RAW (unbounded).
-				return { tool: strip(er.tool).slice(0, 100), summary: strip(er.summary) };
-			})
-			.slice(0, 20);
+		d.errors = d.errors.map((e) => {
+			if (typeof e !== "object" || e === null) return e;
+			const er = e as { tool?: unknown; summary?: unknown };
+			if (typeof er.tool !== "string" || typeof er.summary !== "string") return e;
+			// The round-7 writer stored error tool names RAW (unbounded).
+			// Cut by code points: a UTF-16 slice can split a surrogate
+			// pair and emit a lone surrogate into the reflection.
+			return { tool: cpCut(strip(er.tool), 100), summary: strip(er.summary) };
+		});
 	}
 	if (Array.isArray(d.failedCommands)) {
-		d.failedCommands = d.failedCommands
-			.map((c) => {
-				if (typeof c !== "object" || c === null) return c;
-				const fc = c as { command?: unknown; error?: unknown };
-				if (typeof fc.command !== "string" || typeof fc.error !== "string") return c;
-				return { command: strip(fc.command), error: strip(fc.error) };
-			})
-			.slice(0, 20);
+		d.failedCommands = d.failedCommands.map((c) => {
+			if (typeof c !== "object" || c === null) return c;
+			const fc = c as { command?: unknown; error?: unknown };
+			if (typeof fc.command !== "string" || typeof fc.error !== "string") return c;
+			return { command: strip(fc.command), error: strip(fc.error) };
+		});
 	}
 	// The round-7 writer stored models RAW and unbounded — re-bound both.
-	if (Array.isArray(d.models)) d.models = d.models.map((s) => (typeof s === "string" ? strip(s).slice(0, 200) : s)).slice(0, 20);
+	if (Array.isArray(d.models)) d.models = d.models.map((s) => (typeof s === "string" ? cpCut(strip(s), 200) : s)).slice(0, 20);
 	if (typeof d.stopReasons === "object" && d.stopReasons !== null) {
-		const cleaned: Record<string, number> = {};
+		// Null prototype: a '__proto__' key must be an own property, not
+		// swallowed by the Object.prototype setter (the writer already uses
+		// Object.create(null) — the load path must match).
+		const cleaned: Record<string, number> = Object.create(null);
 		for (const [k, v] of Object.entries(d.stopReasons as Record<string, unknown>)) {
 			// Keys are sanitized (the round-7 writer stored them raw); values
 			// are kept as-is so a non-numeric value still fails validation.
-			const key = strip(k).slice(0, 100);
+			const key = cpCut(strip(k), 100);
 			if (key && Object.keys(cleaned).length < 20) {
 				cleaned[key] = v as number;
 			}
@@ -397,7 +407,7 @@ export function loadLastDigest(dataDir: string): OuroborosDigest | null {
 export function deleteDigest(dataDir: string, sessionId: string): boolean {
 	const file = digestFile(dataDir, sessionId);
 	if (!fs.existsSync(file)) return false;
-	// force: true — the file may vanish between the check and the delete
+	// force: true — the file can vanish between the check and the delete
 	// (concurrent cleanup by another pi instance).
 	fs.rmSync(file, { force: true });
 	return true;

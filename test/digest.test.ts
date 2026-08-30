@@ -291,11 +291,27 @@ describe("buildDigest", () => {
 		// The digest must pass validation (numeric counts).
 		expect(isValidDigest(d)).toBe(true);
 	});
-	test("'__proto__' stop reason is recorded as an own property (FixAudit6)", () => {
+	test("'__proto__' stop reason is recorded as an own property (FixAudit6)", async () => {
 		const d = buildDigest([assistantMessage({ stopReason: "__proto__" })], SID, CWD, END);
 		expect(Object.hasOwn(d.stopReasons, "__proto__")).toBe(true);
 		expect(d.stopReasons["__proto__"]).toBe(1);
 		expect(isValidDigest(d)).toBe(true);
+		// The key must survive the save -> load round-trip (migrateDigest
+		// runs on every load and must not swallow it via the setter).
+		const { mkdtempSync, rmSync } = await import("node:fs");
+		const { tmpdir } = await import("node:os");
+		const { join } = await import("node:path");
+		const { saveDigest, loadDigest } = await import("../src/persistence.ts");
+		const dir = mkdtempSync(join(tmpdir(), "ouro-proto-"));
+		try {
+			saveDigest(dir, d);
+			const loaded = loadDigest(dir, SID);
+			expect(loaded).not.toBeNull();
+			expect(Object.hasOwn(loaded!.stopReasons, "__proto__")).toBe(true);
+			expect(loaded!.stopReasons["__proto__"]).toBe(1);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
 	});
 	test("cleanName never splits a surrogate pair in tool names (FixAudit6)", () => {
 		// A 100-unit tool name ending in an emoji: the code-point cut must
@@ -379,6 +395,16 @@ describe("buildDigest", () => {
 		expect(extractText([{ type: "toolCall", name: "bash", arguments: {} }])).toBe("[tool:bash]");
 		expect(extractText([{ type: "thinking", thinking: "hidden" }])).toBe("");
 		expect(extractText(42)).toBe("");
+	});
+	test("a control char in the cwd parameter cannot break validation (TestQuality3)", () => {
+		// No session-header entry: the production path (session_shutdown)
+		// passes RAW parameter values — getEntries() excludes session
+		// entries in the real runtime. The parameters must be sanitized at
+		// assignment, or the digest fails validation on load and the
+		// reflection is silently deleted.
+		const d = buildDigest([userMessage("hi")], SID, "/proj\u200bdir", END);
+		expect(d.cwd).toBe("/projdir");
+		expect(isValidDigest(d)).toBe(true);
 	});
 });
 

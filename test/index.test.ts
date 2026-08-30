@@ -288,6 +288,55 @@ describe("session_start", () => {
 		expect(api.messages[0]!.message.content).toContain("sess-b");
 		expect(readdirSync(digestsDir(dataDir)).sort()).toEqual(["sess-a.injected.json", "sess-b.injected.json"]);
 	});
+	test("agent_end deletes ONLY the markers queued this session (FixAudit7)", () => {
+		// sess-b is queued (newest recovered); sess-a keeps its marker (the
+		// atomic claim) for the next session start. agent_end must delete
+		// sess-b's marker but leave sess-a's — a blanket delete would lose
+		// sess-a's undelivered reflection.
+		saveDigest(dataDir, buildDigest(notableEntries("sess-a"), "sess-a", "/proj", "2026-08-30T10:00:00.000Z"));
+		markDigestInjected(dataDir, "sess-a");
+		saveDigest(dataDir, buildDigest(notableEntries("sess-b"), "sess-b", "/proj", "2026-08-30T11:00:00.000Z"));
+		markDigestInjected(dataDir, "sess-b");
+		api.fire("session_start", {}, fakeCtx());
+		expect(api.messages).toHaveLength(1);
+		expect(api.messages[0]!.message.content).toContain("sess-b");
+		api.fire("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }] });
+		expect(readdirSync(digestsDir(dataDir))).toEqual(["sess-a.injected.json"]);
+	});
+	test("a corrupt recovered digest's marker is removed without re-injecting (TestQuality3)", () => {
+		// The .injected.json marker itself is corrupt: readInjectedDigest
+		// returns null, the marker is deleted, and nothing is queued.
+		mkdirSync(digestsDir(dataDir), { recursive: true });
+		writeFileSync(join(digestsDir(dataDir), "sess-x.injected.json"), "{not json");
+		const handler = api.fire.bind(api, "session_start");
+		handler({}, fakeCtx());
+		expect(api.messages).toHaveLength(0);
+		expect(readdirSync(digestsDir(dataDir))).toEqual([]);
+	});
+	test("a recovered digest that is no longer notable has its marker removed (TestQuality3)", () => {
+		// PI_OUROBOROS_REFLECT_MIN_PROMPTS can be raised between sessions:
+		// a digest that was notable at capture is not notable now. The
+		// marker is deleted, nothing is queued.
+		const quiet = buildDigest([{ type: "message", message: { role: "user", content: "hi" } }], "sess-1", "/proj", "2026-08-30T12:00:00.000Z");
+		saveDigest(dataDir, quiet);
+		markDigestInjected(dataDir, "sess-1");
+		const handler = api.fire.bind(api, "session_start");
+		handler({}, fakeCtx());
+		expect(api.messages).toHaveLength(0);
+		expect(readdirSync(digestsDir(dataDir))).toEqual([]);
+	});
+	test("sendMessage failure on a RECOVERED digest keeps the marker (TestQuality3)", () => {
+		// The marker is the atomic claim: unmarking would open a pending
+		// window in which a concurrent instance could delete the digest as
+		// stale. The marker must survive for the next session start.
+		saveDigest(dataDir, buildDigest(notableEntries(), "sess-1", "/proj", "2026-08-30T12:00:00.000Z"));
+		markDigestInjected(dataDir, "sess-1");
+		api.throwOnSend = true;
+		const handler = api.fire.bind(api, "session_start");
+		handler({}, fakeCtx());
+		expect(api.messages).toHaveLength(0);
+		expect(readdirSync(digestsDir(dataDir))).toEqual(["sess-1.injected.json"]);
+	});
 	test("a corrupt digest after an injected one is deleted by filename without parsing", () => {
 		saveDigest(dataDir, buildDigest(notableEntries("sess-a"), "sess-a", "/proj", "2026-08-30T10:00:00.000Z"));
 		markDigestInjected(dataDir, "sess-a");
@@ -335,6 +384,18 @@ describe("session_start", () => {
 		handler({ reason: "startup" }, fakeCtx({ sessionManager: { getEntries: () => entries } }));
 		expect(api.messages).toHaveLength(1);
 		expect(readdirSync(digestsDir(dataDir))).toEqual(["sess-1.injected.json"]);
+	});
+	test("a sessionId with '<' matches the ESCAPED digest-block line (Security6)", () => {
+		// The digest's sessionId contains '<' — formatDigest renders it as
+		// '&lt;'. The needle must match the rendered form, or the guard
+		// would miss the delivered reflection and re-inject it.
+		saveDigest(dataDir, buildDigest(notableEntries("a<b"), "a<b", "/proj", "2026-08-30T12:00:00.000Z"));
+		markDigestInjected(dataDir, "a<b");
+		const entries = [{ type: "custom_message", customType: OUROBOROS_CUSTOM_TYPE, content: "[Ouroboros] ...\nsession: a&lt;b\ncwd: /proj" }];
+		const handler = api.fire.bind(api, "session_start");
+		handler({ reason: "startup" }, fakeCtx({ sessionManager: { getEntries: () => entries } }));
+		expect(api.messages).toHaveLength(0);
+		expect(readdirSync(digestsDir(dataDir))).toEqual([]);
 	});
 	test("resume without the reflection in history re-injects it", () => {
 		saveDigest(dataDir, buildDigest(notableEntries(), "sess-1", "/proj", "2026-08-30T12:00:00.000Z"));

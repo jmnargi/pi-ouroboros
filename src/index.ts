@@ -55,7 +55,7 @@ import {
 	lastDigestFile,
 	saveLastDigest,
 } from "./persistence.ts";
-import { buildReflectionMessage, buildRulesAppendix, formatDigest, OUROBOROS_CUSTOM_TYPE } from "./reflect.ts";
+import { buildReflectionMessage, buildRulesAppendix, escapeTags, formatDigest, OUROBOROS_CUSTOM_TYPE } from "./reflect.ts";
 
 
 
@@ -91,8 +91,9 @@ function sessionHasOuroborosMessage(entries: unknown[], sessionId: string): bool
 	// Match the digest-block line, not a bare substring: a reflection for a
 	// DIFFERENT digest whose data contains 'session: <this id>' (e.g. a user
 	// prompt '- session: A') must not count as delivered. The real block
-	// always renders `\nsession: <id>\n` as its first line.
-	const needle = `\nsession: ${sessionId}\n`;
+	// always renders `\nsession: <id>\n` as its first line, with '<' escaped
+	// exactly as formatDigest does — the needle must match the RENDERED form.
+	const needle = `\nsession: ${escapeTags(sessionId)}\n`;
 	for (const raw of entries) {
 		if (!raw || typeof raw !== "object") continue;
 		const entry = raw as { type?: unknown; customType?: unknown; content?: unknown };
@@ -116,6 +117,10 @@ export default function (pi: ExtensionAPI): void {
 	let reflectQueued = false;
 	/** True while injected digests await cleanup — avoids a readdir every turn. */
 	let hasInjectedDigests = false;
+	/** Sids actually queued in the current session_start. agent_end deletes
+	 * ONLY these markers — a recovered-but-not-queued digest keeps its marker
+	 * (the atomic claim) for the next session start. */
+	let queuedInjected = new Set<string>();
 	const updateStatus = (): void => {
 		const host = uiHost;
 		if (!host?.hasUI) return;
@@ -182,18 +187,20 @@ export default function (pi: ExtensionAPI): void {
 	pi.on("session_start", (event, ctx) => {
 		uiHost = ctx as unknown as UiHost;
 		reflectQueued = false;
+		queuedInjected = new Set();
 		// Leftover .injected.json files mean the queued reflection was never
 		// confirmed delivered (crash, quit before the first turn, failed LLM
-		// call) — unmark them so the loop below re-injects them. A delivered
-		// reflection has its marker deleted at agent_end. Skipped on reload:
-		// the queued message survives in _pendingNextTurnMessages, and
-		// unmarking would deliver the reflection twice.
+		// call). Keep their markers (the atomic claim) and process them
+		// directly from the injected state below. A delivered reflection has
+		// its marker deleted at agent_end. Skipped on reload: the queued
+		// message survives in _pendingNextTurnMessages, and re-injecting
+		// would deliver the reflection twice.
 		const recovered: string[] = [];
 		if (event.reason !== "reload") {
 			try {
 				const injected = listInjectedDigests(dataDir);
 				if (injected.length > 0) {
-					// The queued reflection may already be in the CURRENT
+					// The queued reflection can already be in the CURRENT
 					// session's history: the message is drained (persisted)
 					// before the first LLM call, and a failed call keeps the
 					// marker. This fires for every non-reload reason — the
@@ -249,7 +256,7 @@ export default function (pi: ExtensionAPI): void {
 					continue;
 				}
 				if (!isNotable(digest, minPrompts)) {
-					// Nothing worth reflecting on — don't burn tokens.
+					// Nothing worth reflecting on — do not waste tokens.
 					if (recoveredSet.has(sid)) deleteInjectedDigest(dataDir, sid);
 					else deleteDigest(dataDir, sid);
 					continue;
@@ -278,6 +285,7 @@ export default function (pi: ExtensionAPI): void {
 				}
 				reflectQueued = true;
 				hasInjectedDigests = true;
+				queuedInjected.add(sid);
 				injected = true;
 			} catch {
 				// One bad digest must not stall the rest.
@@ -308,12 +316,18 @@ export default function (pi: ExtensionAPI): void {
 			const last = messages[messages.length - 1] as { stopReason?: unknown } | undefined;
 			if (last?.stopReason === "error" || last?.stopReason === "aborted") return;
 			try {
-				for (const sid of listInjectedDigests(dataDir)) {
+				// Delete ONLY the markers queued in this session_start. A
+				// recovered-but-not-queued digest (sendMessage failure, or a
+				// second recovered digest skipped because one was already
+				// injected) keeps its marker — the atomic claim — for the
+				// next session start.
+				for (const sid of queuedInjected) {
 					deleteInjectedDigest(dataDir, sid);
 				}
 			} catch {
 				// best-effort — a failed cleanup must not skip the status
 			}
+			queuedInjected = new Set();
 			hasInjectedDigests = false;
 			updateStatus();
 		}

@@ -63,13 +63,22 @@ describe("rules", () => {
 		expect(loadRules(dir)).toEqual(["a b"]);
 		expect((await appendRule(dir, "   ")).added).toBe(false);
 	});
-	test("appendRule rejects lessons with no alphanumeric content (EdgeCases)", async () => {
+	test("appendRule rejects lessons with no letter or number content (EdgeCases)", async () => {
 		const dir = tmpDataDir();
 		// '!!!' and emoji-only are not lessons — and they share the empty
 		// dedupKey, so the first would shadow all later ones as 'duplicate'.
 		expect((await appendRule(dir, "!!!")).reason).toBe("empty");
 		expect((await appendRule(dir, "😀😀")).reason).toBe("empty");
 		expect(loadRules(dir)).toEqual([]);
+		// CJK lessons are letters — the model may write in any language.
+		expect((await appendRule(dir, "編集前にファイルを再読込する")).added).toBe(true);
+		expect(loadRules(dir)).toEqual(["編集前にファイルを再読込する"]);
+		// A SECOND distinct CJK rule must not be shadowed by the empty
+		// dedupKey (Security6: only one non-Latin rule could be stored).
+		expect((await appendRule(dir, "テストを実行する")).added).toBe(true);
+		expect(loadRules(dir)).toEqual(["編集前にファイルを再読込する", "テストを実行する"]);
+		// A near-duplicate CJK rule (punctuation differs) is still deduped.
+		expect((await appendRule(dir, "編集前にファイルを再読込する！")).reason).toBe("duplicate");
 	});
 
 	test("appendRule drops the oldest rule at cap", async () => {
@@ -311,6 +320,36 @@ describe("digests", () => {
 		expect(migrated!.models).toHaveLength(20);
 		expect(migrated!.models[0]).toBe("vitruvixcode");
 		expect(migrated!.errors[0]!.tool).toBe("editevil");
+	});
+	test("over-bounded arrays stay rejected after migration (TestQuality3)", () => {
+		const dir = tmpDataDir();
+		const file = digestFile(dir, "sess-legacy");
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		const base = digest();
+		// No writer ever produced a 13-element userPrompts (PROMPT_CAP=12) —
+		// it is corruption. migrateDigest must NOT re-bound it; the
+		// validator's length check rejects the digest.
+		fs.writeFileSync(file, JSON.stringify({ ...base, userPrompts: Array.from({ length: 13 }, (_, i) => `p${i}`) }));
+		expect(loadDigest(dir, "sess-legacy")).toBeNull();
+	});
+	test("migrateDigest cuts by code points, never splitting a surrogate pair (TestQuality3)", () => {
+		const dir = tmpDataDir();
+		const file = digestFile(dir, "sess-legacy");
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		const base = digest();
+		// A round-7 error tool name with an astral char at the 100-code-point
+		// boundary: a UTF-16 slice would split the surrogate pair.
+		const round7 = { ...base, errors: [{ tool: "x".repeat(99) + "😀" + "y", summary: "boom" }] };
+		fs.writeFileSync(file, JSON.stringify(round7));
+		const migrated = loadDigest(dir, "sess-legacy");
+		expect(migrated).not.toBeNull();
+		const tool = migrated!.errors[0]!.tool;
+		expect([...tool]).toHaveLength(100); // 100 code points
+		expect(tool.endsWith("😀")).toBe(true); // the pair survives intact
+		// A lone surrogate is a single UTF-16 unit in the range; a full
+		// astral code point is two units (its charCodeAt(0) is the high
+		// surrogate and must NOT count).
+		expect([...tool].some((c) => c.length === 1 && c.charCodeAt(0) >= 0xd800 && c.charCodeAt(0) <= 0xdfff)).toBe(false);
 	});
 
 	test("last digest round-trips for /ouroboros digest (UX-2)", () => {

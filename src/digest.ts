@@ -143,12 +143,22 @@ function cleanName(s: string, max: number): string {
 	return Array.from(cleaned).slice(0, max).join("");
 }
 
-/** Keep the LAST max code points — bash errors put the exit code at the end. */
+/** Keep the LAST max code points — bash errors put the exit code at the end.
+ * The input is bounded before the code-point pass: a 10MB tool output must
+ * not materialize a 10M-element array. Grow the tail bound geometrically
+ * until enough code points survive or the string is exhausted. */
 function truncateTail(s: string, max: number): string {
-	const cleaned = s
-		.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f]/g, "")
-		.trim()
-		.replace(/\s+/g, " ");
+	let bound = max * 2 + 1;
+	let cleaned = "";
+	while (true) {
+		cleaned = s
+			.slice(-bound)
+			.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f]/g, "")
+			.trim()
+			.replace(/\s+/g, " ");
+		if (Array.from(cleaned).length > max || bound >= s.length) break;
+		bound = Math.min(s.length, bound * 2);
+	}
 	const chars = Array.from(cleaned);
 	if (chars.length <= max) return cleaned;
 	return `…${chars.slice(-max).join("")}`;
@@ -173,10 +183,15 @@ export function buildDigest(
 ): OuroborosDigest {
 	const digest: OuroborosDigest = {
 		version: 1,
-		sessionId,
-		cwd,
-		startedAt,
-		endedAt,
+		// Sanitize the parameters here, not in the session-header branch:
+		// getEntries() excludes session entries in the real runtime, so the
+		// production path (session_shutdown) passes RAW values. A control
+		// char in the project directory name must not make the digest fail
+		// validation on load (which would delete the reflection).
+		sessionId: cleanName(sessionId, 200),
+		cwd: cleanName(cwd, 2000),
+		startedAt: cleanName(startedAt, 100),
+		endedAt: cleanName(endedAt, 100),
 		userPrompts: [],
 		userPromptCount: 0,
 		toolCalls: [],
@@ -210,9 +225,10 @@ export function buildDigest(
 		const entry = raw as RawEntry;
 
 		// Session header (present in tests; getEntries() excludes it in pi).
-		// Metadata is sanitized at capture: a control char in the project
-		// directory name must not make the digest fail validation on load
-		// (which would silently delete it and lose the reflection).
+		// The parameters are already sanitized at assignment above; this
+		// branch re-sanitizes the header values (defense in depth) so a
+		// control char in the project directory name can never make the
+		// digest fail validation on load.
 		if (entry.type === "session") {
 			if (typeof entry.cwd === "string" && entry.cwd) digest.cwd = cleanName(entry.cwd, 2000);
 			if (typeof entry.id === "string" && entry.id) digest.sessionId = cleanName(entry.id, 200);
@@ -366,7 +382,8 @@ export function buildDigest(
 	if (digest.userPrompts.length > PROMPT_CAP) {
 		digest.userPrompts = digest.userPrompts.slice(-PROMPT_CAP);
 	}
-	// Cap failures too — a failure-heavy session must not blow up the digest.
+	// Cap failures too — a failure-heavy session must not grow the digest
+	// without limit.
 	if (digest.errors.length > ERROR_CAP) {
 		digest.errors = digest.errors.slice(-ERROR_CAP);
 	}
