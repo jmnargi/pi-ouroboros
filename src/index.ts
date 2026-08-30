@@ -49,14 +49,16 @@ import {
 	writeSkill,
 	isValidSkillName,
 	cleanupStaleTmp,
+	loadLastDigest,
+	saveLastDigest,
 } from "./persistence.ts";
 import { buildReflectionMessage, buildRulesAppendix, formatDigest, OUROBOROS_CUSTOM_TYPE } from "./reflect.ts";
 
-/** Minimal theme surface used by the message renderer. */
-interface ThemeLike {
-	fg(color: string, text: string): string;
-	bold(text: string): string;
-}
+
+
+
+
+
 
 interface UiHost {
 	mode?: string;
@@ -80,6 +82,7 @@ export default function (pi: ExtensionAPI): void {
 
 	const dataDir = process.env.PI_CODING_AGENT_DIR ?? path.join(os.homedir(), ".pi", "agent");
 	const rulesMaxChars = envInt("PI_OUROBOROS_RULES_MAX_CHARS", DEFAULT_RULES_MAX_CHARS);
+	const rulesCap = envInt("PI_OUROBOROS_RULES_CAP", DEFAULT_RULES_CAP);
 	const minPrompts = envInt("PI_OUROBOROS_REFLECT_MIN_PROMPTS", DEFAULT_REFLECT_MIN_PROMPTS);
 	let uiHost: UiHost | undefined = undefined;
 	/** True while a /ouroboros reflect message is queued (dedupe). */
@@ -98,8 +101,8 @@ export default function (pi: ExtensionAPI): void {
 				host.ui.setStatus("ouroboros", undefined);
 				return;
 			}
-			const parts = [`⟳ ${rules.length} rules`];
-			if (skills.length > 0) parts.push(`${skills.length} skills`);
+			const parts = [`⟳ ${rules.length} rule${rules.length === 1 ? "" : "s"}`];
+			if (skills.length > 0) parts.push(`${skills.length} skill${skills.length === 1 ? "" : "s"}`);
 			if (injected.length > 0) parts.push("reflection queued");
 			host.ui.setStatus("ouroboros", parts.join(" · "));
 		} catch {
@@ -130,7 +133,7 @@ export default function (pi: ExtensionAPI): void {
 		// Digest finished sessions: quit, new, and resume-away (the abandoned
 		// file is finalized at teardown). "fork" continues in the copy and
 		// "reload" keeps the session alive — neither must produce a digest.
-	if (event.reason === "reload" || event.reason === "fork") return;
+		if (event.reason === "reload" || event.reason === "fork") return;
 		try {
 			// Ephemeral sessions (--no-session) have no session file; their
 			// throwaway digests must not leak into the next real session.
@@ -141,6 +144,9 @@ export default function (pi: ExtensionAPI): void {
 			const header = ctx.sessionManager.getHeader?.() as { timestamp?: string } | undefined;
 			const digest = buildDigest(entries, sessionId, cwdOf(ctx), new Date().toISOString(), header?.timestamp ?? "");
 			saveDigest(dataDir, digest);
+			// Keep a copy for /ouroboros digest — pending digests are
+			// consumed at the next session start.
+			saveLastDigest(dataDir, digest);
 		} catch {
 			// teardown race — best-effort
 		}
@@ -148,26 +154,23 @@ export default function (pi: ExtensionAPI): void {
 
 	pi.on("session_start", (_event, ctx) => {
 		uiHost = ctx as unknown as UiHost;
-		// Leftover .injected.json files are stale by definition (the queued
-		// message died with the previous extension instance) — clean them
-		// before the injection loop renames fresh ones.
+		reflectQueued = false;
+		// Leftover .injected.json files mean the queued reflection was never
+		// delivered (crash, quit before the first turn, failed LLM call) —
+		// unmark them so the loop below re-injects them. A delivered
+		// reflection has its marker deleted at agent_end.
 		try {
 			for (const sid of listInjectedDigests(dataDir)) {
-				deleteInjectedDigest(dataDir, sid);
+				unmarkDigestInjected(dataDir, sid);
 			}
 			cleanupStaleTmp(dataDir);
 		} catch {
 			// best-effort — a failed cleanup must not block the reflection
 		}
-		// Bounded scan: at most the newest 5 digests are ever loaded. Anything
-		// older is stale (a digest is consumed on the first session start
-		// after it is written) and is deleted by filename without parsing.
-		// The list is captured ONCE — a second call would re-sort and miss
-		// the 6th-10th newest.
+		// The list is captured ONCE — a second call would re-sort.
 		const all = listDigests(dataDir);
-		const pending = all.slice(0, 5);
 		let injected = false;
-		for (const sid of pending) {
+		for (const sid of all) {
 			// One corrupt digest must not block the rest.
 			try {
 				const digest = loadDigest(dataDir, sid);
@@ -186,58 +189,60 @@ export default function (pi: ExtensionAPI): void {
 					deleteDigest(dataDir, sid);
 					continue;
 				}
-				// Mark injected BEFORE sending: if the rename fails, the
-				// digest stays pending and the message is not queued.
+				// Mark injected BEFORE sending: the rename is the atomic
+				// claim. If it fails, another instance won — the digest is
+				// theirs, so leave it alone.
 				if (!markDigestInjected(dataDir, sid)) {
-					deleteDigest(dataDir, sid);
 					continue;
 				}
-				pi.sendMessage(
-					{
-						customType: OUROBOROS_CUSTOM_TYPE,
-						content: buildReflectionMessage(digest, rulesFile(dataDir), skillsDir(dataDir)),
-						display: true,
-					},
-					{ deliverAs: "nextTurn" },
-				);
+				try {
+					pi.sendMessage(
+						{
+							customType: OUROBOROS_CUSTOM_TYPE,
+							content: buildReflectionMessage(digest, rulesFile(dataDir), skillsDir(dataDir)),
+							display: true,
+						},
+						{ deliverAs: "nextTurn" },
+					);
+				} catch {
+					// sendMessage never throws in the current runtime, but if
+					// it ever does, restore the digest for the next session
+					// start instead of losing the reflection.
+					unmarkDigestInjected(dataDir, sid);
+					continue;
+				}
 				reflectQueued = true;
 				hasInjectedDigests = true;
 				injected = true;
 			} catch {
-				// sendMessage failed after the mark — restore the digest so it
-			// can be retried on the next session start. One bad digest
-			// must not stall the rest.
-			unmarkDigestInjected(dataDir, sid);
-		}
-	}
-	// Delete any digests beyond the scan window without parsing them.
-		try {
-			for (const sid of all.slice(5)) {
-				deleteDigest(dataDir, sid);
+				// One bad digest must not stall the rest.
 			}
-		} catch {
-			// best-effort — a failed deletion must not skip the status
 		}
 		updateStatus();
 	});
 	pi.on("before_agent_start", (event) => {
-		// The queued reflection is delivered in this turn — clean up any
-		// injected digests that were never consumed. Skipped entirely when
-		// nothing was injected (the common case): zero file IO per turn.
+		reflectQueued = false;
+		const rules = loadRules(dataDir);
+		if (rules.length === 0) return;
+		return { systemPrompt: `${event.systemPrompt}${buildRulesAppendix(rules, rulesMaxChars)}` };
+	});
+	pi.on("agent_end", () => {
+		// The queued reflection was delivered in this turn — the marker is
+		// no longer needed. Deleted here (not before_agent_start): the LLM
+		// call may fail after the message is drained, and the marker must
+		// survive so the next session_start re-injects it. Skipped entirely
+		// when nothing was injected (the common case): zero file IO per turn.
 		if (hasInjectedDigests) {
 			try {
 				for (const sid of listInjectedDigests(dataDir)) {
 					deleteInjectedDigest(dataDir, sid);
 				}
 			} catch {
-				// best-effort — a failed cleanup must not skip the rules
+				// best-effort — a failed cleanup must not skip the status
 			}
 			hasInjectedDigests = false;
+			updateStatus();
 		}
-		reflectQueued = false;
-		const rules = loadRules(dataDir);
-		if (rules.length === 0) return;
-		return { systemPrompt: `${event.systemPrompt}${buildRulesAppendix(rules, rulesMaxChars)}` };
 	});
 
 	// ------------------------------------------------------------------
@@ -287,16 +292,17 @@ export default function (pi: ExtensionAPI): void {
 		},
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			if (params.kind === "rule") {
-			const { added, count, cap } = appendRule(dataDir, params.lesson, DEFAULT_RULES_CAP);
+				const { added, reason, count, cap } = appendRule(dataDir, params.lesson, rulesCap);
 				updateStatus();
+				const text =
+					reason === "duplicate"
+						? `duplicate rule skipped (${count}/${cap})`
+						: reason === "conflict"
+							? `rule not recorded — concurrent write (${count}/${cap})`
+							: `rule recorded (${count}/${cap}) — active from next turn`;
 				return {
-					content: [
-						{
-							type: "text" as const,
-							text: added ? `rule recorded (${count}/${cap}) — active from next turn` : `duplicate rule skipped (${count}/${cap})`,
-						},
-					],
-					details: { added, count, cap },
+					content: [{ type: "text" as const, text }],
+					details: { added, reason, count, cap },
 				};
 			}
 
@@ -308,6 +314,11 @@ export default function (pi: ExtensionAPI): void {
 			}
 			if (!description.trim()) throw new Error("skillDescription is required for kind=skill");
 			if (!body.trim()) throw new Error("skillBody is required for kind=skill");
+			// Bounds: the body is written verbatim and pi advertises the
+			// description in the system prompt — a huge body is a disk-fill
+			// vector and a huge description bloats every future prompt.
+			if (description.length > 200) throw new Error("skillDescription must be 200 characters or fewer");
+			if (body.length > 20_000) throw new Error("skillBody must be 20,000 characters or fewer");
 			const file = writeSkill(dataDir, name, description, body);
 			updateStatus();
 			return {
@@ -363,13 +374,10 @@ export default function (pi: ExtensionAPI): void {
 			}
 
 			if (sub === "digest") {
-				const pending = listDigests(dataDir);
-				if (pending.length === 0) {
-					if (cmdCtx.hasUI) cmdCtx.ui.notify("ouroboros: no pending digests", "info");
-					return;
-				}
-				const digest = loadDigest(dataDir, pending[0]!);
-				if (cmdCtx.hasUI) cmdCtx.ui.notify(digest ? formatDigest(digest) : "ouroboros: digest unreadable", "info");
+				// Pending digests are consumed at session start, so the
+				// command reads the last-digest copy written at shutdown.
+				const digest = loadLastDigest(dataDir);
+				if (cmdCtx.hasUI) cmdCtx.ui.notify(digest ? formatDigest(digest) : "ouroboros: no digest recorded yet", "info");
 				return;
 			}
 
@@ -389,16 +397,9 @@ export default function (pi: ExtensionAPI): void {
 		},
 	});
 
-	// ------------------------------------------------------------------
-	// TUI rendering for the reflection message
-	// ------------------------------------------------------------------
-
-	pi.registerMessageRenderer(OUROBOROS_CUSTOM_TYPE, (message, _options, theme) => {
-		const t = theme as unknown as ThemeLike;
-		const head = t.fg("accent", t.bold("⟳ ouroboros"));
-		const content = typeof message.content === "string" ? message.content : "";
-		return new Text(`${head}\n${content}`, 1, 0);
-	});
+	// No custom message renderer: pi's default CustomMessageComponent renders
+	// the content as Markdown (label + body), which is better than a raw
+	// Text dump for the numbered instructions.
 
 	pi.on("session_shutdown", () => {
 		try {

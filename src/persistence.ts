@@ -48,7 +48,9 @@ function hashSessionId(sessionId: string): string {
 
 /** Sanitize a session id into a safe filename fragment (hash fallback). */
 export function safeSessionId(sessionId: string): string {
-	if (SAFE_ID.test(sessionId) && !sessionId.includes("..")) return sessionId;
+	// The sid-h- prefix is RESERVED for hashed ids — a verbatim id with that
+	// shape would collide with the hash of an unsafe id.
+	if (SAFE_ID.test(sessionId) && !sessionId.includes("..") && !sessionId.startsWith("sid-h-")) return sessionId;
 	return hashSessionId(sessionId);
 }
 
@@ -68,11 +70,15 @@ export function skillsDir(dataDir: string): string {
 let rulesCache: { file: string; mtimeMs: number; size: number; rules: string[] } | null = null;
 /** True while rules.md is known to be absent — avoids a throwing statSync. */
 let rulesMissing = false;
+/** When rulesMissing was set — the negative cache is time-bounded so an
+ * externally created rules.md (another pi instance, the user) is picked up. */
+let rulesMissingAt = 0;
 
 /** Load rules as a list of non-empty lines (comments starting with `#` kept). */
 export function loadRules(dataDir: string): string[] {
 	const file = rulesFile(dataDir);
-	if (rulesMissing) return [];
+	if (rulesMissing && Date.now() - rulesMissingAt < 1000) return [];
+	rulesMissing = false;
 	try {
 		const stat = fs.statSync(file);
 		// mtime + size: on coarse-granularity filesystems (1s), two writes in
@@ -89,6 +95,7 @@ export function loadRules(dataDir: string): string[] {
 		return rules;
 	} catch {
 		rulesMissing = true;
+		rulesMissingAt = Date.now();
 		return [];
 	}
 }
@@ -107,33 +114,50 @@ function dedupKey(rule: string): string {
 		.replace(/\s+/g, " ")
 		.trim();
 }
-
 /**
  * Append a rule, deduped against existing lines. Returns whether it was added
  * and the resulting count. When at cap, the oldest rule is dropped so the
  * freshest lessons always win. Oversized rules are truncated.
  *
- * The read-modify-write is fully synchronous, so concurrent callers cannot
- * interleave in single-threaded JS — no lock is needed.
+ * The read-modify-write is synchronous, so callers within one process cannot
+ * interleave. Across processes (two pi instances sharing a dataDir) the last
+ * rename wins, so the write is verified and retried: a lost update is
+ * re-applied on the next attempt instead of silently dropped.
  */
-export function appendRule(dataDir: string, rule: string, cap: number = DEFAULT_RULES_CAP): { added: boolean; count: number; cap: number } {
-	const normalized = rule.trim().replace(/\s+/g, " ").slice(0, MAX_RULE_CHARS);
-	if (!normalized) return { added: false, count: loadRules(dataDir).length, cap };
-	const rules = loadRules(dataDir);
-	const key = dedupKey(normalized);
-	if (rules.some((r) => dedupKey(r) === key)) return { added: false, count: rules.length, cap };
-	const next = [...rules, normalized];
-	while (next.length > cap) next.shift();
-	writeRules(dataDir, next);
-	return { added: true, count: next.length, cap };
+export function appendRule(dataDir: string, rule: string, cap: number = DEFAULT_RULES_CAP): { added: boolean; reason: "added" | "duplicate" | "conflict"; count: number; cap: number } {
+	// Strip control chars: a rule is injected into the system prompt verbatim.
+	const normalized = rule
+		.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u2028\u2029]/g, "")
+		.trim()
+		.replace(/\s+/g, " ")
+		.slice(0, MAX_RULE_CHARS);
+	if (!normalized) return { added: false, reason: "conflict", count: loadRules(dataDir).length, cap };
+	for (let attempt = 0; attempt < 3; attempt++) {
+		const rules = loadRules(dataDir);
+		const key = dedupKey(normalized);
+		if (rules.some((r) => dedupKey(r) === key)) return { added: false, reason: "duplicate", count: rules.length, cap };
+		const next = [...rules, normalized];
+		while (next.length > cap) next.shift();
+		writeRules(dataDir, next);
+		// Verify: another instance may have renamed over our write between
+		// the read and the rename. If our rule is gone, retry.
+		const after = loadRules(dataDir);
+		if (after.some((r) => dedupKey(r) === key)) return { added: true, reason: "added", count: after.length, cap };
+	}
+	return { added: false, reason: "conflict", count: loadRules(dataDir).length, cap };
 }
 
 function writeRules(dataDir: string, rules: string[]): void {
 	let file = rulesFile(dataDir);
 	// Write through a symlink instead of replacing it — atomicWrite renames
-	// over the link, silently destroying the user's symlink setup.
-	if (fs.existsSync(file) && fs.lstatSync(file).isSymbolicLink()) {
-		file = fs.realpathSync(file);
+	// over the link, silently destroying the user's symlink setup. lstatSync
+	// (not existsSync) so a DANGLING symlink is still detected.
+	try {
+		if (fs.lstatSync(file).isSymbolicLink()) {
+			file = fs.realpathSync(file);
+		}
+	} catch {
+		// dangling symlink or missing file — write the regular file
 	}
 	fs.mkdirSync(path.dirname(file), { recursive: true });
 	const body = rules.length > 0 ? `${rules.join("\n")}\n` : "";
@@ -152,18 +176,27 @@ export function clearRules(dataDir: string): void {
 export function markDigestInjected(dataDir: string, sessionId: string): boolean {
 	const from = digestFile(dataDir, sessionId);
 	const to = `${from.slice(0, -".json".length)}.injected.json`;
-	if (!fs.existsSync(from)) return false;
-	fs.renameSync(from, to);
-	return true;
+	// No existsSync pre-check: the rename itself is the atomic claim. A
+	// concurrent instance may have renamed the file first — ENOENT means
+	// "someone else won", not an error.
+	try {
+		fs.renameSync(from, to);
+		return true;
+	} catch {
+		return false;
+	}
 }
 
 /** Undo an injection mark (rename back to pending) — for sendMessage failure. */
 export function unmarkDigestInjected(dataDir: string, sessionId: string): boolean {
 	const from = `${digestFile(dataDir, sessionId).slice(0, -".json".length)}.injected.json`;
 	const to = digestFile(dataDir, sessionId);
-	if (!fs.existsSync(from)) return false;
-	fs.renameSync(from, to);
-	return true;
+	try {
+		fs.renameSync(from, to);
+		return true;
+	} catch {
+		return false;
+	}
 }
 /** Injected digest session ids (awaiting delivery, then cleanup). */
 export function listInjectedDigests(dataDir: string): string[] {
@@ -202,6 +235,30 @@ export function loadDigest(dataDir: string, sessionId: string): OuroborosDigest 
 	}
 }
 
+/** The last session's digest, kept for /ouroboros digest (pending digests
+ * are consumed at the next session start, so the command reads this copy). */
+export function lastDigestFile(dataDir: string): string {
+	return path.join(ouroborosDir(dataDir), "last-digest.json");
+}
+
+export function saveLastDigest(dataDir: string, digest: OuroborosDigest): void {
+	try {
+		const file = lastDigestFile(dataDir);
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		atomicWrite(file, `${JSON.stringify(digest, null, 2)}\n`);
+	} catch {
+		// best-effort — the pending digest is the source of truth
+	}
+}
+
+export function loadLastDigest(dataDir: string): OuroborosDigest | null {
+	try {
+		const parsed: unknown = JSON.parse(fs.readFileSync(lastDigestFile(dataDir), "utf8"));
+		return isValidDigest(parsed) ? parsed : null;
+	} catch {
+		return null;
+	}
+}
 export function deleteDigest(dataDir: string, sessionId: string): boolean {
 	const file = digestFile(dataDir, sessionId);
 	if (!fs.existsSync(file)) return false;
@@ -245,22 +302,46 @@ function isValidDigest(p: unknown): p is OuroborosDigest {
 	if (typeof p !== "object" || p === null) return false;
 	const d = p as OuroborosDigest;
 	const isCount = (v: unknown): boolean => typeof v === "number" && Number.isFinite(v) && v >= 0;
-	const clean = (v: unknown): v is string => typeof v === "string" && !/[\u0000-\u001f\u007f]/.test(v);
+	const clean = (v: unknown, max: number): v is string => typeof v === "string" && v.length <= max && !/[\u0000-\u001f\u007f]/.test(v);
+	const strArr = (v: unknown, max: number, maxLen: number): boolean =>
+		Array.isArray(v) && v.length <= max && v.every((e) => typeof e === "string" && e.length <= maxLen);
+	const errArr = (v: unknown, max: number): boolean =>
+		Array.isArray(v) &&
+		v.length <= max &&
+		v.every(
+			(e) =>
+				typeof e === "object" &&
+				e !== null &&
+				typeof (e as { tool?: unknown }).tool === "string" &&
+				typeof (e as { summary?: unknown }).summary === "string",
+		);
+	const cmdArr = (v: unknown, max: number): boolean =>
+		Array.isArray(v) &&
+		v.length <= max &&
+		v.every(
+			(e) =>
+				typeof e === "object" &&
+				e !== null &&
+				typeof (e as { command?: unknown }).command === "string" &&
+				typeof (e as { error?: unknown }).error === "string",
+		);
 	return (
 		d.version === 1 &&
-		clean(d.sessionId) &&
-		clean(d.cwd) &&
-		clean(d.startedAt) &&
-		clean(d.endedAt) &&
-		Array.isArray(d.userPrompts) &&
-		Array.isArray(d.errors) &&
-		Array.isArray(d.failedCommands) &&
+		clean(d.sessionId, 200) &&
+		clean(d.cwd, 2000) &&
+		clean(d.startedAt, 100) &&
+		clean(d.endedAt, 100) &&
+		strArr(d.userPrompts, 12, 300) &&
+		errArr(d.errors, 20) &&
+		cmdArr(d.failedCommands, 20) &&
 		typeof d.stopReasons === "object" &&
 		d.stopReasons !== null &&
-		Object.values(d.stopReasons).every((v) => typeof v === "number" && Number.isFinite(v)) &&
-		Array.isArray(d.models) &&
+		Object.keys(d.stopReasons).length <= 20 &&
+		Object.values(d.stopReasons).every((v) => typeof v === "number" && Number.isFinite(v) && v >= 0) &&
+		strArr(d.models, 20, 200) &&
 		isCount(d.compactions) &&
 		isCount(d.messageCount) &&
+		isCount(d.userPromptCount) &&
 		typeof d.usage === "object" &&
 		d.usage !== null &&
 		isCount(d.usage.input) &&
@@ -327,8 +408,17 @@ export function listSkills(dataDir: string): string[] {
 
 /** Remove stale atomicWrite tmp files (crashes leave them behind). */
 export function cleanupStaleTmp(dataDir: string, maxAgeMs: number = 60 * 60 * 1000): void {
-	const dirs = [ouroborosDir(dataDir), digestsDir(dataDir)];
 	const cutoff = Date.now() - maxAgeMs;
+	// atomicWrite is used for rules, digests, AND skills. Skill tmps live one
+	// level deeper: skills/<name>/SKILL.md.*.tmp.
+	const dirs = [ouroborosDir(dataDir), digestsDir(dataDir)];
+	try {
+		for (const name of fs.readdirSync(skillsDir(dataDir))) {
+			dirs.push(path.join(skillsDir(dataDir), name));
+		}
+	} catch {
+		// skills dir missing — nothing to scan
+	}
 	for (const dir of dirs) {
 		let names: string[];
 		try {
@@ -349,14 +439,23 @@ export function cleanupStaleTmp(dataDir: string, maxAgeMs: number = 60 * 60 * 10
 	}
 }
 
-
-
 let tmpCounter = 0;
 
 function atomicWrite(file: string, content: string): void {
 	// pid + ms + monotonic counter: unique even for concurrent writes from
 	// the same process in the same millisecond.
 	const tmp = `${file}.${process.pid}.${Date.now()}.${tmpCounter++}.tmp`;
-	fs.writeFileSync(tmp, content);
+	// "wx" = O_CREAT|O_EXCL: a pre-created symlink at the tmp path fails the
+	// open instead of being followed (TOCTOU symlink redirect).
+	const fd = fs.openSync(tmp, "wx");
+	try {
+		fs.writeFileSync(fd, content);
+		// fsync before rename: on power loss, ext4 delayed allocation can
+		// make the rename durable before the data blocks, leaving an empty
+		// file.
+		fs.fsyncSync(fd);
+	} finally {
+		fs.closeSync(fd);
+	}
 	fs.renameSync(tmp, file);
 }

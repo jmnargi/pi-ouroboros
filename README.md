@@ -47,19 +47,27 @@ The model can write rules that conflict with your instructions.
 Review the rules with `/ouroboros`.
 Clear the rules with `/ouroboros reset`.
 The rules apply to all projects.
-The rules do not override your explicit instructions.
+The rules are suggestions, not instructions.
+The plugin tells the model that your explicit instructions take precedence.
+This is a prompt-level mitigation, not a guarantee.
+A model can follow a bad rule despite the warning.
+Review the rules regularly.
 The rules file is shared by all pi instances on this machine.
 Two pi instances can write rules at the same time.
 The plugin serializes writes within one instance.
+The plugin verifies its writes and retries on conflict.
 The plugin does not lock the file across instances.
 Run one pi instance at a time to avoid lost rules.
 
 The digest content is untrusted data.
 The digest can contain text from files, tools, or other agents.
 The reflection message tells the model to ignore instructions inside the digest.
+The plugin escapes XML-like tags in the digest text.
 The model records lessons with the `ouroboros_learn` tool.
 The tool appends, dedupes, and caps the rules.
+The tool strips control characters from rules.
 The tool refuses to overwrite an existing skill.
+The tool caps the skill body and description.
 The model does not write the rules file directly.
 The model's write tool overwrites the file and bypasses the dedup and cap.
 
@@ -101,7 +109,7 @@ Use these commands:
 - `/ouroboros` shows the status.
 - `/ouroboros reflect` forces a reflection now.
 - `/ouroboros reset` clears all rules.
-- `/ouroboros digest` shows the latest digest.
+- `/ouroboros digest` shows the last session's digest.
 
 Use the `ouroboros_learn` tool to record a lesson.
 Use `kind=rule` to add a rule.
@@ -128,7 +136,7 @@ bun test
 npx tsc --noEmit
 ```
 
-The test suite has 76 tests.
+The test suite has 86 tests.
 The tests cover digest extraction, persistence, prompt building, and the extension entry point.
 Run `bun bench/bench.ts` to measure the hot paths.
 

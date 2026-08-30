@@ -36,6 +36,8 @@ export interface OuroborosDigest {
 	endedAt: string;
 	/** User prompts, newest-last, each truncated. */
 	userPrompts: string[];
+	/** Uncapped count of user prompts (userPrompts is capped at PROMPT_CAP). */
+	userPromptCount: number;
 	/** Failed tool results: tool name + brief text. */
 	errors: Array<{ tool: string; summary: string }>;
 	/** Bash commands that exited non-zero, with the error tail. */
@@ -113,10 +115,21 @@ function truncate(s: string, max: number): string {
 		if (Array.from(cleaned).length > max || bound >= s.length) break;
 		bound = Math.min(s.length, bound * 2);
 	}
-	if (cleaned.length <= max) return cleaned;
+	if (Array.from(cleaned).length <= max) return cleaned;
 	// Cut by code points, never mid-surrogate-pair (emoji must survive).
 	const chars = Array.from(cleaned);
 	return `${chars.slice(0, max).join("")}…`;
+}
+
+/** Keep the LAST max code points — bash errors put the exit code at the end. */
+function truncateTail(s: string, max: number): string {
+	const cleaned = s
+		.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u2028\u2029]/g, "")
+		.trim()
+		.replace(/\s+/g, " ");
+	const chars = Array.from(cleaned);
+	if (chars.length <= max) return cleaned;
+	return `…${chars.slice(-max).join("")}`;
 }
 
 function asNumber(v: unknown): number {
@@ -143,6 +156,8 @@ export function buildDigest(
 		startedAt,
 		endedAt,
 		userPrompts: [],
+		userPromptCount: 0,
+
 		errors: [],
 		failedCommands: [],
 		stopReasons: {},
@@ -183,10 +198,13 @@ export function buildDigest(
 		if (msg.role === "bashExecution") {
 			const code = asNumber(msg.exitCode);
 			if (code !== 0 && typeof msg.command === "string" && msg.command.trim()) {
-				const cmd = truncate(msg.command, COMMAND_MAX_CHARS);
-				const error = truncate(extractText(msg.output), ERROR_MAX_CHARS) || "(no output)";
-				if (cmd && !seenCommands.has(cmd)) {
-					seenCommands.add(cmd);
+				// Dedup on the RAW command — truncation could collapse two
+				// distinct commands into one key.
+				const raw = msg.command.trim();
+				if (!seenCommands.has(raw)) {
+					seenCommands.add(raw);
+					const cmd = truncate(raw, COMMAND_MAX_CHARS);
+					const error = truncateTail(extractText(msg.output), ERROR_MAX_CHARS) || "(no output)";
 					digest.failedCommands.push({ command: cmd, error });
 				}
 			}
@@ -194,6 +212,7 @@ export function buildDigest(
 		}
 
 		if (msg.role === "user") {
+			digest.userPromptCount += 1;
 			const text = truncate(extractText(msg.content), PROMPT_MAX_CHARS);
 			if (text) digest.userPrompts.push(text);
 			continue;
@@ -237,11 +256,12 @@ export function buildDigest(
 			// 0 with isError false — it is not a failure.
 			if (msg.toolName === "bash") {
 				if (msg.isError === true) {
-					const command = typeof msg.toolCallId === "string" ? bashCommands.get(msg.toolCallId) : undefined;
-					const cmd = truncate(command ?? "(unknown command)", COMMAND_MAX_CHARS);
-					const error = truncate(extractText(msg.content), ERROR_MAX_CHARS) || "(no output)";
-					if (!seenCommands.has(cmd)) {
-						seenCommands.add(cmd);
+					const raw = typeof msg.toolCallId === "string" ? bashCommands.get(msg.toolCallId) : undefined;
+					const key = raw ?? "(unknown command)";
+					if (!seenCommands.has(key)) {
+						seenCommands.add(key);
+						const cmd = truncate(key, COMMAND_MAX_CHARS);
+						const error = truncateTail(extractText(msg.content), ERROR_MAX_CHARS) || "(no output)";
 						digest.failedCommands.push({ command: cmd, error });
 					}
 				}
@@ -288,6 +308,7 @@ export function isNotable(digest: OuroborosDigest, minPrompts: number): boolean 
 	if (digest.compactions > 0) return true;
 	// A long successful session is worth reflecting on, but only well above
 	// the default threshold — without a failure signal the model writes
-	// platitudes.
-	return digest.userPrompts.length >= Math.max(minPrompts, 20);
+	// platitudes. userPromptCount is uncapped (userPrompts is capped at 12).
+	return digest.userPromptCount >= Math.max(minPrompts, 20);
 }
+

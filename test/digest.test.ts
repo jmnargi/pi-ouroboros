@@ -168,6 +168,13 @@ describe("buildDigest", () => {
 		expect(d.userPrompts[0]).toBe("a31mbcd");
 	});
 
+	test("truncation does not add an ellipsis to an exact-fit astral string", () => {
+		// 20 emoji = 20 code points = 40 UTF-16 units; max=20 code points.
+		const d = buildDigest([userMessage("😀".repeat(20))], SID, CWD, END);
+		expect(d.userPrompts[0]).toBe("😀".repeat(20));
+		expect(d.userPrompts[0]!.endsWith("…")).toBe(false);
+	});
+
 	test("control-character-only prompts produce no digest entries", () => {
 		const d = buildDigest([userMessage("\u0000\u0000\u0000")], SID, CWD, END);
 		expect(d.userPrompts).toEqual([]);
@@ -249,9 +256,18 @@ describe("isNotable", () => {
 	});
 
 	test("true when enough prompts, false for a quiet clean session", () => {
-		const many = Array.from({ length: 20 }, (_, i) => `p${i}`);
-		expect(isNotable({ ...base(), userPrompts: many }, 5)).toBe(true);
-		expect(isNotable({ ...base(), userPrompts: ["a", "b"] }, 5)).toBe(false);
+		// userPromptCount is the uncapped counter — userPrompts itself is
+		// capped at 12 by buildDigest, so isNotable must not read it.
+		expect(isNotable({ ...base(), userPromptCount: 20 }, 5)).toBe(true);
+		expect(isNotable({ ...base(), userPromptCount: 2 }, 5)).toBe(false);
 		expect(isNotable(base(), 5)).toBe(false);
+	});
+
+	test("a real 20-prompt session is notable (buildDigest → isNotable)", () => {
+		const entries = Array.from({ length: 20 }, (_, i) => userMessage(`prompt ${i}`));
+		const d = buildDigest(entries, SID, CWD, END);
+		expect(d.userPrompts).toHaveLength(12); // capped
+		expect(d.userPromptCount).toBe(20); // uncapped
+		expect(isNotable(d, 5)).toBe(true);
 	});
 });

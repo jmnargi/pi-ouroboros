@@ -16,7 +16,8 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 import plugin from "../src/index.ts";
 import { buildDigest } from "../src/digest.ts";
-import { appendRule, digestsDir, loadRules, markDigestInjected, saveDigest, skillsDir } from "../src/persistence.ts";
+
+import { appendRule, digestsDir, loadRules, markDigestInjected, saveDigest, saveLastDigest, skillsDir } from "../src/persistence.ts";
 import { OUROBOROS_CUSTOM_TYPE } from "../src/reflect.ts";
 
 type Handler = (...args: unknown[]) => unknown;
@@ -235,14 +236,15 @@ describe("session_start", () => {
 		expect(readdirSync(digestsDir(dataDir))).toEqual([]);
 	});
 
-	test("cleans leftover injected digests from a crashed instance", () => {
+	test("re-injects leftover injected digests from an undelivered reflection", () => {
 		saveDigest(dataDir, buildDigest(notableEntries(), "sess-1", "/proj", "2026-08-30T12:00:00.000Z"));
 		markDigestInjected(dataDir, "sess-1");
 		const handler = api.fire.bind(api, "session_start");
 		handler({}, fakeCtx());
-		// The stale injected digest is deleted, not re-injected.
-		expect(api.messages).toHaveLength(0);
-		expect(readdirSync(digestsDir(dataDir))).toEqual([]);
+		// The undelivered reflection is unmarked and re-injected.
+		expect(api.messages).toHaveLength(1);
+		expect(api.messages[0]!.message.customType).toBe(OUROBOROS_CUSTOM_TYPE);
+		expect(readdirSync(digestsDir(dataDir))).toEqual(["sess-1.injected.json"]);
 	});
 });
 
@@ -260,8 +262,15 @@ describe("before_agent_start", () => {
 		const handler = api.fire.bind(api, "before_agent_start");
 		expect(handler({ systemPrompt: "base prompt" })).toBeUndefined();
 	});
-});
 
+	test("agent_end deletes the injected marker after delivery", () => {
+		saveDigest(dataDir, buildDigest(notableEntries(), "sess-1", "/proj", "2026-08-30T12:00:00.000Z"));
+		api.fire("session_start", {}, fakeCtx());
+		expect(readdirSync(digestsDir(dataDir))).toEqual(["sess-1.injected.json"]);
+		api.fire("agent_end", {});
+		expect(readdirSync(digestsDir(dataDir))).toEqual([]);
+	});
+});
 describe("ouroboros_learn tool", () => {
 	const tool = (): MockTool => api.tools.find((t) => t.name === "ouroboros_learn")!;
 
@@ -272,6 +281,19 @@ describe("ouroboros_learn tool", () => {
 		const second = await t.execute("call-2", { kind: "rule", lesson: "Always re-read before editing!" }, undefined, undefined, fakeCtx());
 		expect(second.content[0]!.text).toContain("duplicate rule skipped");
 		expect(loadRules(dataDir)).toHaveLength(1);
+	});
+
+	test("kind=rule respects PI_OUROBOROS_RULES_CAP", async () => {
+		process.env.PI_OUROBOROS_RULES_CAP = "2";
+		const capped = makeAPI();
+		plugin(capped as unknown as ExtensionAPI);
+		const t = capped.tools.find((x) => x.name === "ouroboros_learn")!;
+		await t.execute("call-1", { kind: "rule", lesson: "rule one" }, undefined, undefined, fakeCtx());
+		await t.execute("call-2", { kind: "rule", lesson: "rule two" }, undefined, undefined, fakeCtx());
+		const third = await t.execute("call-3", { kind: "rule", lesson: "rule three" }, undefined, undefined, fakeCtx());
+		expect(third.content[0]!.text).toContain("rule recorded (2/2)");
+		expect(loadRules(dataDir)).toEqual(["rule two", "rule three"]);
+		delete process.env.PI_OUROBOROS_RULES_CAP;
 	});
 
 	test("kind=skill writes a SKILL.md and validates the name", async () => {
@@ -311,8 +333,8 @@ describe("/ouroboros command", () => {
 		expect(api.messages).toHaveLength(1);
 	});
 
-	test("digest subcommand reports pending digests", () => {
-		saveDigest(dataDir, buildDigest(notableEntries(), "sess-1", "/proj", "2026-08-30T12:00:00.000Z"));
+	test("digest subcommand reports the last recorded digest", () => {
+		saveLastDigest(dataDir, buildDigest(notableEntries(), "sess-1", "/proj", "2026-08-30T12:00:00.000Z"));
 		const notified: string[] = [];
 		const ctx = fakeCtx({ hasUI: true, ui: { setStatus: () => {}, notify: (m: string) => notified.push(m) } });
 		cmd().handler("digest", ctx);

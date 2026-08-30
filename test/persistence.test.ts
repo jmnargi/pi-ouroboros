@@ -15,11 +15,13 @@ import {
 	deleteInjectedDigest,
 	digestFile,
 	loadDigest,
+	loadLastDigest,
 	loadRules,
 	listDigests,
 	listInjectedDigests,
 	listSkills,
 	saveDigest,
+	saveLastDigest,
 	markDigestInjected,
 	normalizeDescription,
 	rulesFile,
@@ -48,15 +50,15 @@ afterEach(() => {
 describe("rules", () => {
 	test("appendRule adds, dedupes, and reports counts", async () => {
 		const dir = tmpDataDir();
-		expect(await appendRule(dir, "Always re-read before editing")).toEqual({ added: true, count: 1, cap: 50 });
-		expect(await appendRule(dir, "Always re-read before editing")).toEqual({ added: false, count: 1, cap: 50 });
-		expect(await appendRule(dir, "Run tests after refactors")).toEqual({ added: true, count: 2, cap: 50 });
+		expect(await appendRule(dir, "Always re-read before editing")).toEqual({ added: true, reason: "added", count: 1, cap: 50 });
+		expect(await appendRule(dir, "Always re-read before editing")).toEqual({ added: false, reason: "duplicate", count: 1, cap: 50 });
+		expect(await appendRule(dir, "Run tests after refactors")).toEqual({ added: true, reason: "added", count: 2, cap: 50 });
 		expect(loadRules(dir)).toEqual(["Always re-read before editing", "Run tests after refactors"]);
 	});
 
 	test("appendRule normalizes whitespace and rejects empty", async () => {
 		const dir = tmpDataDir();
-		expect(await appendRule(dir, "  a   b  ")).toEqual({ added: true, count: 1, cap: 50 });
+		expect(await appendRule(dir, "  a   b  ")).toEqual({ added: true, reason: "added", count: 1, cap: 50 });
 		expect(loadRules(dir)).toEqual(["a b"]);
 		expect((await appendRule(dir, "   ")).added).toBe(false);
 	});
@@ -75,7 +77,7 @@ describe("rules", () => {
 		const long = "x".repeat(2000);
 		expect((await appendRule(dir, long)).added).toBe(true);
 		expect(loadRules(dir)[1]).toHaveLength(500);
-		expect(await appendRule(dir, "   ")).toEqual({ added: false, count: 2, cap: 50 });
+		expect(await appendRule(dir, "   ")).toEqual({ added: false, reason: "conflict", count: 2, cap: 50 });
 	});
 
 	test("appendRule calls from one turn do not lose rules", async () => {
@@ -123,9 +125,15 @@ describe("rules", () => {
 	test("appendRule dedupes semantically (case, punctuation, spacing)", async () => {
 		const dir = tmpDataDir();
 		await appendRule(dir, "Always re-read before editing!");
-		expect(await appendRule(dir, "always re-read before editing")).toEqual({ added: false, count: 1, cap: 50 });
-		expect(await appendRule(dir, "ALWAYS  re-read, before editing.")).toEqual({ added: false, count: 1, cap: 50 });
-		expect(await appendRule(dir, "Run tests after refactors")).toEqual({ added: true, count: 2, cap: 50 });
+		expect(await appendRule(dir, "always re-read before editing")).toEqual({ added: false, reason: "duplicate", count: 1, cap: 50 });
+		expect(await appendRule(dir, "ALWAYS  re-read, before editing.")).toEqual({ added: false, reason: "duplicate", count: 1, cap: 50 });
+		expect(await appendRule(dir, "Run tests after refactors")).toEqual({ added: true, reason: "added", count: 2, cap: 50 });
+	});
+
+	test("appendRule strips control characters (SEC-001)", async () => {
+		const dir = tmpDataDir();
+		await appendRule(dir, "always\u0000 re-read\u0007 before editing");
+		expect(loadRules(dir)).toEqual(["always re-read before editing"]);
 	});
 	test("appendRule writes through a symlinked rules.md (Data F12)", async () => {
 		const dir = tmpDataDir();
@@ -175,10 +183,11 @@ describe("digests", () => {
 	test("safeSessionId hashes distinct unsafe ids distinctly (Data F5)", () => {
 		// The old djb2 hash collided at ~77k ids; sha256-16hex does not.
 		expect(safeSessionId("sess-5s5-5edxhisd")).not.toBe(safeSessionId("sess-vp5-wbt0rpm4"));
-		// Hashed ids live in their own namespace, never colliding with
-		// verbatim safe ids.
+		// Hashed ids live in their own namespace: the sid-h- prefix is
+		// reserved, so a verbatim id with that shape is hashed too.
 		expect(safeSessionId("../../etc/passwd")).toMatch(/^sid-h-[0-9a-f]{16}$/);
-		expect(safeSessionId("sid-h-3754d6cb3a38e118")).toBe("sid-h-3754d6cb3a38e118");
+		expect(safeSessionId("sid-h-3754d6cb3a38e118")).toMatch(/^sid-h-[0-9a-f]{16}$/);
+		expect(safeSessionId("sid-h-3754d6cb3a38e118")).not.toBe("sid-h-3754d6cb3a38e118");
 	});
 
 	test("listDigests skips unstatable files instead of failing (Data F3)", () => {
@@ -202,6 +211,17 @@ describe("digests", () => {
 		expect(loadDigest(dir, "sess-absurd")).toBeNull();
 		fs.writeFileSync(file, JSON.stringify({ ...base, sessionId: "bad\u0000id" }));
 		expect(loadDigest(dir, "sess-absurd")).toBeNull();
+		// Element shape: a round-2 digest (failedCommands: string[]) is rejected.
+		fs.writeFileSync(file, JSON.stringify({ ...base, failedCommands: ["npm test"] }));
+		expect(loadDigest(dir, "sess-absurd")).toBeNull();
+	});
+
+	test("last digest round-trips for /ouroboros digest (UX-2)", () => {
+		const dir = tmpDataDir();
+		expect(loadLastDigest(dir)).toBeNull();
+		const d = digest();
+		saveLastDigest(dir, d);
+		expect(loadLastDigest(dir)).toEqual(d);
 	});
 
 	test("cleanupStaleTmp removes old tmp files and keeps fresh ones", () => {
@@ -219,6 +239,18 @@ describe("digests", () => {
 		expect(fs.existsSync(fresh)).toBe(true);
 	});
 
+	test("cleanupStaleTmp also scans the skills dir", () => {
+		const dir = tmpDataDir();
+		// Skill tmps live one level deep: skills/<name>/SKILL.md.*.tmp.
+		const skillDir = path.join(dir, "skills", "debug-flaky-tests");
+		fs.mkdirSync(skillDir, { recursive: true });
+		const stale = path.join(skillDir, "SKILL.md.123.456.0.tmp");
+		fs.writeFileSync(stale, "x");
+		const old = Date.now() / 1000 - 7200;
+		fs.utimesSync(stale, old, old);
+		cleanupStaleTmp(dir);
+		expect(fs.existsSync(stale)).toBe(false);
+	});
 
 
 	test("listDigests ignores non-json files and missing dir", () => {
