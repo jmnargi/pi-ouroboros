@@ -21,11 +21,12 @@
  * injection. Nothing here calls the model directly.
  */
 
+import * as os from "node:os";
+import * as path from "node:path";
 import { Text } from "@earendil-works/pi-tui";
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-
 import { buildDigest, isNotable, type OuroborosDigest } from "./digest.ts";
 import {
 	appendRule,
@@ -36,16 +37,18 @@ import {
 	deleteInjectedDigest,
 	listInjectedDigests,
 	markDigestInjected,
+	unmarkDigestInjected,
 	deleteDigest,
 	listDigests,
 	loadDigest,
 	listSkills,
 	loadRules,
-	skillsDir,
 	rulesFile,
+	skillsDir,
 	saveDigest,
 	writeSkill,
 	isValidSkillName,
+	cleanupStaleTmp,
 } from "./persistence.ts";
 import { buildReflectionMessage, buildRulesAppendix, formatDigest, OUROBOROS_CUSTOM_TYPE } from "./reflect.ts";
 
@@ -74,8 +77,8 @@ function envInt(name: string, fallback: number): number {
 export default function (pi: ExtensionAPI): void {
 	if (process.env.PI_OUROBOROS_DISABLED === "1") return;
 
-	const dataDir = process.env.PI_CODING_AGENT_DIR ?? (process.env.HOME ? `${process.env.HOME}/.pi/agent` : ".");
-	const rulesCap = envInt("PI_OUROBOROS_RULES_CAP", DEFAULT_RULES_CAP);
+
+	const dataDir = process.env.PI_CODING_AGENT_DIR ?? path.join(os.homedir(), ".pi", "agent");
 	const rulesMaxChars = envInt("PI_OUROBOROS_RULES_MAX_CHARS", DEFAULT_RULES_MAX_CHARS);
 	const minPrompts = envInt("PI_OUROBOROS_REFLECT_MIN_PROMPTS", DEFAULT_REFLECT_MIN_PROMPTS);
 	let uiHost: UiHost | undefined = undefined;
@@ -127,7 +130,7 @@ export default function (pi: ExtensionAPI): void {
 		// Digest finished sessions: quit, new, and resume-away (the abandoned
 		// file is finalized at teardown). "fork" continues in the copy and
 		// "reload" keeps the session alive — neither must produce a digest.
-		if (event.reason === "reload" || event.reason === "fork") return;
+	if (event.reason === "reload" || event.reason === "fork") return;
 		try {
 			// Ephemeral sessions (--no-session) have no session file; their
 			// throwaway digests must not leak into the next real session.
@@ -145,10 +148,24 @@ export default function (pi: ExtensionAPI): void {
 
 	pi.on("session_start", (_event, ctx) => {
 		uiHost = ctx as unknown as UiHost;
+		// Leftover .injected.json files are stale by definition (the queued
+		// message died with the previous extension instance) — clean them
+		// before the injection loop renames fresh ones.
+		try {
+			for (const sid of listInjectedDigests(dataDir)) {
+				deleteInjectedDigest(dataDir, sid);
+			}
+			cleanupStaleTmp(dataDir);
+		} catch {
+			// best-effort — a failed cleanup must not block the reflection
+		}
 		// Bounded scan: at most the newest 5 digests are ever loaded. Anything
 		// older is stale (a digest is consumed on the first session start
 		// after it is written) and is deleted by filename without parsing.
-		const pending = listDigests(dataDir).slice(0, 5);
+		// The list is captured ONCE — a second call would re-sort and miss
+		// the 6th-10th newest.
+		const all = listDigests(dataDir);
+		const pending = all.slice(0, 5);
 		let injected = false;
 		for (const sid of pending) {
 			// One corrupt digest must not block the rest.
@@ -187,23 +204,33 @@ export default function (pi: ExtensionAPI): void {
 				hasInjectedDigests = true;
 				injected = true;
 			} catch {
-				// best-effort — one bad digest must not stall the rest
-			}
+				// sendMessage failed after the mark — restore the digest so it
+			// can be retried on the next session start. One bad digest
+			// must not stall the rest.
+			unmarkDigestInjected(dataDir, sid);
 		}
-		// Delete any digests beyond the scan window without parsing them.
-		for (const sid of listDigests(dataDir).slice(5)) {
-			deleteDigest(dataDir, sid);
+	}
+	// Delete any digests beyond the scan window without parsing them.
+		try {
+			for (const sid of all.slice(5)) {
+				deleteDigest(dataDir, sid);
+			}
+		} catch {
+			// best-effort — a failed deletion must not skip the status
 		}
 		updateStatus();
 	});
-
 	pi.on("before_agent_start", (event) => {
 		// The queued reflection is delivered in this turn — clean up any
 		// injected digests that were never consumed. Skipped entirely when
 		// nothing was injected (the common case): zero file IO per turn.
 		if (hasInjectedDigests) {
-			for (const sid of listInjectedDigests(dataDir)) {
-				deleteInjectedDigest(dataDir, sid);
+			try {
+				for (const sid of listInjectedDigests(dataDir)) {
+					deleteInjectedDigest(dataDir, sid);
+				}
+			} catch {
+				// best-effort — a failed cleanup must not skip the rules
 			}
 			hasInjectedDigests = false;
 		}
@@ -260,7 +287,7 @@ export default function (pi: ExtensionAPI): void {
 		},
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			if (params.kind === "rule") {
-				const { added, count, cap } = await appendRule(dataDir, params.lesson, rulesCap);
+			const { added, count, cap } = appendRule(dataDir, params.lesson, DEFAULT_RULES_CAP);
 				updateStatus();
 				return {
 					content: [
@@ -301,9 +328,13 @@ export default function (pi: ExtensionAPI): void {
 			const sub = (args ?? "").trim().split(/\s+/)[0] ?? "";
 
 			if (sub === "reset") {
-				clearRules(dataDir);
-				updateStatus();
-				if (cmdCtx.hasUI) cmdCtx.ui.notify("ouroboros: rules cleared", "info");
+				try {
+					clearRules(dataDir);
+					updateStatus();
+					if (cmdCtx.hasUI) cmdCtx.ui.notify("ouroboros: rules cleared", "info");
+				} catch (err) {
+					if (cmdCtx.hasUI) cmdCtx.ui.notify(`ouroboros: reset failed: ${String(err)}`, "error");
+				}
 				return;
 			}
 
@@ -313,12 +344,12 @@ export default function (pi: ExtensionAPI): void {
 					return;
 				}
 				try {
-					const entries = cmdCtx.sessionManager.getEntries() as unknown[];
-					const digest = buildDigest(entries, sessionIdOf(cmdCtx), cwdOf(cmdCtx), new Date().toISOString());
+					// Mid-session: the model already has the session in
+					// context, so no digest is included.
 					pi.sendMessage(
 						{
 							customType: OUROBOROS_CUSTOM_TYPE,
-							content: buildReflectionMessage(digest, rulesFile(dataDir), skillsDir(dataDir), true),
+							content: buildReflectionMessage(null, rulesFile(dataDir), skillsDir(dataDir), true),
 							display: true,
 						},
 						{ deliverAs: "nextTurn" },

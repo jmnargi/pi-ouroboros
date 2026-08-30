@@ -77,7 +77,7 @@ describe("buildDigest", () => {
 		expect(d.endedAt).toBe(END);
 		expect(d.userPrompts).toEqual(["fix the auth bug", "now the tests"]);
 		expect(d.errors).toEqual([{ tool: "edit", summary: "file not found" }]);
-		expect(d.failedCommands).toEqual(["npm test"]);
+		expect(d.failedCommands).toEqual([{ command: "npm test", error: "(no output)" }]);
 		expect(d.stopReasons).toEqual({ stop: 1, length: 1 });
 		expect(d.models).toEqual(["vitruvix-code", "vitruvix-high"]);
 		expect(d.usage).toEqual({ input: 200, output: 100, cost: 0.002 });
@@ -94,7 +94,7 @@ describe("buildDigest", () => {
 			bashToolResult("call-3", "ok\n"),
 		];
 		const d = buildDigest(entries, SID, CWD, END);
-		expect(d.failedCommands).toEqual(["ls /nonexistent-dir-xyz", "npm test"]);
+		expect(d.failedCommands).toEqual([{ command: "ls /nonexistent-dir-xyz", error: "ls: cannot access '/nonexistent-dir-xyz': No such file or directory Command exited with code 2" }, { command: "npm test", error: "1 failing Command exited with code 1" }]);
 	});
 
 	test("ignores successful bash results even when they print exit codes", () => {
@@ -103,6 +103,10 @@ describe("buildDigest", () => {
 			bashToolResult("call-1", "exit code: 1\n"), // command exited 0 (echo succeeded)
 			bashToolCall("call-2", "echo \"exit code: 5\""),
 			bashToolResult("call-2", "exit code: 5\n"),
+			// The discriminating case: a SUCCESSFUL command that merely
+			// prints the failure string — isError false must not record it.
+			bashToolCall("call-3", "echo 'Command exited with code 5'"),
+			bashToolResult("call-3", "Command exited with code 5\n"),
 		];
 		const d = buildDigest(entries, SID, CWD, END);
 		expect(d.failedCommands).toEqual([]);
@@ -110,7 +114,7 @@ describe("buildDigest", () => {
 
 	test("records unknown command for orphan failed bash results", () => {
 		const d = buildDigest([bashToolResult("orphan", "Command exited with code 1", true)], SID, CWD, END);
-		expect(d.failedCommands).toEqual(["(unknown command)"]);
+		expect(d.failedCommands).toEqual([{ command: "(unknown command)", error: "Command exited with code 1" }]);
 	});
 	test("uses the caller-provided startedAt when no header entry exists", () => {
 		const d = buildDigest([userMessage("hi")], SID, CWD, END, "2026-08-30T09:00:00.000Z");
@@ -141,12 +145,54 @@ describe("buildDigest", () => {
 		const d = buildDigest([userMessage(long), bashFailure(`echo ${long}`, 2)], SID, CWD, END);
 		expect(d.userPrompts[0]).toHaveLength(241); // 240 + ellipsis
 		expect(d.userPrompts[0]!.endsWith("…")).toBe(true);
-		expect(d.failedCommands[0]).toHaveLength(161);
+		expect(d.failedCommands[0]!.command).toHaveLength(161);
 	});
 
 	test("strips control characters from digest text", () => {
 		const d = buildDigest([userMessage("hello\u0000world\u001b[31mred")], SID, CWD, END);
 		expect(d.userPrompts[0]).toBe("helloworld[31mred"); // ESC stripped, text remains
+
+	});
+
+	test("truncation keeps content after stripped characters (Data F2)", () => {
+		// Cleaning removes chars, so the surviving content can start far into
+		// the input — the bound must grow until enough survives.
+		const nul = buildDigest([userMessage("a" + "\u0000".repeat(20) + "b" + "x".repeat(100))], SID, CWD, END);
+		expect(nul.userPrompts[0]).toBe("ab" + "x".repeat(100));
+		const spaces = buildDigest([userMessage("a" + " ".repeat(1000) + "b" + "y".repeat(100))], SID, CWD, END);
+		expect(spaces.userPrompts[0]).toBe("a by" + "y".repeat(99));
+	});
+
+	test("strips C1 control characters and line separators (Data F9)", () => {
+		const d = buildDigest([userMessage("a\u009b31mb\u2028c\u2029d")], SID, CWD, END);
+		expect(d.userPrompts[0]).toBe("a31mbcd");
+	});
+
+	test("control-character-only prompts produce no digest entries", () => {
+		const d = buildDigest([userMessage("\u0000\u0000\u0000")], SID, CWD, END);
+		expect(d.userPrompts).toEqual([]);
+	});
+
+	test("truncation never splits surrogate pairs", () => {
+		const emoji = "😀".repeat(300); // 600 UTF-16 units, 300 code points
+		const d = buildDigest([userMessage(emoji)], SID, CWD, END);
+		expect(Array.from(d.userPrompts[0]!).length).toBe(241); // 240 code points + ellipsis
+		expect(d.userPrompts[0]!.endsWith("…")).toBe(true);
+		// No lone surrogates: every char must round-trip through JSON.
+		expect(JSON.parse(JSON.stringify(d.userPrompts[0]))).toBe(d.userPrompts[0]);
+	});
+
+	test("records version, dedupes models, and falls back usage fields", () => {
+		const entries = [
+			assistantMessage({ model: "vitruvix-code" }),
+			assistantMessage({ model: "vitruvix-code", usage: { input: 5 } }),
+			entry({ message: { role: "toolResult", content: [{ type: "text", text: "boom" }], isError: true } }),
+		];
+		const d = buildDigest(entries, SID, CWD, END);
+		expect(d.version).toBe(1);
+		expect(d.models).toEqual(["vitruvix-code"]);
+		expect(d.usage).toEqual({ input: 105, output: 50, cost: 0.001 }); // missing fields → 0
+		expect(d.errors).toEqual([{ tool: "tool", summary: "boom" }]); // no toolName → "tool"
 	});
 
 	test("caps errors and failed commands at 20 each", () => {
@@ -192,7 +238,7 @@ describe("isNotable", () => {
 
 	test("true on errors, failed commands, abnormal stops, compactions", () => {
 		expect(isNotable({ ...base(), errors: [{ tool: "edit", summary: "x" }] }, 5)).toBe(true);
-		expect(isNotable({ ...base(), failedCommands: ["npm test"] }, 5)).toBe(true);
+		expect(isNotable({ ...base(), failedCommands: [{ command: "npm test", error: "x" }] }, 5)).toBe(true);
 		expect(isNotable({ ...base(), stopReasons: { length: 1 } }, 5)).toBe(true);
 		expect(isNotable({ ...base(), stopReasons: { error: 1 } }, 5)).toBe(true);
 		expect(isNotable({ ...base(), compactions: 1 }, 5)).toBe(true);
@@ -203,7 +249,8 @@ describe("isNotable", () => {
 	});
 
 	test("true when enough prompts, false for a quiet clean session", () => {
-		expect(isNotable({ ...base(), userPrompts: ["a", "b", "c", "d", "e"] }, 5)).toBe(true);
+		const many = Array.from({ length: 20 }, (_, i) => `p${i}`);
+		expect(isNotable({ ...base(), userPrompts: many }, 5)).toBe(true);
 		expect(isNotable({ ...base(), userPrompts: ["a", "b"] }, 5)).toBe(false);
 		expect(isNotable(base(), 5)).toBe(false);
 	});

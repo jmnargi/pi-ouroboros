@@ -38,8 +38,8 @@ export interface OuroborosDigest {
 	userPrompts: string[];
 	/** Failed tool results: tool name + brief text. */
 	errors: Array<{ tool: string; summary: string }>;
-	/** Bash commands that exited non-zero, truncated. */
-	failedCommands: string[];
+	/** Bash commands that exited non-zero, with the error tail. */
+	failedCommands: Array<{ command: string; error: string }>;
 	/** Assistant stop-reason counts (e.g. { stop: 4, length: 1 }). */
 	stopReasons: Record<string, number>;
 	/** Distinct model ids used. */
@@ -75,6 +75,7 @@ interface RawEntry {
 		toolCallId?: unknown;
 		command?: unknown;
 		exitCode?: unknown;
+		output?: unknown;
 	};
 	cwd?: unknown;
 	id?: unknown;
@@ -96,15 +97,26 @@ export function extractText(content: unknown): string {
 	}
 	return parts.join("\n");
 }
-
 function truncate(s: string, max: number): string {
-	// Strip control characters: digest content is untrusted data and must not
-	// smuggle formatting or instructions into the reflection message.
-	const t = s
-		.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "")
-		.trim()
-		.replace(/\s+/g, " ");
-	return t.length > max ? `${t.slice(0, max)}…` : t;
+	// Cleaning removes characters, so the first max code points of the
+	// cleaned text can start arbitrarily far into the input. Grow the bound
+	// geometrically until enough survive or the string is exhausted — the
+	// common case (no control chars) is one pass over ~max*2 units.
+	let bound = max * 2 + 1;
+	let cleaned = "";
+	while (true) {
+		cleaned = s
+			.slice(0, bound)
+			.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u2028\u2029]/g, "")
+			.trim()
+			.replace(/\s+/g, " ");
+		if (Array.from(cleaned).length > max || bound >= s.length) break;
+		bound = Math.min(s.length, bound * 2);
+	}
+	if (cleaned.length <= max) return cleaned;
+	// Cut by code points, never mid-surrogate-pair (emoji must survive).
+	const chars = Array.from(cleaned);
+	return `${chars.slice(0, max).join("")}…`;
 }
 
 function asNumber(v: unknown): number {
@@ -167,26 +179,25 @@ export function buildDigest(
 		if (entry.type !== "message" || !entry.message || typeof entry.message !== "object") continue;
 		const msg = entry.message;
 		digest.messageCount += 1;
-
 		// Documented bashExecution role (command/exitCode on the message).
 		if (msg.role === "bashExecution") {
 			const code = asNumber(msg.exitCode);
 			if (code !== 0 && typeof msg.command === "string" && msg.command.trim()) {
 				const cmd = truncate(msg.command, COMMAND_MAX_CHARS);
-				if (!seenCommands.has(cmd)) {
+				const error = truncate(extractText(msg.output), ERROR_MAX_CHARS) || "(no output)";
+				if (cmd && !seenCommands.has(cmd)) {
 					seenCommands.add(cmd);
-					digest.failedCommands.push(cmd);
+					digest.failedCommands.push({ command: cmd, error });
 				}
 			}
 			continue;
 		}
 
 		if (msg.role === "user") {
-			const text = extractText(msg.content).trim();
-			if (text) digest.userPrompts.push(truncate(text, PROMPT_MAX_CHARS));
+			const text = truncate(extractText(msg.content), PROMPT_MAX_CHARS);
+			if (text) digest.userPrompts.push(text);
 			continue;
 		}
-
 		if (msg.role === "assistant") {
 			if (typeof msg.stopReason === "string" && msg.stopReason) {
 				digest.stopReasons[msg.stopReason] = (digest.stopReasons[msg.stopReason] ?? 0) + 1;
@@ -202,12 +213,17 @@ export function buildDigest(
 				digest.usage.cost += asNumber(usage.cost?.total);
 			}
 			// Remember bash commands so their tool results can be attributed.
+			// Bounded: a long session must not grow this map without limit.
 			if (Array.isArray(msg.content)) {
 				for (const block of msg.content) {
 					if (!block || typeof block !== "object") continue;
 					const b = block as { type?: unknown; name?: unknown; id?: unknown; arguments?: { command?: unknown } };
 					if (b.type === "toolCall" && b.name === "bash" && typeof b.id === "string" && typeof b.arguments?.command === "string") {
 						bashCommands.set(b.id, b.arguments.command);
+						if (bashCommands.size > 100) {
+							const oldest = bashCommands.keys().next().value;
+							if (oldest !== undefined) bashCommands.delete(oldest);
+						}
 					}
 				}
 			}
@@ -223,13 +239,15 @@ export function buildDigest(
 				if (msg.isError === true) {
 					const command = typeof msg.toolCallId === "string" ? bashCommands.get(msg.toolCallId) : undefined;
 					const cmd = truncate(command ?? "(unknown command)", COMMAND_MAX_CHARS);
+					const error = truncate(extractText(msg.content), ERROR_MAX_CHARS) || "(no output)";
 					if (!seenCommands.has(cmd)) {
 						seenCommands.add(cmd);
-						digest.failedCommands.push(cmd);
+						digest.failedCommands.push({ command: cmd, error });
 					}
 				}
 				continue;
 			}
+
 			// Other failed tools: isError/toolName on the message object.
 			if (msg.isError === true) {
 				const tool = typeof msg.toolName === "string" ? msg.toolName : "tool";
@@ -244,6 +262,7 @@ export function buildDigest(
 		}
 	}
 
+	// Keep the newest prompts; cap the rest.
 	if (digest.userPrompts.length > PROMPT_CAP) {
 		digest.userPrompts = digest.userPrompts.slice(-PROMPT_CAP);
 	}
@@ -267,5 +286,8 @@ export function isNotable(digest: OuroborosDigest, minPrompts: number): boolean 
 	const hasAbnormalStop = Object.keys(digest.stopReasons).some((k) => !BENIGN_STOP_REASONS[k]);
 	if (hasAbnormalStop) return true;
 	if (digest.compactions > 0) return true;
-	return digest.userPrompts.length >= minPrompts;
+	// A long successful session is worth reflecting on, but only well above
+	// the default threshold — without a failure signal the model writes
+	// platitudes.
+	return digest.userPrompts.length >= Math.max(minPrompts, 20);
 }

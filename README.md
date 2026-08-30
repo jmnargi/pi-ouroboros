@@ -54,6 +54,15 @@ The plugin serializes writes within one instance.
 The plugin does not lock the file across instances.
 Run one pi instance at a time to avoid lost rules.
 
+The digest content is untrusted data.
+The digest can contain text from files, tools, or other agents.
+The reflection message tells the model to ignore instructions inside the digest.
+The model records lessons with the `ouroboros_learn` tool.
+The tool appends, dedupes, and caps the rules.
+The tool refuses to overwrite an existing skill.
+The model does not write the rules file directly.
+The model's write tool overwrites the file and bypasses the dedup and cap.
+
 ## Performance
 
 The plugin has minimal performance impact.
@@ -65,15 +74,22 @@ Measured costs:
 - Session start with no digests: 0.003 ms.
 - Session start with 1 digest: 0.017 ms.
 - Session start with 50 digests: 0.156 ms.
-- Rules read per turn (cached): 0.002 ms.
+- Rules read per turn (cached): 0.001 ms.
+- Skills read per turn (cached): 0.001 ms.
 - Turn start with no pending reflection: 0.0002 ms.
+- Digest list with 10,000 digests: 21 ms.
+- Digest build with a 300 KB prompt: 0.037 ms.
+- Digest save (atomic write): 0.021 ms.
 
 The plugin caches the rules file.
 The plugin invalidates the cache on its own writes.
 The plugin checks the file mtime for external writes.
+The plugin caches the skills list.
+The plugin invalidates the skills cache on its own writes.
 The plugin scans at most the newest 5 digests.
 The plugin deletes older digests by name without parsing them.
 The plugin skips the per-turn cleanup when nothing is pending.
+Run `bun bench/bench.ts` to re-measure the hot paths.
 
 ## Usage
 
@@ -112,8 +128,9 @@ bun test
 npx tsc --noEmit
 ```
 
-The test suite has 43 tests.
-The tests cover digest extraction, persistence, and prompt building.
+The test suite has 75 tests.
+The tests cover digest extraction, persistence, prompt building, and the extension entry point.
+Run `bun bench/bench.ts` to measure the hot paths.
 
 ## Design notes
 
