@@ -128,7 +128,7 @@ bun test
 npx tsc --noEmit
 ```
 
-The test suite has 75 tests.
+The test suite has 76 tests.
 The tests cover digest extraction, persistence, prompt building, and the extension entry point.
 Run `bun bench/bench.ts` to measure the hot paths.
 
