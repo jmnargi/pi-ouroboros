@@ -78,24 +78,26 @@ export default function (pi: ExtensionAPI): void {
 	const rulesCap = envInt("PI_OUROBOROS_RULES_CAP", DEFAULT_RULES_CAP);
 	const rulesMaxChars = envInt("PI_OUROBOROS_RULES_MAX_CHARS", DEFAULT_RULES_MAX_CHARS);
 	const minPrompts = envInt("PI_OUROBOROS_REFLECT_MIN_PROMPTS", DEFAULT_REFLECT_MIN_PROMPTS);
-
 	let uiHost: UiHost | undefined = undefined;
 	/** True while a /ouroboros reflect message is queued (dedupe). */
 	let reflectQueued = false;
+	/** True while injected digests await cleanup — avoids a readdir every turn. */
+	let hasInjectedDigests = false;
 	const updateStatus = (): void => {
 		const host = uiHost;
 		if (!host?.hasUI) return;
 		try {
 			const rules = loadRules(dataDir);
 			const skills = listSkills(dataDir);
-			const pendingReflection = listInjectedDigests(dataDir).length > 0;
-			if (rules.length === 0 && skills.length === 0 && !pendingReflection) {
+			const injected = listInjectedDigests(dataDir);
+			if (injected.length > 0) hasInjectedDigests = true;
+			if (rules.length === 0 && skills.length === 0 && injected.length === 0) {
 				host.ui.setStatus("ouroboros", undefined);
 				return;
 			}
 			const parts = [`⟳ ${rules.length} rules`];
 			if (skills.length > 0) parts.push(`${skills.length} skills`);
-			if (pendingReflection) parts.push("reflection queued");
+			if (injected.length > 0) parts.push("reflection queued");
 			host.ui.setStatus("ouroboros", parts.join(" · "));
 		} catch {
 			// best-effort (print/rpc/teardown)
@@ -143,7 +145,10 @@ export default function (pi: ExtensionAPI): void {
 
 	pi.on("session_start", (_event, ctx) => {
 		uiHost = ctx as unknown as UiHost;
-		const pending = listDigests(dataDir);
+		// Bounded scan: at most the newest 5 digests are ever loaded. Anything
+		// older is stale (a digest is consumed on the first session start
+		// after it is written) and is deleted by filename without parsing.
+		const pending = listDigests(dataDir).slice(0, 5);
 		let injected = false;
 		for (const sid of pending) {
 			// One corrupt digest must not block the rest.
@@ -179,23 +184,28 @@ export default function (pi: ExtensionAPI): void {
 					{ deliverAs: "nextTurn" },
 				);
 				reflectQueued = true;
+				hasInjectedDigests = true;
 				injected = true;
 			} catch {
 				// best-effort — one bad digest must not stall the rest
 			}
 		}
+		// Delete any digests beyond the scan window without parsing them.
+		for (const sid of listDigests(dataDir).slice(5)) {
+			deleteDigest(dataDir, sid);
+		}
 		updateStatus();
 	});
 
-	// ------------------------------------------------------------------
-	// Every turn: inject self-learned rules into the system prompt
-	// ------------------------------------------------------------------
-
 	pi.on("before_agent_start", (event) => {
 		// The queued reflection is delivered in this turn — clean up any
-		// injected digests that were never consumed.
-		for (const sid of listInjectedDigests(dataDir)) {
-			deleteInjectedDigest(dataDir, sid);
+		// injected digests that were never consumed. Skipped entirely when
+		// nothing was injected (the common case): zero file IO per turn.
+		if (hasInjectedDigests) {
+			for (const sid of listInjectedDigests(dataDir)) {
+				deleteInjectedDigest(dataDir, sid);
+			}
+			hasInjectedDigests = false;
 		}
 		reflectQueued = false;
 		const rules = loadRules(dataDir);

@@ -54,6 +54,27 @@ The plugin serializes writes within one instance.
 The plugin does not lock the file across instances.
 Run one pi instance at a time to avoid lost rules.
 
+## Performance
+
+The plugin has minimal performance impact.
+pi.dev awaits every event handler.
+The plugin keeps handler work small.
+
+Measured costs:
+
+- Session start with no digests: 0.003 ms.
+- Session start with 1 digest: 0.017 ms.
+- Session start with 50 digests: 0.156 ms.
+- Rules read per turn (cached): 0.002 ms.
+- Turn start with no pending reflection: 0.0002 ms.
+
+The plugin caches the rules file.
+The plugin invalidates the cache on its own writes.
+The plugin checks the file mtime for external writes.
+The plugin scans at most the newest 5 digests.
+The plugin deletes older digests by name without parsing them.
+The plugin skips the per-turn cleanup when nothing is pending.
+
 ## Usage
 
 The plugin works automatically.

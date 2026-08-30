@@ -57,17 +57,32 @@ export function skillsDir(dataDir: string): string {
 // Rules
 // ---------------------------------------------------------------------------
 
+/** In-memory rules cache: rules are read every turn, so avoid re-reading. */
+let rulesCache: { file: string; mtimeMs: number; rules: string[] } | null = null;
+
 /** Load rules as a list of non-empty lines (comments starting with `#` kept). */
 export function loadRules(dataDir: string): string[] {
+	const file = rulesFile(dataDir);
 	try {
-		const text = fs.readFileSync(rulesFile(dataDir), "utf8");
-		return text
+		const stat = fs.statSync(file);
+		if (rulesCache && rulesCache.file === file && rulesCache.mtimeMs === stat.mtimeMs) {
+			return rulesCache.rules;
+		}
+		const text = fs.readFileSync(file, "utf8");
+		const rules = text
 			.split("\n")
 			.map((l) => l.trim())
 			.filter((l) => l.length > 0);
+		rulesCache = { file, mtimeMs: stat.mtimeMs, rules };
+		return rules;
 	} catch {
 		return [];
 	}
+}
+
+/** Drop the cache after our own writes (mtime alone can miss same-ms writes). */
+function invalidateRulesCache(): void {
+	rulesCache = null;
 }
 
 /**
@@ -95,15 +110,16 @@ export async function appendRule(
 	});
 }
 
-export function clearRules(dataDir: string): void {
-	writeRules(dataDir, []);
-}
-
 function writeRules(dataDir: string, rules: string[]): void {
 	const file = rulesFile(dataDir);
 	fs.mkdirSync(path.dirname(file), { recursive: true });
 	const body = rules.length > 0 ? `${rules.join("\n")}\n` : "";
 	atomicWrite(file, body);
+	invalidateRulesCache();
+}
+
+export function clearRules(dataDir: string): void {
+	writeRules(dataDir, []);
 }
 
 // ---------------------------------------------------------------------------
