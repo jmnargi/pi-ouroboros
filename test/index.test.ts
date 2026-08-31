@@ -610,10 +610,13 @@ describe("session_start", () => {
 	test("a mismatched pending digest AFTER a valid injection is still deleted (TQ-27-02)", async () => {
 		// The mismatch check must run before the injected-flag
 		// short-circuit: a crafted mismatched digest that follows a valid
-		// injection must be deleted, not kept pending.
-		saveDigest(dataDir, buildDigest(notableEntries("sess-1"), "sess-1", "/proj", "2026-08-30T12:00:00.000Z"));
+		// injection must be deleted, not kept pending. The crafted file
+		// is written FIRST so it is OLDER (listDigests sorts mtime-DESC)
+		// and processed after the valid injection.
 		const crafted = buildDigest(notableEntries("def"), "def", "/proj", "2026-08-30T12:00:00.000Z");
+		mkdirSync(digestsDir(dataDir), { recursive: true });
 		writeFileSync(join(digestsDir(dataDir), "abc.json"), JSON.stringify({ ...crafted, sessionId: "def" }));
+		saveDigest(dataDir, buildDigest(notableEntries("sess-1"), "sess-1", "/proj", "2026-08-30T12:00:00.000Z"));
 		const handler = api.fire.bind(api, "session_start");
 		await handler({}, fakeCtx());
 		expect(api.messages).toHaveLength(1);
@@ -633,6 +636,38 @@ describe("session_start", () => {
 		await handler({}, fakeCtx());
 		expect(api.messages).toHaveLength(1);
 		expect(api.messages[0]!.message.content).toContain("sess.1");
+	});
+	test("the recovery loop accepts a legacy-hashed marker (TQ-27-LEGACY)", async () => {
+		const raw = "sess.1";
+		const legacy = legacySessionId(raw);
+		const d = buildDigest(notableEntries("sess-1"), "sess-1", "/proj", "2026-08-30T12:00:00.000Z");
+		mkdirSync(digestsDir(dataDir), { recursive: true });
+		writeFileSync(join(digestsDir(dataDir), `${legacy}.injected.json`), JSON.stringify({ ...d, sessionId: raw }));
+		const handler = api.fire.bind(api, "session_start");
+		await handler({}, fakeCtx());
+		expect(api.messages).toHaveLength(1);
+		expect(api.messages[0]!.message.content).toContain("sess.1");
+	});
+	test("the reload branch keeps a legacy-hashed marker (TQ-27-LEGACY)", async () => {
+		const raw = "sess.1";
+		const legacy = legacySessionId(raw);
+		const d = buildDigest(notableEntries("sess-1"), "sess-1", "/proj", "2026-08-30T12:00:00.000Z");
+		mkdirSync(digestsDir(dataDir), { recursive: true });
+		writeFileSync(join(digestsDir(dataDir), `${legacy}.injected.json`), JSON.stringify({ ...d, sessionId: raw }));
+		const handler = api.fire.bind(api, "session_start");
+		await handler({ reason: "reload" }, fakeCtx());
+		expect(readdirSync(digestsDir(dataDir))).toEqual([`${legacy}.injected.json`]);
+	});
+	test("the agent_end loop keeps a legacy-hashed marker (TQ-27-LEGACY)", async () => {
+		const raw = "sess.1";
+		const legacy = legacySessionId(raw);
+		const d = buildDigest(notableEntries("sess-1"), "sess-1", "/proj", "2026-08-30T12:00:00.000Z");
+		mkdirSync(digestsDir(dataDir), { recursive: true });
+		writeFileSync(join(digestsDir(dataDir), `${legacy}.injected.json`), JSON.stringify({ ...d, sessionId: raw }));
+		const handler = api.fire.bind(api, "session_start");
+		await handler({ reason: "reload" }, fakeCtx());
+		await api.fire("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }] });
+		expect(readdirSync(digestsDir(dataDir))).toEqual([`${legacy}.injected.json`]);
 	});
 	test("sendMessage failure on a RECOVERED digest keeps the marker (TestQuality3)", async () => {
 		// The marker is the atomic claim: unmarking would open a pending

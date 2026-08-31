@@ -610,17 +610,18 @@ describe("rules", () => {
 		expect(migrated!.errors[0]!.tool).toBe("editevil");
 	});
 	test("the extended control-char class is stripped in every persistence path (TQ-R23-01)", async () => {
-		// All 17 chars: the old 4 plus the round-25 additions.
-		const dirty = "a\u061cb\u180ec\ufeffd\u00a0e\u00adf\u034fg\u115fh\u1160i\u17b4j\u17b5k\u3164l\uffa0m\u1680n\u2000o\u202fp\u205fq\u3000r";
+		// All 20 chars: the old 4 plus the round-25 additions plus the
+		// round-27 additions (U+180B, U+FE01, U+E0100).
+		const dirty = "a\u061cb\u180ec\ufeffd\u00a0e\u00adf\u034fg\u115fh\u1160i\u17b4j\u17b5k\u3164l\uffa0m\u1680n\u2000o\u202fp\u205fq\u3000r\u180bs\ufe01t\u{e0100}u";
 		// appendRule: a lesson with the chars is cleaned.
 		const dir = tmpDataDir();
 		await appendRule(dir, dirty);
-		expect(loadRules(dir)).toEqual(["abcdefghijklmnopqr"]);
+		expect(loadRules(dir)).toEqual(["abcdefghijklmnopqrstu"]);
 		// loadRules: a hand-edited rules.md is cleaned on read.
 		const dir2 = tmpDataDir();
 		fs.mkdirSync(path.dirname(rulesFile(dir2)), { recursive: true });
 		fs.writeFileSync(rulesFile(dir2), `- ${dirty}\n`);
-		expect(loadRules(dir2)).toEqual(["- abcdefghijklmnopqr"]);
+		expect(loadRules(dir2)).toEqual(["- abcdefghijklmnopqrstu"]);
 		// migrateDigest: a legacy digest with a dirty model is repaired.
 		const dir3 = tmpDataDir();
 		const file = digestFile(dir3, "sess-legacy");
@@ -628,7 +629,7 @@ describe("rules", () => {
 		fs.writeFileSync(file, JSON.stringify({ ...digest(), models: ["m" + dirty] }));
 		const migrated = loadDigest(dir3, "sess-legacy");
 		expect(migrated).not.toBeNull();
-		expect(migrated!.models[0]).toBe("mabcdefghijklmnopqr");
+		expect(migrated!.models[0]).toBe("mabcdefghijklmnopqrstu");
 		// stopReasons: a crafted key with a bidi control is cleaned by
 		// migrateDigest before validation (the key never reaches the
 		// reflection).
@@ -640,11 +641,11 @@ describe("rules", () => {
 		expect(keyed).not.toBeNull();
 		expect(keyed!.stopReasons).toEqual({ okreason: 1 });
 		// normalizeDescription: a skill description is cleaned.
-		expect(normalizeDescription("d" + dirty)).toBe("dabcdefghijklmnopqr");
+		expect(normalizeDescription("d" + dirty)).toBe("dabcdefghijklmnopqrstu");
 		// writeSkill: a skill body with the chars is cleaned.
 		const dir5 = tmpDataDir();
 		writeSkill(dir5, "ok-name", "desc", "# Body\n" + dirty);
-		expect(fs.readFileSync(path.join(dir5, "skills", "ok-name", "SKILL.md"), "utf8")).toContain("abcdefghijklmnopqr");
+		expect(fs.readFileSync(path.join(dir5, "skills", "ok-name", "SKILL.md"), "utf8")).toContain("abcdefghijklmnopqrstu");
 	});
 	test("over-bounded arrays stay rejected after migration (TestQuality3)", () => {
 		const dir = tmpDataDir();
