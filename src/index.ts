@@ -500,7 +500,11 @@ export default function (pi: ExtensionAPI): void {
 			} catch {
 				// best-effort — a failed cleanup must not skip the status
 			}
-			hasInjectedDigests = false;
+			// A marker kept for a failed run must re-arm the flag: the
+			// next agent_end (a successful retry) must run the cleanup
+			// again. updateStatus re-arms it only in TUI mode, so derive
+			// it from the surviving markers (RuntimeIntegration20).
+			hasInjectedDigests = listInjectedDigests(dataDir).length > 0;
 			updateStatus();
 		}
 	});

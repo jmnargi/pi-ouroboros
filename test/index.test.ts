@@ -879,6 +879,42 @@ describe("before_agent_start", () => {
 		await api.fire("agent_end", { messages: [{ role: "assistant", stopReason: "error" }] }, fakeCtx({ sessionManager: { getEntries: () => entries } }));
 		expect(readdirSync(digestsDir(dataDir))).toEqual([]);
 	});
+	test("agent_end keeps the marker when a benign assistant PRECEDES the reflection in the history (TQ-R30-01)", async () => {
+		// A resumed session can carry a prior benign assistant message
+		// before the reflection injected at session_start. Only a benign
+		// assistant AFTER the reflection proves it was processed: the
+		// marker must survive a thrown first-call failure. This pins the
+		// ordering semantics of processedInHistory and fails on revert of
+		// the round-30 guard (unconditional delete).
+		saveDigest(dataDir, buildDigest(notableEntries(), "sess-1", "/proj", "2026-08-30T12:00:00.000Z"));
+		await api.fire("session_start", {}, fakeCtx());
+		expect(readdirSync(digestsDir(dataDir))).toEqual(["sess-1.injected.json"]);
+		const entries = [
+			{ type: "message", message: { role: "assistant", stopReason: "stop" } },
+			{ type: "custom_message", customType: OUROBOROS_CUSTOM_TYPE, content: "[Ouroboros] ...\nsession: sess-1\ncwd: /proj" },
+		];
+		await api.fire("agent_end", { messages: [{ role: "assistant", stopReason: "error" }] }, fakeCtx({ sessionManager: { getEntries: () => entries } }));
+		expect(readdirSync(digestsDir(dataDir))).toEqual(["sess-1.injected.json"]);
+	});
+	test("a kept marker re-arms the cleanup for a later successful retry (RuntimeIntegration20)", async () => {
+		// A thrown first-call failure keeps the marker AND must re-arm
+		// hasInjectedDigests: the next agent_end (a successful retry in
+		// the same session) must run the cleanup and delete the marker —
+		// the reflection is in the session history and was processed by
+		// the retry. Without the re-arm, the retry's agent_end skips the
+		// cleanup and the next session start re-injects (double delivery).
+		saveDigest(dataDir, buildDigest(notableEntries(), "sess-1", "/proj", "2026-08-30T12:00:00.000Z"));
+		await api.fire("session_start", {}, fakeCtx());
+		expect(readdirSync(digestsDir(dataDir))).toEqual(["sess-1.injected.json"]);
+		const entries = [{ type: "custom_message", customType: OUROBOROS_CUSTOM_TYPE, content: "[Ouroboros] ...\nsession: sess-1\ncwd: /proj" }];
+		// 1. The first call throws: the marker is kept.
+		await api.fire("agent_end", { messages: [{ role: "assistant", stopReason: "error" }] }, fakeCtx({ sessionManager: { getEntries: () => entries } }));
+		expect(readdirSync(digestsDir(dataDir))).toEqual(["sess-1.injected.json"]);
+		// 2. The retry succeeds: the reflection is in the history, so the
+		// marker is deleted.
+		await api.fire("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }] }, fakeCtx({ sessionManager: { getEntries: () => entries } }));
+		expect(readdirSync(digestsDir(dataDir))).toEqual([]);
+	});
  });
 describe("ouroboros_learn tool", () => {
 	const tool = (): MockTool => api.tools.find((t) => t.name === "ouroboros_learn")!;
