@@ -394,9 +394,45 @@ describe("session_start", () => {
 		markDigestInjected(dataDir, "sess-1");
 		const handler = api.fire.bind(api, "session_start");
 		await handler({ reason: "reload" }, fakeCtx());
+		// The marker survives the reload (the reflection is not in the
+		// history yet) — the agent_end history check deletes it.
+		expect(readdirSync(digestsDir(dataDir))).toEqual(["sess-1.injected.json"]);
 		const entries = [{ type: "custom_message", customType: OUROBOROS_CUSTOM_TYPE, content: "[Ouroboros] ...\nsession: sess-1\ncwd: /proj" }];
 		await api.fire("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }] }, fakeCtx({ sessionManager: { getEntries: () => entries } }));
 		expect(readdirSync(digestsDir(dataDir))).toEqual([]);
+	});
+	test("reload branch isolates one unreadable marker from the rest (TestQuality5)", async () => {
+		// sess-a's marker path is a directory (readInjectedDigest throws);
+		// sess-b's reflection is in the history. The reload branch must
+		// skip sess-a (marker kept) and still delete sess-b's marker.
+		saveDigest(dataDir, buildDigest(notableEntries("sess-a"), "sess-a", "/proj", "2026-08-30T10:00:00.000Z"));
+		markDigestInjected(dataDir, "sess-a");
+		const markerA = join(digestsDir(dataDir), "sess-a.injected.json");
+		rmSync(markerA);
+		mkdirSync(markerA);
+		saveDigest(dataDir, buildDigest(notableEntries("sess-b"), "sess-b", "/proj", "2026-08-30T11:00:00.000Z"));
+		markDigestInjected(dataDir, "sess-b");
+		const entries = [{ type: "custom_message", customType: OUROBOROS_CUSTOM_TYPE, content: "[Ouroboros] ...\nsession: sess-b\ncwd: /proj" }];
+		const handler = api.fire.bind(api, "session_start");
+		await handler({ reason: "reload" }, fakeCtx({ sessionManager: { getEntries: () => entries } }));
+		expect(readdirSync(digestsDir(dataDir)).sort()).toEqual(["sess-a.injected.json"]);
+	});
+	test("agent_end keeps an unreadable marker and deletes a delivered one (TestQuality5)", async () => {
+		// sess-a's marker path is a directory (readInjectedDigest throws —
+		// the marker must survive); sess-b's reflection is in the history
+		// (the marker must be deleted at agent_end).
+		saveDigest(dataDir, buildDigest(notableEntries("sess-a"), "sess-a", "/proj", "2026-08-30T10:00:00.000Z"));
+		markDigestInjected(dataDir, "sess-a");
+		const markerA = join(digestsDir(dataDir), "sess-a.injected.json");
+		rmSync(markerA);
+		mkdirSync(markerA);
+		saveDigest(dataDir, buildDigest(notableEntries("sess-b"), "sess-b", "/proj", "2026-08-30T11:00:00.000Z"));
+		markDigestInjected(dataDir, "sess-b");
+		const handler = api.fire.bind(api, "session_start");
+		await handler({ reason: "reload" }, fakeCtx());
+		const entries = [{ type: "custom_message", customType: OUROBOROS_CUSTOM_TYPE, content: "[Ouroboros] ...\nsession: sess-b\ncwd: /proj" }];
+		await api.fire("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }] }, fakeCtx({ sessionManager: { getEntries: () => entries } }));
+		expect(readdirSync(digestsDir(dataDir))).toEqual(["sess-a.injected.json"]);
 	});
 	test("a recovered digest that is no longer notable has its marker removed (TestQuality3)", async () => {
 		// PI_OUROBOROS_REFLECT_MIN_PROMPTS can be raised between sessions:

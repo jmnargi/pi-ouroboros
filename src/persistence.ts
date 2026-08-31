@@ -88,6 +88,10 @@ export function loadRules(dataDir: string): string[] {
 		if (rulesCache && rulesCache.file === file && rulesCache.mtimeMs === stat.mtimeMs && rulesCache.size === stat.size) {
 			return rulesCache.rules;
 		}
+		// Bound the read: a multi-MB rules.md (model write-tool bypass or
+		// hand-edit) must not be read and split into a giant line array.
+		// The appendRule cap is 3000 chars; 1MB is a generous ceiling.
+		if (stat.size > 1024 * 1024) return [];
 		const text = fs.readFileSync(file, "utf8");
 		// Strip control chars and lone surrogates at the injection boundary
 		// too. Older plugin versions or hand-editing bypass appendRule's
@@ -151,6 +155,7 @@ export function appendRule(
 	// Bypass the negative cache. A rules.md created by another process
 	// within the 1s window must be seen. Otherwise this write would
 	// clobber it.
+	invalidateRulesCache();
 	// Strip control chars and lone surrogates: a rule is injected into the
 	// system prompt verbatim. The cap is by code points — a UTF-16 slice
 	// could split a surrogate pair and store a lone surrogate.
@@ -292,12 +297,21 @@ export function listInjectedDigests(dataDir: string): string[] {
 export function deleteInjectedDigest(dataDir: string, sessionId: string): boolean {
 	if (digestsDirIsSymlink(dataDir)) return false;
 	const file = `${digestFile(dataDir, sessionId).slice(0, -".json".length)}.injected.json`;
-	fs.rmSync(file, { force: true });
-	return true;
+	try {
+		fs.rmSync(file, { force: true });
+		return true;
+	} catch {
+		// Never throw: a failed delete (EACCES, EPERM) must not stall the
+		// reconciliation loops — the marker is retried at the next start.
+		return false;
+	}
 }
 
 
 export function saveDigest(dataDir: string, digest: OuroborosDigest): void {
+	// Never write through a symlinked digests dir: the digest would land
+	// in the target and be silently lost (listDigests returns []).
+	if (digestsDirIsSymlink(dataDir)) return;
 	const file = digestFile(dataDir, digest.sessionId);
 	fs.mkdirSync(path.dirname(file), { recursive: true });
 	atomicWrite(file, `${JSON.stringify(digest, null, 2)}\n`);
@@ -338,9 +352,11 @@ function migrateDigest(p: unknown): unknown {
 					.replace(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g, "")
 			: "";
 	/** Cut by code points: a UTF-16 slice can split a surrogate pair and
-	 * emit a lone surrogate into the reflection. */
+	 * emit a lone surrogate into the reflection. Bound the input first:
+	 * max code points need at most max*2+1 UTF-16 units, so a multi-MB
+	 * string never materializes a multi-MB array. */
 	const cpCut = (s: string, max: number): string => {
-		const chars = Array.from(s);
+		const chars = Array.from(s.slice(0, max * 2 + 1));
 		return chars.length <= max ? s : chars.slice(0, max).join("");
 	};
 	// The round-7 writer stored the header fields RAW and unbounded.
@@ -348,12 +364,13 @@ function migrateDigest(p: unknown): unknown {
 	if (typeof d.cwd === "string") d.cwd = cpCut(strip(d.cwd), 2000);
 	if (typeof d.startedAt === "string") d.startedAt = cpCut(strip(d.startedAt), 100);
 	if (typeof d.endedAt === "string") d.endedAt = cpCut(strip(d.endedAt), 100);
-	// Fields the round-7 writer already bounded are only control-char
-	// stripped. A longer value is corruption and stays rejected.
-	if (Array.isArray(d.userPrompts)) d.userPrompts = d.userPrompts.map((s) => (typeof s === "string" ? strip(s) : s));
-	if (Array.isArray(d.assistantText)) d.assistantText = d.assistantText.map((s) => (typeof s === "string" ? strip(s) : s));
+	// Bound each pass to cap+1 elements: a crafted multi-million-element
+	// array is still rejected by the validator (length > cap) but never
+	// materializes a multi-MB mapped array.
+	if (Array.isArray(d.userPrompts)) d.userPrompts = d.userPrompts.slice(0, 13).map((s) => (typeof s === "string" ? strip(s) : s));
+	if (Array.isArray(d.assistantText)) d.assistantText = d.assistantText.slice(0, 13).map((s) => (typeof s === "string" ? strip(s) : s));
 	if (Array.isArray(d.toolCalls)) {
-		d.toolCalls = d.toolCalls.map((t) => {
+		d.toolCalls = d.toolCalls.slice(0, 21).map((t) => {
 			if (typeof t !== "object" || t === null) return t;
 			const tc = t as { tool?: unknown; args?: unknown };
 			if (typeof tc.tool !== "string" || typeof tc.args !== "string") return t;
@@ -362,7 +379,7 @@ function migrateDigest(p: unknown): unknown {
 		});
 	}
 	if (Array.isArray(d.errors)) {
-		d.errors = d.errors.map((e) => {
+		d.errors = d.errors.slice(0, 21).map((e) => {
 			if (typeof e !== "object" || e === null) return e;
 			const er = e as { tool?: unknown; summary?: unknown };
 			if (typeof er.tool !== "string" || typeof er.summary !== "string") return e;
@@ -373,7 +390,7 @@ function migrateDigest(p: unknown): unknown {
 		});
 	}
 	if (Array.isArray(d.failedCommands)) {
-		d.failedCommands = d.failedCommands.map((c) => {
+		d.failedCommands = d.failedCommands.slice(0, 21).map((c) => {
 			if (typeof c !== "object" || c === null) return c;
 			const fc = c as { command?: unknown; error?: unknown };
 			if (typeof fc.command !== "string" || typeof fc.error !== "string") return c;
@@ -381,19 +398,20 @@ function migrateDigest(p: unknown): unknown {
 		});
 	}
 	// The round-7 writer stored models RAW and unbounded — re-bound both.
-	if (Array.isArray(d.models)) d.models = d.models.map((s) => (typeof s === "string" ? cpCut(strip(s), 200) : s)).slice(0, 20);
+	if (Array.isArray(d.models)) d.models = d.models.slice(0, 21).map((s) => (typeof s === "string" ? cpCut(strip(s), 200) : s)).slice(0, 20);
 	if (typeof d.stopReasons === "object" && d.stopReasons !== null && !Array.isArray(d.stopReasons)) {
 		// Use a null prototype. A '__proto__' key must be an own property.
 		// The writer already uses Object.create(null). The load path must
-		// match.
+		// match. Iterate with for...in: Object.entries would materialize
+		// every key of a crafted object. The loop stops at 20 keys.
 		const cleaned: Record<string, number> = Object.create(null);
-		for (const [k, v] of Object.entries(d.stopReasons as Record<string, unknown>)) {
+		let n = 0;
+		for (const k in d.stopReasons as Record<string, unknown>) {
+			if (++n > 20) break;
 			// Keys are sanitized (the round-7 writer stored them raw); values
 			// are kept as-is so a non-numeric value still fails validation.
 			const key = cpCut(strip(k), 100);
-			if (key && Object.keys(cleaned).length < 20) {
-				cleaned[key] = v as number;
-			}
+			if (key) cleaned[key] = (d.stopReasons as Record<string, unknown>)[k] as number;
 		}
 		d.stopReasons = cleaned;
 	}
@@ -449,6 +467,9 @@ export function lastDigestFile(dataDir: string): string {
 }
 
 export function saveLastDigest(dataDir: string, digest: OuroborosDigest): void {
+	// Never write through a symlinked ouroboros dir (same rule as
+	// saveDigest): the file would land in the target and be lost.
+	if (digestsDirIsSymlink(dataDir)) return;
 	try {
 		const file = lastDigestFile(dataDir);
 		fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -457,8 +478,10 @@ export function saveLastDigest(dataDir: string, digest: OuroborosDigest): void {
 		// best-effort — the pending digest is the source of truth
 	}
 }
-
 export function loadLastDigest(dataDir: string): OuroborosDigest | null {
+	// Never read through a symlinked ouroboros dir (same rule as
+	// listDigests): the file would come from the target.
+	if (digestsDirIsSymlink(dataDir)) return null;
 	try {
 		const parsed: unknown = JSON.parse(fs.readFileSync(lastDigestFile(dataDir), "utf8"));
 		const migrated = migrateDigest(parsed);
@@ -471,12 +494,16 @@ export function deleteDigest(dataDir: string, sessionId: string): boolean {
 	if (digestsDirIsSymlink(dataDir)) return false;
 	const file = digestFile(dataDir, sessionId);
 	if (!fs.existsSync(file)) return false;
-	// Use force: true. The file can vanish between the check and the
-	// delete.
-	fs.rmSync(file, { force: true });
-	return true;
+	try {
+		// Use force: true. The file can vanish between the check and the
+		// delete.
+		fs.rmSync(file, { force: true });
+		return true;
+	} catch {
+		// Never throw: a failed delete must not stall the caller.
+		return false;
+	}
 }
-
 export function listDigests(dataDir: string): string[] {
 	if (digestsDirIsSymlink(dataDir)) return [];
 	try {
@@ -515,13 +542,21 @@ export function isValidDigest(p: unknown): p is OuroborosDigest {
 	// them; this is the last line of defense.
 	const LONE_SURROGATE = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
 	// The writer caps by code points. The validator must measure the same
-	// way. Otherwise astral-heavy content would fail validation.
-	const cpLen = (s: string): number => Array.from(s).length;
+	// way. Otherwise astral-heavy content would fail validation. The
+	// counter stops at max+1: a multi-MB string never materializes a
+	// multi-MB array.
+	const cpLen = (s: string, max: number): number => {
+		let n = 0;
+		for (const _ of s) {
+			if (++n > max) return n;
+		}
+		return n;
+	};
 	const clean = (v: unknown, max: number): v is string =>
-		typeof v === "string" && cpLen(v) <= max && !/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f]/.test(v) && !LONE_SURROGATE.test(v);
+		typeof v === "string" && cpLen(v, max) <= max && !/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f]/.test(v) && !LONE_SURROGATE.test(v);
 	const noControl = (s: string): boolean => !/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f]/.test(s) && !LONE_SURROGATE.test(s);
 	const strArr = (v: unknown, max: number, maxLen: number): boolean =>
-		Array.isArray(v) && v.length <= max && v.every((e) => typeof e === "string" && cpLen(e) <= maxLen && noControl(e));
+		Array.isArray(v) && v.length <= max && v.every((e) => typeof e === "string" && cpLen(e, maxLen) <= maxLen && noControl(e));
 	const errArr = (v: unknown, max: number): boolean =>
 		Array.isArray(v) &&
 		v.length <= max &&
@@ -530,10 +565,10 @@ export function isValidDigest(p: unknown): p is OuroborosDigest {
 				typeof e === "object" &&
 				e !== null &&
 				typeof (e as { tool?: unknown }).tool === "string" &&
-				cpLen((e as { tool: string }).tool) <= 100 &&
+				cpLen((e as { tool: string }).tool, 100) <= 100 &&
 				noControl((e as { tool: string }).tool) &&
 				typeof (e as { summary?: unknown }).summary === "string" &&
-				cpLen((e as { summary: string }).summary) <= 200 &&
+				cpLen((e as { summary: string }).summary, 200) <= 200 &&
 				noControl((e as { summary: string }).summary),
 		);
 	const cmdArr = (v: unknown, max: number): boolean =>
@@ -544,10 +579,10 @@ export function isValidDigest(p: unknown): p is OuroborosDigest {
 				typeof e === "object" &&
 				e !== null &&
 				typeof (e as { command?: unknown }).command === "string" &&
-				cpLen((e as { command: string }).command) <= 200 &&
+				cpLen((e as { command: string }).command, 200) <= 200 &&
 				noControl((e as { command: string }).command) &&
 				typeof (e as { error?: unknown }).error === "string" &&
-				cpLen((e as { error: string }).error) <= 200 &&
+				cpLen((e as { error: string }).error, 200) <= 200 &&
 				noControl((e as { error: string }).error),
 		);
 	const toolCallArr = (v: unknown, max: number): boolean =>
@@ -558,12 +593,26 @@ export function isValidDigest(p: unknown): p is OuroborosDigest {
 				typeof e === "object" &&
 				e !== null &&
 				typeof (e as { tool?: unknown }).tool === "string" &&
-				cpLen((e as { tool: string }).tool) <= 100 &&
+				cpLen((e as { tool: string }).tool, 100) <= 100 &&
 				noControl((e as { tool: string }).tool) &&
 				typeof (e as { args?: unknown }).args === "string" &&
-				cpLen((e as { args: string }).args) <= 200 &&
+				cpLen((e as { args: string }).args, 200) <= 200 &&
 				noControl((e as { args: string }).args),
 		);
+	// Bounded key/value scan: Object.keys/Object.values would materialize
+	// every key of a crafted object. The loop stops at 21 keys.
+	const stopReasonsOk = (o: object): boolean => {
+		let n = 0;
+		for (const k in o) {
+			if (++n > 20) return false;
+			if (cpLen(k, 100) > 100) return false;
+			if (/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f]/.test(k)) return false;
+			if (LONE_SURROGATE.test(k)) return false;
+			const v = (o as Record<string, unknown>)[k];
+			if (typeof v !== "number" || !Number.isFinite(v) || v < 0) return false;
+		}
+		return true;
+	};
 	return (
 		d.version === 1 &&
 		clean(d.sessionId, 200) &&
@@ -578,9 +627,7 @@ export function isValidDigest(p: unknown): p is OuroborosDigest {
 		typeof d.stopReasons === "object" &&
 		d.stopReasons !== null &&
 		!Array.isArray(d.stopReasons) &&
-		Object.keys(d.stopReasons).length <= 20 &&
-		Object.keys(d.stopReasons).every((k) => cpLen(k) <= 100 && !/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f]/.test(k) && !LONE_SURROGATE.test(k)) &&
-		Object.values(d.stopReasons).every((v) => typeof v === "number" && Number.isFinite(v) && v >= 0) &&
+		stopReasonsOk(d.stopReasons) &&
 		strArr(d.models, 20, 200) &&
 		isCount(d.compactions) &&
 		isCount(d.messageCount) &&
@@ -727,13 +774,16 @@ export function cleanupStaleTmp(dataDir: string, maxAgeMs: number = 60 * 60 * 10
 		}
 	}
 	try {
-		if (fs.lstatSync(skillsDir(dataDir)).isSymbolicLink()) return;
 		// Only real directories are scanned — a symlinked skill dir must
 		// not make the cleanup delete *.tmp files inside an arbitrary
-		// target (readdirSync follows links).
-		for (const e of fs.readdirSync(skillsDir(dataDir), { withFileTypes: true })) {
-			if (e.isDirectory() && !e.isSymbolicLink()) {
-				dirs.push(path.join(skillsDir(dataDir), e.name));
+		// target (readdirSync follows links). A symlinked skills ROOT
+		// skips only this scan; the ouroboros and digests scans above
+		// still run.
+		if (!fs.lstatSync(skillsDir(dataDir)).isSymbolicLink()) {
+			for (const e of fs.readdirSync(skillsDir(dataDir), { withFileTypes: true })) {
+				if (e.isDirectory() && !e.isSymbolicLink()) {
+					dirs.push(path.join(skillsDir(dataDir), e.name));
+				}
 			}
 		}
 	} catch {
@@ -774,12 +824,17 @@ function atomicWrite(file: string, content: string): void {
 		// make the rename durable before the data blocks. This leaves an
 		// empty file.
 		fs.fsyncSync(fd);
+		fs.closeSync(fd);
+		fs.renameSync(tmp, file);
 	} catch (err) {
-		// A failed write (disk full, IO error) must not leak the tmp.
+		// A failed write or rename (disk full, IO error, EACCES on the
+		// target dir) must not leak the tmp.
+		try {
+			fs.closeSync(fd);
+		} catch {
+			// already closed
+		}
 		fs.rmSync(tmp, { force: true });
 		throw err;
-	} finally {
-		fs.closeSync(fd);
 	}
-	fs.renameSync(tmp, file);
 }

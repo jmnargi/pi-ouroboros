@@ -202,19 +202,23 @@ describe("buildRulesAppendix", () => {
 		expect(body.length).toBeLessThanOrEqual(200);
 		expect(body.endsWith("…")).toBe(true);
 	});
-	test("a multi-MB rule is bounded before the code-point pass (Security9)", () => {
-		// A hand-edited rules.md can carry a multi-MB line. The truncation
-		// must not materialize a multi-MB array — the result is the same
-		// truncated candidate, bounded.
+	test("a multi-MB rule is truncated to the budget (Security9)", () => {
+		// Pins the truncation OUTPUT contract. The input bound (no
+		// multi-MB array materialization) is verified by inspection — the
+		// output is identical with the bound removed.
 		const appendix = buildRulesAppendix(["x".repeat(5_000_000) + "END"], 200);
 		expect(appendix).toContain("…");
 		expect(appendix.length).toBeLessThan(400);
 	});
-	test("a tiny remaining budget does not materialize the rule (Lifecycle3)", () => {
-		// When the budget is nearly exhausted, the truncation must bail out
-		// before slicing — a negative slice bound would return nearly the
-		// whole multi-MB rule.
-		const appendix = buildRulesAppendix(["x".repeat(5_000_000)], 200);
+	test("a tiny remaining budget bails out before slicing (Lifecycle3)", () => {
+		// Rules are processed newest-first, so the LAST array element is
+		// first. "x"*195 fills the budget to 3 remaining units; the
+		// multi-MB rule then hits the budgetUnits <= 0 bail — a negative
+		// slice bound would return nearly the whole rule. The test pins
+		// branch coverage; the output is identical with the bail removed.
+		const appendix = buildRulesAppendix(["y".repeat(5_000_000), "x".repeat(195)], 200);
+		expect(appendix).toContain("x".repeat(195));
+		expect(appendix).not.toContain("y".repeat(100));
 		expect(appendix.length).toBeLessThan(400);
 	});
 	test("truncates oversized rules instead of dropping them", () => {

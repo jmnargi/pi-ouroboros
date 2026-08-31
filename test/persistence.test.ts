@@ -132,6 +132,18 @@ describe("rules", () => {
 		expect(loadRules(dir)[1]).toHaveLength(500);
 		expect(await appendRule(dir, "   ")).toEqual({ added: false, reason: "empty", count: 2, cap: 50 });
 	});
+	test("appendRule bounds a multi-MB lesson before the code-point pass (FixAudit11)", async () => {
+		const dir = tmpDataDir();
+		// The bounded slice (MAX_RULE_CHARS*2+1 units) is verified by
+		// inspection — the output is identical with the bound removed.
+		// This test pins the observable contract: the stored rule is
+		// exactly 500 code points and the tail is cut.
+		const huge = "x".repeat(5_000_000) + "END";
+		expect((await appendRule(dir, huge)).added).toBe(true);
+		const stored = loadRules(dir)[0]!;
+		expect([...stored]).toHaveLength(500);
+		expect(stored.endsWith("END")).toBe(false);
+	});
 
 	test("appendRule calls from one turn do not lose rules", async () => {
 		const dir = tmpDataDir();
@@ -165,6 +177,14 @@ describe("rules", () => {
 		const dir = tmpDataDir();
 		await appendRule(dir, "a rule");
 		clearRules(dir);
+		expect(loadRules(dir)).toEqual([]);
+	});
+	test("loadRules skips a multi-MB rules file (Security10)", () => {
+		const dir = tmpDataDir();
+		fs.mkdirSync(path.dirname(rulesFile(dir)), { recursive: true });
+		// A model write-tool bypass or hand-edit can exceed the 1MB read
+		// bound. The file must not be read and split into a giant array.
+		fs.writeFileSync(rulesFile(dir), "- " + "x".repeat(2 * 1024 * 1024));
 		expect(loadRules(dir)).toEqual([]);
 	});
 
@@ -247,6 +267,19 @@ describe("digests", () => {
 		fs.writeFileSync(path.join(victim, "package.json"), "{}");
 		fs.mkdirSync(path.join(dir, "ouroboros"), { recursive: true });
 		fs.symlinkSync(victim, path.join(dir, "ouroboros", "digests"));
+		expect(listDigests(dir)).toEqual([]);
+		expect(listInjectedDigests(dir)).toEqual([]);
+		expect(deleteDigest(dir, "package")).toBe(false);
+		expect(fs.existsSync(path.join(victim, "package.json"))).toBe(true);
+	});
+	test("a symlinked ouroboros parent is never read or deleted through (TestQuality5)", () => {
+		const dir = tmpDataDir();
+		// A symlinked ouroboros dir makes the digests path resolve inside
+		// the target — the guard's first operand must catch it.
+		const victim = fs.mkdtempSync(path.join(os.tmpdir(), "ouroboros-victim-"));
+		tmpDirs.push(victim);
+		fs.writeFileSync(path.join(victim, "package.json"), "{}");
+		fs.symlinkSync(victim, path.join(dir, "ouroboros"));
 		expect(listDigests(dir)).toEqual([]);
 		expect(listInjectedDigests(dir)).toEqual([]);
 		expect(deleteDigest(dir, "package")).toBe(false);
@@ -536,6 +569,44 @@ describe("digests", () => {
 		cleanupStaleTmp(dir);
 		expect(fs.existsSync(oldTmp)).toBe(true);
 	});
+	test("cleanupStaleTmp does not follow a symlinked digests dir with a real ouroboros parent (TestQuality5)", () => {
+		const dir = tmpDataDir();
+		// The ouroboros dir is real; the digests dir is a symlink to a
+		// victim with an old tmp. The digests-dir lstat must skip it.
+		fs.mkdirSync(path.join(dir, "ouroboros"), { recursive: true });
+		const victim = fs.mkdtempSync(path.join(os.tmpdir(), "ouroboros-target-"));
+		tmpDirs.push(victim);
+		const oldTmp = path.join(victim, "victim.tmp");
+		fs.writeFileSync(oldTmp, "x");
+		const old = new Date(Date.now() - 2 * 60 * 60 * 1000);
+		fs.utimesSync(oldTmp, old, old);
+		fs.symlinkSync(victim, path.join(dir, "ouroboros", "digests"));
+		cleanupStaleTmp(dir);
+		expect(fs.existsSync(oldTmp)).toBe(true);
+	});
+	test("cleanupStaleTmp skips only the skills scan when the skills root is a symlink (FixAudit11)", () => {
+		const dir = tmpDataDir();
+		// The skills root is a symlink to a victim with an old tmp in a
+		// subdir. The skills scan must be skipped (victim tmp survives)
+		// while the ouroboros/digests scans still run (stale tmp in the
+		// real ouroboros dir is cleaned).
+		const victim = fs.mkdtempSync(path.join(os.tmpdir(), "ouroboros-target-"));
+		tmpDirs.push(victim);
+		const victimSub = path.join(victim, "sub");
+		fs.mkdirSync(victimSub, { recursive: true });
+		const victimTmp = path.join(victimSub, "SKILL.md.123.456.0.tmp");
+		fs.writeFileSync(victimTmp, "x");
+		const old = new Date(Date.now() - 2 * 60 * 60 * 1000);
+		fs.utimesSync(victimTmp, old, old);
+		fs.symlinkSync(victim, path.join(dir, "skills"));
+		fs.mkdirSync(path.join(dir, "ouroboros"), { recursive: true });
+		const stale = path.join(dir, "ouroboros", "rules.md.123.456.0.tmp");
+		fs.writeFileSync(stale, "x");
+		fs.utimesSync(stale, old, old);
+		cleanupStaleTmp(dir);
+		expect(fs.existsSync(victimTmp)).toBe(true);
+		expect(fs.existsSync(stale)).toBe(false);
+	});
 	test("writeSkill re-throws a non-EEXIST link error and cleans its tmp (TestQuality4)", () => {
 		const dir = tmpDataDir();
 		// A directory at the SKILL.md path makes linkSync fail with EPERM
@@ -562,18 +633,6 @@ describe("digests", () => {
 		expect(content).not.toContain("desc2");
 		// No leftover tmp files after the EEXIST throw.
 		expect(fs.readdirSync(path.join(dir, "skills", "my-skill")).filter((f) => f.endsWith(".tmp"))).toEqual([]);
-	});
-	test("writeSkill re-throws a non-EEXIST link error and cleans its tmp (TestQuality4)", () => {
-		const dir = tmpDataDir();
-		// A directory at the SKILL.md path makes linkSync fail with EPERM
-		// on Linux. The fallback's openSync(file, "wx") then fails with
-		// EEXIST (the directory exists) — the friendly 'already exists'
-		// error proves the fallback ran (a revert would re-throw the raw
-		// EPERM instead).
-		const skillDir = path.join(dir, "skills", "my-skill");
-		fs.mkdirSync(path.join(skillDir, "SKILL.md"), { recursive: true });
-		expect(() => writeSkill(dir, "my-skill", "desc", "body")).toThrow(/already exists/);
-		expect(fs.readdirSync(skillDir).filter((f) => f.endsWith(".tmp"))).toEqual([]);
 	});
 
 	test("last digest round-trips for /ouroboros digest (UX-2)", () => {
@@ -633,6 +692,31 @@ describe("digests", () => {
 		const base = digest();
 		fs.writeFileSync(file, JSON.stringify({ ...base, toolCalls: [{ tool: "bash", args: "x".repeat(201) }] }));
 		expect(loadDigest(dir, "sess-args")).toBeNull();
+	});
+	test("a crafted multi-MB digest is bounded on load (Security10)", () => {
+		const dir = tmpDataDir();
+		const file = digestFile(dir, "sess-huge");
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		// The bounded counter/cut is verified by inspection (the output is
+		// identical with the bound removed). This pins the observable
+		// contract: a multi-MB header string is repaired to the cap, and
+		// a multi-million-element array is rejected as corrupt.
+		fs.writeFileSync(file, JSON.stringify({ ...digest(), cwd: "x".repeat(5_000_000) }));
+		const loaded = loadDigest(dir, "sess-huge");
+		expect(loaded).not.toBeNull();
+		expect([...loaded!.cwd]).toHaveLength(2000);
+		fs.writeFileSync(file, JSON.stringify({ ...digest(), userPrompts: Array.from({ length: 5_000_000 }, () => "p") }));
+		expect(loadDigest(dir, "sess-huge")).toBeNull();
+	});
+	test("atomicWrite cleans its tmp when the rename fails (Security10)", () => {
+		const dir = tmpDataDir();
+		// A directory at the target path makes renameSync fail (EISDIR)
+		// after the tmp is written. The tmp must be removed and the error
+		// must propagate.
+		const file = digestFile(dir, "sess-dir");
+		fs.mkdirSync(file, { recursive: true });
+		expect(() => saveDigest(dir, { ...digest(), sessionId: "sess-dir" })).toThrow();
+		expect(fs.readdirSync(path.dirname(file)).filter((f) => f.endsWith(".tmp"))).toEqual([]);
 	});
 
 	test("cleanupStaleTmp removes old tmp files and keeps fresh ones", () => {
