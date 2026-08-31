@@ -68,6 +68,19 @@ export function safeSessionId(sessionId: string): string {
 	if (SAFE_ID.test(sessionId) && !sessionId.includes("..")) return sessionId;
 	return hashSessionId(sessionId);
 }
+/** The pre-round-5 djb2 hash scheme (git 3ac74e6): `sid-<base36>`.
+ * Surviving pending digests from that era carry this filename; the
+ * filename/sessionId consistency checks must accept it (FixAudit24). */
+export function legacySessionId(sessionId: string): string {
+	let h = 5381;
+	for (let i = 0; i < sessionId.length; i++) h = ((h << 5) + h + sessionId.charCodeAt(i)) | 0;
+	return `sid-${(h >>> 0).toString(36)}`;
+}
+/** True when a raw sessionId round-trips to the given filename fragment
+ * under the current or the legacy hash scheme. */
+export function sessionIdMatchesFile(raw: string, sid: string): boolean {
+	return safeSessionId(raw) === sid || legacySessionId(raw) === sid;
+}
 
 export function digestFile(dataDir: string, sessionId: string): string {
 	return path.join(digestsDir(dataDir), `${safeSessionId(sessionId)}.json`);
@@ -138,7 +151,7 @@ export function loadRules(dataDir: string): string[] {
 			.split("\n")
 			.map((l) =>
 				l
-					.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u2028-\u202e\p{Cf}\u034f\u115f\u1160\u17b4\u17b5\u180b-\u180d\u3164\uffa0\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000]/gu, "")
+					.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u2028-\u202e\p{Cf}\u034f\u115f\u1160\u17b4\u17b5\u180b-\u180e\ufe00-\ufe0f\u{e0100}-\u{e01ef}\u3164\uffa0\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000]/gu, "")
 					.replace(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g, "")
 					.trim()
 					// Match the write path: collapse whitespace runs so a
@@ -227,7 +240,7 @@ export function appendRule(
 	while (true) {
 		const candidate = rule
 			.slice(0, window)
-			.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u2028-\u202e\p{Cf}\u034f\u115f\u1160\u17b4\u17b5\u180b-\u180d\u3164\uffa0\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000]/gu, "")
+			.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u2028-\u202e\p{Cf}\u034f\u115f\u1160\u17b4\u17b5\u180b-\u180e\ufe00-\ufe0f\u{e0100}-\u{e01ef}\u3164\uffa0\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000]/gu, "")
 			.replace(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g, "")
 			.trim()
 			.replace(/\s+/g, " ");
@@ -471,7 +484,7 @@ function migrateDigest(p: unknown): unknown {
 	const strip = (s: unknown): string =>
 		typeof s === "string"
 			? s
-					.replace(/[\u0000-\u001f\u007f-\u009f\u2028-\u202e\p{Cf}\u034f\u115f\u1160\u17b4\u17b5\u180b-\u180d\u3164\uffa0\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000]/gu, "")
+					.replace(/[\u0000-\u001f\u007f-\u009f\u2028-\u202e\p{Cf}\u034f\u115f\u1160\u17b4\u17b5\u180b-\u180e\ufe00-\ufe0f\u{e0100}-\u{e01ef}\u3164\uffa0\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000]/gu, "")
 					// Lone surrogates (a legacy UTF-16 slice can split a
 					// pair) are removed, not rejected: the digest is
 					// repaired so the reflection is not lost.
@@ -767,8 +780,8 @@ export function isValidDigest(p: unknown): p is OuroborosDigest {
 		return n;
 	};
 	const clean = (v: unknown, max: number): v is string =>
-		typeof v === "string" && cpLen(v, max) <= max && !/[\u0000-\u001f\u007f-\u009f\u2028-\u202e\p{Cf}\u034f\u115f\u1160\u17b4\u17b5\u180b-\u180d\u3164\uffa0\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000]/u.test(v) && !LONE_SURROGATE.test(v);
-	const noControl = (s: string): boolean => !/[\u0000-\u001f\u007f-\u009f\u2028-\u202e\p{Cf}\u034f\u115f\u1160\u17b4\u17b5\u180b-\u180d\u3164\uffa0\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000]/u.test(s) && !LONE_SURROGATE.test(s);
+		typeof v === "string" && cpLen(v, max) <= max && !/[\u0000-\u001f\u007f-\u009f\u2028-\u202e\p{Cf}\u034f\u115f\u1160\u17b4\u17b5\u180b-\u180e\ufe00-\ufe0f\u{e0100}-\u{e01ef}\u3164\uffa0\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000]/u.test(v) && !LONE_SURROGATE.test(v);
+	const noControl = (s: string): boolean => !/[\u0000-\u001f\u007f-\u009f\u2028-\u202e\p{Cf}\u034f\u115f\u1160\u17b4\u17b5\u180b-\u180e\ufe00-\ufe0f\u{e0100}-\u{e01ef}\u3164\uffa0\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000]/u.test(s) && !LONE_SURROGATE.test(s);
 	const strArr = (v: unknown, max: number, maxLen: number): boolean =>
 		Array.isArray(v) && v.length <= max && v.every((e) => typeof e === "string" && cpLen(e, maxLen) <= maxLen && noControl(e));
 	const errArr = (v: unknown, max: number): boolean =>
@@ -820,7 +833,7 @@ export function isValidDigest(p: unknown): p is OuroborosDigest {
 		for (const k in o) {
 			if (++n > 20) return false;
 			if (cpLen(k, 100) > 100) return false;
-			if (/[\u0000-\u001f\u007f-\u009f\u2028-\u202e\p{Cf}\u034f\u115f\u1160\u17b4\u17b5\u180b-\u180d\u3164\uffa0\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000]/u.test(k)) return false;
+			if (/[\u0000-\u001f\u007f-\u009f\u2028-\u202e\p{Cf}\u034f\u115f\u1160\u17b4\u17b5\u180b-\u180e\ufe00-\ufe0f\u{e0100}-\u{e01ef}\u3164\uffa0\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000]/u.test(k)) return false;
 			if (LONE_SURROGATE.test(k)) return false;
 			const v = (o as Record<string, unknown>)[k];
 			if (typeof v !== "number" || !Number.isFinite(v) || v < 0) return false;
@@ -868,7 +881,7 @@ export function isValidSkillName(name: string): boolean {
  * surrogate can make the provider reject the request. */
 export function normalizeDescription(description: string): string {
 	return description
-		.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u2028-\u202e\p{Cf}\u034f\u115f\u1160\u17b4\u17b5\u180b-\u180d\u3164\uffa0\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000]/gu, "")
+		.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u2028-\u202e\p{Cf}\u034f\u115f\u1160\u17b4\u17b5\u180b-\u180e\ufe00-\ufe0f\u{e0100}-\u{e01ef}\u3164\uffa0\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000]/gu, "")
 		.replace(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g, "")
 		.trim()
 		.replace(/\s+/g, " ");
@@ -912,7 +925,7 @@ export function writeSkill(dataDir: string, name: string, description: string, b
 	// frontmatter. The body is also stripped: pi advertises the skill
 	// content in the system prompt.
 	const content = `---\nname: ${name}\ndescription: ${JSON.stringify(normalizeDescription(description))}\n---\n\n${body
-		.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u2028-\u202e\p{Cf}\u034f\u115f\u1160\u17b4\u17b5\u180b-\u180d\u3164\uffa0\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000]/gu, "")
+		.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u2028-\u202e\p{Cf}\u034f\u115f\u1160\u17b4\u17b5\u180b-\u180e\ufe00-\ufe0f\u{e0100}-\u{e01ef}\u3164\uffa0\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000]/gu, "")
 		.replace(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g, "")
 		.trim()}\n`;
 	// The no-overwrite check must be atomic. Two concurrent writers can

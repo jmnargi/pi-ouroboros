@@ -198,7 +198,7 @@ function truncate(s: string, max: number): string {
 	while (true) {
 		cleaned = s
 			.slice(0, bound)
-			.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u2028-\u202e\p{Cf}\u034f\u115f\u1160\u17b4\u17b5\u180b-\u180d\u3164\uffa0\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000]/gu, "")
+			.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u2028-\u202e\p{Cf}\u034f\u115f\u1160\u17b4\u17b5\u180b-\u180e\ufe00-\ufe0f\u{e0100}-\u{e01ef}\u3164\uffa0\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000]/gu, "")
 			.replace(LONE_SURROGATE, "")
 			.trim()
 			.replace(/\s+/g, " ");
@@ -219,7 +219,7 @@ function truncate(s: string, max: number): string {
  * (SEC-18-01). */
 function cleanName(s: string, max: number): string {
 	const cleaned = s
-		.replace(/[\u0000-\u001f\u007f-\u009f\u2028-\u202e\p{Cf}\u034f\u115f\u1160\u17b4\u17b5\u180b-\u180d\u3164\uffa0\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000]/gu, "")
+		.replace(/[\u0000-\u001f\u007f-\u009f\u2028-\u202e\p{Cf}\u034f\u115f\u1160\u17b4\u17b5\u180b-\u180e\ufe00-\ufe0f\u{e0100}-\u{e01ef}\u3164\uffa0\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000]/gu, "")
 		.replace(LONE_SURROGATE, "");
 	if (cleaned.length <= max) return cleaned;
 	return Array.from(cleaned.slice(0, max * 2 + 1))
@@ -239,7 +239,7 @@ function truncateTail(s: string, max: number): string {
 	while (true) {
 		cleaned = s
 			.slice(-bound)
-			.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u2028-\u202e\p{Cf}\u034f\u115f\u1160\u17b4\u17b5\u180b-\u180d\u3164\uffa0\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000]/gu, "")
+			.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u2028-\u202e\p{Cf}\u034f\u115f\u1160\u17b4\u17b5\u180b-\u180e\ufe00-\ufe0f\u{e0100}-\u{e01ef}\u3164\uffa0\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000]/gu, "")
 			.replace(LONE_SURROGATE, "")
 			.trim()
 			.replace(/\s+/g, " ");

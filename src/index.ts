@@ -60,6 +60,7 @@ import {
 	lastDigestFile,
 	readInjectedDigestRawSessionId,
 	readDigestRawSessionId,
+	sessionIdMatchesFile,
 } from "./persistence.ts";
 import { buildReflectionMessage, buildRulesAppendix, escapeTags, formatDigest, OUROBOROS_CUSTOM_TYPE } from "./reflect.ts";
 
@@ -124,10 +125,6 @@ export default function (pi: ExtensionAPI): void {
 	let reflectQueued = false;
 	/** True while injected digests await cleanup — avoids a readdir every turn. */
 	let hasInjectedDigests = false;
-	/** Sids actually queued in the current session_start. agent_end deletes
-	 * only these markers. A recovered-but-not-queued digest keeps its marker
-	 * for the next session start. */
-	let queuedInjected = new Set<string>();
 	const updateStatus = (): void => {
 		const host = uiHost;
 		if (!host?.hasUI) return;
@@ -194,7 +191,6 @@ export default function (pi: ExtensionAPI): void {
 	pi.on("session_start", async (event, ctx) => {
 		uiHost = ctx as unknown as UiHost;
 		reflectQueued = false;
-		queuedInjected = new Set();
 		// Reset the stale flag. A failed run can leave it true. A spurious
 		// marker-deletion pass would do an unnecessary readdir.
 		hasInjectedDigests = false;
@@ -233,7 +229,11 @@ export default function (pi: ExtensionAPI): void {
 						// wrong reflection and delete this marker as
 						// delivered. Plugin-written digests always match
 						// the filename; a mismatch is corrupt (SEC-24-02).
-						if (digest && safeSessionId(readInjectedDigestRawSessionId(dataDir, sid) ?? digest.sessionId) !== sid) {
+						// An unreadable raw id (transient IO) keeps the
+						// marker (FixAudit24); the legacy djb2 hash is
+						// accepted (FixAudit24).
+						const rawSid = readInjectedDigestRawSessionId(dataDir, sid);
+						if (digest && rawSid !== null && !sessionIdMatchesFile(rawSid, sid)) {
 							deleteInjectedDigest(dataDir, sid);
 							continue;
 						}
@@ -276,8 +276,11 @@ export default function (pi: ExtensionAPI): void {
 						continue;
 					}
 					// A filename/sessionId mismatch is a crafted file: the
-					// needle would alias another digest (SEC-24-02).
-					if (digest && safeSessionId(readInjectedDigestRawSessionId(dataDir, sid) ?? digest.sessionId) !== sid) {
+					// needle would alias another digest (SEC-24-02). An
+					// unreadable raw id keeps the marker; the legacy djb2
+					// hash is accepted (FixAudit24).
+					const rawSid = readInjectedDigestRawSessionId(dataDir, sid);
+					if (digest && rawSid !== null && !sessionIdMatchesFile(rawSid, sid)) {
 						deleteInjectedDigest(dataDir, sid);
 						continue;
 					}
@@ -316,7 +319,7 @@ export default function (pi: ExtensionAPI): void {
 				// pending file whose sessionId aliases another digest is
 				// corrupt, not injectable.
 				const rawSid = recoveredSet.has(sid) ? readInjectedDigestRawSessionId(dataDir, sid) : readDigestRawSessionId(dataDir, sid);
-				if (digest && safeSessionId(rawSid ?? digest.sessionId) !== sid) {
+				if (digest && rawSid !== null && !sessionIdMatchesFile(rawSid, sid)) {
 					if (recoveredSet.has(sid)) deleteInjectedDigest(dataDir, sid);
 					else deleteDigest(dataDir, sid);
 					continue;
@@ -359,7 +362,6 @@ export default function (pi: ExtensionAPI): void {
 				}
 				reflectQueued = true;
 				hasInjectedDigests = true;
-				queuedInjected.add(sid);
 				injected = true;
 			} catch {
 				// One bad digest must not stall the rest.
@@ -394,30 +396,17 @@ export default function (pi: ExtensionAPI): void {
 			const last = messages[messages.length - 1] as { stopReason?: unknown } | undefined;
 			if (last?.stopReason === "error" || last?.stopReason === "aborted") return;
 			try {
-				// Delete ONLY the markers queued in this session_start, and
-				// only when the run actually drained the reflection: a turn
-				// started via sendMessage with triggerTurn bypasses the
-				// _pendingNextTurnMessages drain, so the reflection is
-				// still queued and the marker must survive (FixAudit21).
-				// All pending nextTurn messages drain together, so one
-				// ouroboros custom message in the run proves the drain.
-				const drained = messages.some((m) => {
-					const msg = m as { role?: unknown; customType?: unknown };
-					return msg.role === "custom" && msg.customType === OUROBOROS_CUSTOM_TYPE;
-				});
-				if (drained) {
-					for (const sid of queuedInjected) {
-						deleteInjectedDigest(dataDir, sid);
-					}
-				}
-				// A reload re-imported the module, so a marker queued before
-				// the reload is not in queuedInjected. Delete any injected
-				// marker whose reflection is verifiably delivered: in THIS
-				// run's messages (the drained custom message carries the
-				// digest block) or in the session history (a failed run
-				// drained it, and an auto-retry continued from that
-				// context). A marker whose reflection is not delivered
-				// (recovered-but-not-queued) is left for the next recovery.
+				// Delete any injected marker whose reflection is
+				// verifiably delivered: in THIS run's messages (the
+				// drained custom message carries the digest block) or in
+				// the session history (a failed run drained it, and an
+				// auto-retry continued from that context). The needle
+				// check is per-marker: a triggerTurn run that bypassed
+				// the _pendingNextTurnMessages drain carries no needle,
+				// so the marker survives (FixAudit21, SEC-27-01). A
+				// marker whose reflection is not delivered
+				// (recovered-but-not-queued) is left for the next
+				// recovery.
 				const entries = (ctx as unknown as { sessionManager?: { getEntries?: () => unknown[] } } | undefined)?.sessionManager?.getEntries?.() ?? [];
 				for (const sid of listInjectedDigests(dataDir)) {
 					// Per-marker isolation: a transient IO error on one
@@ -430,8 +419,11 @@ export default function (pi: ExtensionAPI): void {
 					}
 					if (!digest) continue;
 					// A filename/sessionId mismatch is a crafted file: the
-					// needle would alias another digest (SEC-24-02).
-					if (safeSessionId(readInjectedDigestRawSessionId(dataDir, sid) ?? digest.sessionId) !== sid) {
+					// needle would alias another digest (SEC-24-02). An
+					// unreadable raw id keeps the marker; the legacy djb2
+					// hash is accepted (FixAudit24).
+					const rawSid = readInjectedDigestRawSessionId(dataDir, sid);
+					if (rawSid !== null && !sessionIdMatchesFile(rawSid, sid)) {
 						deleteInjectedDigest(dataDir, sid);
 						continue;
 					}
@@ -454,7 +446,6 @@ export default function (pi: ExtensionAPI): void {
 			} catch {
 				// best-effort — a failed cleanup must not skip the status
 			}
-			queuedInjected = new Set();
 			hasInjectedDigests = false;
 			updateStatus();
 		}

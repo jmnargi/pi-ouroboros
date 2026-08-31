@@ -250,14 +250,16 @@ describe("buildDigest", () => {
 	test("Cf and Zs format characters are stripped at capture (SEC-25-01)", () => {
 		// U+00AD (soft hyphen, Cf), U+034F (combining grapheme joiner,
 		// Mn), U+115F/U+1160/U+3164/U+FFA0 (Hangul fillers, Lo),
-		// U+17B4/U+17B5 (Mn), U+1680/U+2000/U+202F/U+205F/U+3000 (Zs).
+		// U+17B4/U+17B5 (Mn), U+180E (Mongolian vowel separator, Mn),
+		// U+FE00 (variation selector, Mn), U+1680/U+2000/U+202F/U+205F/
+		// U+3000 (Zs).
 		const d = buildDigest(
-			[userMessage("a\u00adb\u034fc\u115fd\u1160e\u17b4f\u17b5g\u3164h\uffa0i\u1680j\u2000k\u202fl\u205fm\u3000n")],
+			[userMessage("a\u00adb\u034fc\u115fd\u1160e\u17b4f\u17b5g\u3164h\uffa0i\u1680j\u2000k\u202fl\u205fm\u3000n\u180eo\ufe00p")],
 			SID,
 			CWD,
 			END,
 		);
-		expect(d.userPrompts[0]).toBe("abcdefghijklmn");
+		expect(d.userPrompts[0]).toBe("abcdefghijklmnop");
 		expect(isValidDigest(d)).toBe(true);
 	});
 	test("a crafted digest with a soft hyphen or Hangul filler fails validation (SEC-25-01)", () => {
@@ -279,10 +281,13 @@ describe("buildDigest", () => {
 		expect(isValidDigest(d)).toBe(false);
 	});
 	test("the extended control-char class is stripped in every digest path (TQ-R23-01)", () => {
-		const dirty = "a\u061cb\u180ec\ufeffd\u00a0e";
+		// All 17 chars: the old 4 (U+061C, U+180E, U+FEFF, U+00A0) plus
+		// the round-25 additions (U+00AD, U+034F, U+115F, U+1160, U+17B4,
+		// U+17B5, U+3164, U+FFA0, U+1680, U+2000, U+202F, U+205F, U+3000).
+		const dirty = "a\u061cb\u180ec\ufeffd\u00a0e\u00adf\u034fg\u115fh\u1160i\u17b4j\u17b5k\u3164l\uffa0m\u1680n\u2000o\u202fp\u205fq\u3000r";
 		// truncateTail: failed-command errors.
 		const tail = buildDigest([bashFailure("npm test", 1, dirty)], SID, CWD, END);
-		expect(tail.failedCommands[0]!.error).toBe("abcde");
+		expect(tail.failedCommands[0]!.error).toBe("abcdefghijklmnopqr");
 		// cleanName: tool names, models, and the cwd.
 		const named = buildDigest(
 			[entry({ message: { role: "assistant", content: [{ type: "toolCall", id: "c1", name: "bash" + dirty, arguments: { command: "x" } }], stopReason: "toolUse", model: "m" + dirty } })],
@@ -290,9 +295,9 @@ describe("buildDigest", () => {
 			"/proj" + dirty,
 			END,
 		);
-		expect(named.toolCalls[0]!.tool).toBe("bashabcde");
-		expect(named.models[0]).toBe("mabcde");
-		expect(named.cwd).toBe("/projabcde");
+		expect(named.toolCalls[0]!.tool).toBe("bashabcdefghijklmnopqr");
+		expect(named.models[0]).toBe("mabcdefghijklmnopqr");
+		expect(named.cwd).toBe("/projabcdefghijklmnopqr");
 		expect(isValidDigest(named)).toBe(true);
 	});
 	test("usage accumulation clamps instead of overflowing (OURO-SEC-22-02)", () => {
