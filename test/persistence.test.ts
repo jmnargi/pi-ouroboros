@@ -17,12 +17,13 @@ import {
 	lastDigestFile,
 	loadDigest,
 	isValidDigest,
-	readInjectedDigest,
 	loadLastDigest,
 	loadRules,
+	MAX_RULE_WINDOW,
 	listDigests,
 	listInjectedDigests,
 	listSkills,
+	readInjectedDigest,
 	saveDigest,
 	saveLastDigest,
 	markDigestInjected,
@@ -155,11 +156,11 @@ describe("rules", () => {
 	});
 	test("appendRule caps the window: a >16KB garbage prefix loses the lesson (TQ-19-02)", async () => {
 		const dir = tmpDataDir();
-		// 100k control chars exceed MAX_RULE_WINDOW: the window caps at
-		// 16KB, the cleaned prefix is empty, and the lesson is not
-		// scanned. Without the cap the window would grow to 100k and
-		// find the lesson (added: true).
-		const lesson = "\u0000".repeat(100_000) + "real lesson";
+		// MAX_RULE_WINDOW + 1 NULs exceed the cap exactly: the window
+		// caps at 16KB, the cleaned prefix is empty, and the lesson is
+		// not scanned. Without the cap (or with a larger cap) the window
+		// would find the lesson (added: true).
+		const lesson = "\u0000".repeat(MAX_RULE_WINDOW + 1) + "real lesson";
 		expect((await appendRule(dir, lesson)).reason).toBe("empty");
 		expect(loadRules(dir)).toEqual([]);
 	});
@@ -178,6 +179,15 @@ describe("rules", () => {
 		// clearRules must not overwrite the victim.
 		clearRules(dir);
 		expect(fs.readFileSync(path.join(victim, "rules.md"), "utf8")).toBe("- injected rule\n");
+	});
+	test("a DANGLING ouroboros symlink is refused, not followed (TQ19-03)", async () => {
+		const dir = tmpDataDir();
+		// lstatSync (not existsSync) must detect a dangling symlink: the
+		// guard must refuse, not throw EEXIST from mkdirSync.
+		fs.symlinkSync(path.join(dir, "nonexistent-target"), path.join(dir, "ouroboros"));
+		expect(loadRules(dir)).toEqual([]);
+		expect((await appendRule(dir, "new rule")).reason).toBe("symlink");
+		expect(loadLastDigest(dir)).toBeNull();
 	});
 
 	test("appendRule calls from one turn do not lose rules", async () => {
@@ -321,6 +331,18 @@ describe("rules", () => {
 		// The symlink must survive and the target must receive the rule.
 		expect(fs.lstatSync(rulesFile(dir)).isSymbolicLink()).toBe(true);
 		expect(loadRules(dir)).toEqual(["existing rule", "new rule"]);
+	});
+	test("appendRule refuses to destroy a DANGLING rules.md symlink (OURO-SEC-20-01)", async () => {
+		const dir = tmpDataDir();
+		fs.mkdirSync(path.dirname(rulesFile(dir)), { recursive: true });
+		// A symlink to a not-yet-created target: realpathSync throws
+		// ENOENT. The write must refuse, not replace the link with a
+		// regular file.
+		fs.symlinkSync(path.join(dir, "missing-target.md"), rulesFile(dir));
+		await appendRule(dir, "new rule");
+		expect(fs.lstatSync(rulesFile(dir)).isSymbolicLink()).toBe(true);
+		expect(fs.existsSync(path.join(dir, "missing-target.md"))).toBe(false);
+		expect(loadRules(dir)).toEqual([]);
 	});
 });
 describe("digests", () => {

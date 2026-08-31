@@ -391,9 +391,16 @@ export default function (pi: ExtensionAPI): void {
 					}
 					if (!digest) continue;
 					const needle = `\nsession: ${escapeTags(digest.sessionId)}\n`;
+					// Match ONLY the ouroboros custom message: the marker is
+					// the only copy of the digest, so a false positive
+					// would delete an undelivered reflection. The runtime
+					// normalizes user/assistant/toolResult content to
+					// block arrays, so today only the ouroboros message
+					// carries string content — this is defense-in-depth
+					// (OURO-SEC-20-02).
 					const inRun = messages.some((m) => {
-						const content = (m as { content?: unknown })?.content;
-						return typeof content === "string" && content.includes(needle);
+						const msg = m as { role?: unknown; customType?: unknown; content?: unknown };
+						return msg.role === "custom" && msg.customType === OUROBOROS_CUSTOM_TYPE && typeof msg.content === "string" && msg.content.includes(needle);
 					});
 					if (inRun || sessionHasOuroborosMessage(entries, digest.sessionId)) {
 						deleteInjectedDigest(dataDir, sid);
@@ -508,6 +515,13 @@ export default function (pi: ExtensionAPI): void {
 			const sub = (args ?? "").trim().split(/\s+/)[0] ?? "";
 
 			if (sub === "reset") {
+				// The writeRules symlink guard silently no-ops: report the
+				// refusal instead of claiming the rules were cleared
+				// (FixAudit17).
+				if (ouroborosDirIsSymlink(dataDir)) {
+					if (cmdCtx.hasUI) cmdCtx.ui.notify("ouroboros: ouroboros dir is a symlink — refusing to clear rules", "error");
+					return;
+				}
 				try {
 					clearRules(dataDir);
 					updateStatus();

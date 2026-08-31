@@ -155,7 +155,7 @@ npx tsc --noEmit
 ```
 
 The tests cover digest extraction, persistence, prompt building, and the extension entry point.
-The test suite has 205 tests.
+The test suite has 209 tests.
 The reflection happens at the start of the next session.
 The reflection does not happen at shutdown.
 Shutdown must stay fast.

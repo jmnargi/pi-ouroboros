@@ -417,6 +417,19 @@ describe("session_start", () => {
 		await api.fire("agent_end", { messages: [{ role: "custom", customType: OUROBOROS_CUSTOM_TYPE, content: reflection }, { role: "assistant", stopReason: "stop" }] });
 		expect(readdirSync(digestsDir(dataDir))).toEqual([]);
 	});
+	test("agent_end ignores a non-ouroboros string message with the needle (OURO-SEC-20-02)", async () => {
+		// The inRun check must match ONLY the ouroboros custom message: a
+		// crafted string-content message from another extension carrying
+		// the needle must not delete the marker (the marker is the only
+		// copy of the digest).
+		saveDigest(dataDir, buildDigest(notableEntries(), "sess-1", "/proj", "2026-08-30T12:00:00.000Z"));
+		markDigestInjected(dataDir, "sess-1");
+		const handler = api.fire.bind(api, "session_start");
+		await handler({ reason: "reload" }, fakeCtx());
+		const needle = "\nsession: sess-1\n";
+		await api.fire("agent_end", { messages: [{ role: "user", content: "note: " + needle }, { role: "assistant", stopReason: "stop" }] });
+		expect(readdirSync(digestsDir(dataDir))).toEqual(["sess-1.injected.json"]);
+	});
 	test("agent_end keeps a marker whose reflection is NOT in the run's messages (RuntimeIntegration2)", async () => {
 		// A recovered-but-not-queued marker: its reflection was never
 		// delivered, so the run's messages do not contain it — the marker
@@ -715,6 +728,17 @@ describe("ouroboros_learn tool", () => {
 		const result = await t.execute("c1", { kind: "rule", lesson: "new rule" }, undefined, undefined, fakeCtx());
 		expect(result.content[0]!.text).toContain("exceeds 1MB");
 		expect(result.content[0]!.text).not.toContain("concurrent write");
+	});
+	test("kind=rule refuses a symlinked ouroboros dir with the symlink message (TQ19-02)", async () => {
+		const t = tool();
+		const victim = mkdtempSync(join(tmpdir(), "ouroboros-victim-"));
+		symlinkSync(victim, join(dataDir, "ouroboros"));
+		const result = await t.execute("c1", { kind: "rule", lesson: "new rule" }, undefined, undefined, fakeCtx());
+		expect(result.content[0]!.text).toContain("symlink");
+		expect(result.content[0]!.text).not.toContain("rule recorded");
+		// The lesson must not land in the victim.
+		expect(existsSync(join(victim, "rules.md"))).toBe(false);
+		rmSync(victim, { recursive: true, force: true });
 	});
 	test("sendMessage failure restores the digest to pending (defense-in-depth)", async () => {
 		saveDigest(dataDir, buildDigest(notableEntries(), "sess-1", "/proj", "2026-08-30T12:00:00.000Z"));

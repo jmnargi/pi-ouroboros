@@ -4,7 +4,7 @@
 
 import { describe, expect, test } from "bun:test";
 
-import { buildDigest, extractText, isNotable, stringifyArgs } from "../src/digest.ts";
+import { buildDigest, extractText, isNotable, MAX_TRUNCATE_WINDOW, stringifyArgs } from "../src/digest.ts";
 import { isValidDigest } from "../src/persistence.ts";
 
 const SID = "sess-123";
@@ -416,9 +416,12 @@ describe("buildDigest", () => {
 	test("extracts text from string and block content", () => {
 		expect(extractText("plain")).toBe("plain");
 		expect(extractText([{ type: "text", text: "a" }, { type: "text", text: "b" }])).toBe("a\nb");
-	expect(extractText([{ type: "toolCall", name: "bash", arguments: {} }])).toBe("[tool:bash]");
-	expect(extractText(42)).toBe("");
-});
+		expect(extractText([{ type: "toolCall", name: "bash", arguments: {} }])).toBe("[tool:bash]");
+		// Thinking traces must never leak into the digest text
+		// (FixAudit17).
+		expect(extractText([{ type: "thinking", thinking: "hidden" }])).toBe("");
+		expect(extractText(42)).toBe("");
+	});
 	test("a long toolCall name does not drop later text blocks (SEC-19-01)", () => {
 		// The toolCall branch must account for the SLICED name (100), not
 		// the full length: a crafted 10MB name must not inflate the bound
@@ -427,7 +430,8 @@ describe("buildDigest", () => {
 			{ type: "toolCall", name: "x".repeat(10_000), arguments: {} },
 			{ type: "text", text: "after" },
 		]);
-});
+		expect(out).toBe(`[tool:${"x".repeat(100)}]\nafter`);
+	});
 	test("extractText keeps both ends of an oversized block (RuntimeIntegration7)", () => {
 		// truncateTail needs the tail (bash errors put the exit code at
 		// the end); truncate needs the prefix. The block slice must keep
@@ -461,13 +465,14 @@ describe("buildDigest", () => {
 	test("a huge whitespace tail collapses without unbounded work (FixAudit8)", () => {
 		const big = "x".repeat(100) + " ".repeat(5_000_000) + "END";
 		const d = buildDigest([bashFailure("npm test", 1, big)], SID, CWD, END);
-		expect(d.failedCommands[0]!.error).toContain("END");
-	});
+	expect(d.failedCommands[0]!.error).toContain("END");
+});
 	test("truncateTail caps the window: content beyond 16KB from the end is lost (TQ-19-03)", () => {
-		// 'END' + 100k NULs: the window caps at 16KB, the tail slice is
-		// all NULs, and the error falls back to '(no output)'. Without
-		// the cap the window would grow to 100k and find 'END'.
-		const d = buildDigest([bashFailure("npm test", 1, "END" + "\u0000".repeat(100_000))], SID, CWD, END);
+		// 'END' + MAX_TRUNCATE_WINDOW+1 NULs: the window caps at 16KB,
+		// the tail slice is all NULs, and the error falls back to
+		// '(no output)'. Without the cap (or with a larger cap) the
+		// window would reach 'END' and the assertion flips.
+		const d = buildDigest([bashFailure("npm test", 1, "END" + "\u0000".repeat(MAX_TRUNCATE_WINDOW + 1))], SID, CWD, END);
 		expect(d.failedCommands[0]!.error).toBe("(no output)");
 	});
 	test("a stopReason key with an astral char at the boundary is cut by code points (FixAudit8)", () => {

@@ -282,7 +282,17 @@ function writeRules(dataDir: string, rules: string[]): void {
 			file = fs.realpathSync(file);
 		}
 	} catch {
-		// dangling symlink or missing file — write the regular file
+		// Distinguish a dangling symlink from a genuinely missing file:
+		// lstatSync succeeds for a dangling link, so realpathSync's ENOENT
+		// means the target is absent. Writing a regular file over the link
+		// would silently destroy the user's symlink setup (OURO-SEC-20-01).
+		// Refuse instead. Only a truly absent path falls through to the
+		// regular-file write.
+		try {
+			if (fs.lstatSync(file).isSymbolicLink()) return;
+		} catch {
+			// missing file — write the regular file
+		}
 	}
 	fs.mkdirSync(path.dirname(file), { recursive: true });
 	const body = rules.length > 0 ? `${rules.join("\n")}\n` : "";
