@@ -17,7 +17,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import plugin from "../src/index.ts";
 import { buildDigest } from "../src/digest.ts";
 
-import { appendRule, digestsDir, listInjectedDigests, loadRules, markDigestInjected, saveDigest, saveLastDigest, skillsDir } from "../src/persistence.ts";
+import { appendRule, digestsDir, listInjectedDigests, loadRules, markDigestInjected, safeSessionId, saveDigest, saveLastDigest, skillsDir } from "../src/persistence.ts";
 import { OUROBOROS_CUSTOM_TYPE } from "../src/reflect.ts";
 
 type Handler = (...args: unknown[]) => unknown;
@@ -294,11 +294,11 @@ describe("session_start", () => {
 		// The drained custom message is in the run (FixAudit21).
 		await api.fire("agent_end", { messages: [{ role: "custom", customType: OUROBOROS_CUSTOM_TYPE, content: "[Ouroboros] ...\nsession: sess-a\ncwd: /proj" }, { role: "assistant", stopReason: "stop" }] });
 		expect(readdirSync(digestsDir(dataDir))).toEqual(["sess-b.json"]);
-	await handler({}, fakeCtx());
-	expect(api.messages).toHaveLength(2);
-	expect(api.messages[1]!.message.content).toContain("sess-b");
-	expect(readdirSync(digestsDir(dataDir))).toEqual(["sess-b.injected.json"]);
-});
+		await handler({}, fakeCtx());
+		expect(api.messages).toHaveLength(2);
+		expect(api.messages[1]!.message.content).toContain("sess-b");
+		expect(readdirSync(digestsDir(dataDir))).toEqual(["sess-b.injected.json"]);
+	});
 	test("digests marked injected at entry are never deleted as stale (Concurrency2/3)", async () => {
 		// Both sess-a (older) and sess-b (newer) are marked injected at
 		// entry. Both are recovered (markers kept — the atomic claim). The
@@ -530,6 +530,45 @@ describe("session_start", () => {
 		expect(api.messages).toHaveLength(0);
 		expect(readdirSync(digestsDir(dataDir))).toEqual([]);
 	});
+	test("the reload branch deletes a mismatched marker without queuing (TQ-R24-02)", async () => {
+		const crafted = buildDigest(notableEntries("sess-2"), "sess-2", "/proj", "2026-08-30T12:00:00.000Z");
+		saveDigest(dataDir, crafted);
+		markDigestInjected(dataDir, "sess-2");
+		const marker = join(digestsDir(dataDir), "sess-2.injected.json");
+		writeFileSync(marker, JSON.stringify({ ...crafted, sessionId: "sess-1" }));
+		const handler = api.fire.bind(api, "session_start");
+		await handler({ reason: "reload" }, fakeCtx());
+		expect(api.messages).toHaveLength(0);
+		expect(readdirSync(digestsDir(dataDir))).toEqual([]);
+	});
+	test("the agent_end loop deletes a mismatched marker (TQ-R24-02)", async () => {
+		const crafted = buildDigest(notableEntries("sess-2"), "sess-2", "/proj", "2026-08-30T12:00:00.000Z");
+		saveDigest(dataDir, crafted);
+		markDigestInjected(dataDir, "sess-2");
+		const marker = join(digestsDir(dataDir), "sess-2.injected.json");
+		writeFileSync(marker, JSON.stringify({ ...crafted, sessionId: "sess-1" }));
+		const handler = api.fire.bind(api, "session_start");
+		await handler({ reason: "reload" }, fakeCtx());
+		// The run carries sess-2's reflection needle; the mismatched
+		// sessionId must be rejected before the needle is built.
+		await api.fire("agent_end", { messages: [{ role: "custom", customType: OUROBOROS_CUSTOM_TYPE, content: "[Ouroboros] ...\nsession: sess-2\ncwd: /proj" }, { role: "assistant", stopReason: "stop" }] });
+		expect(readdirSync(digestsDir(dataDir))).toEqual([]);
+	});
+	test("a digest with a stripped raw sessionId is NOT deleted as mismatched (FixAudit22)", async () => {
+		// A legacy/crafted digest whose raw id carried a control char: the
+		// writer hashed the RAW id into the filename, and migrateDigest
+		// cleans the stored id. The mismatch check must compare the raw
+		// id so the marker survives and the reflection is injected.
+		const raw = "sess\u00001";
+		const sid = safeSessionId(raw);
+		const d = buildDigest(notableEntries("sess-1"), "sess-1", "/proj", "2026-08-30T12:00:00.000Z");
+		mkdirSync(digestsDir(dataDir), { recursive: true });
+		writeFileSync(join(digestsDir(dataDir), `${sid}.injected.json`), JSON.stringify({ ...d, sessionId: raw }));
+		const handler = api.fire.bind(api, "session_start");
+		await handler({}, fakeCtx());
+		expect(api.messages).toHaveLength(1);
+		expect(api.messages[0]!.message.content).toContain("sess1");
+	});
 	test("sendMessage failure on a RECOVERED digest keeps the marker (TestQuality3)", async () => {
 		// The marker is the atomic claim: unmarking would open a pending
 		// window in which a concurrent instance could delete the digest as
@@ -652,29 +691,32 @@ describe("before_agent_start", () => {
 		await api.fire("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }] });
 		expect(readdirSync(digestsDir(dataDir))).toEqual(["sess-1.injected.json"]);
 	});
-
+	test("agent_end keeps a queued marker when only a NON-ouroboros custom message is in the run (TQ-R24-04)", async () => {
+		// Another extension's triggerTurn custom message does not prove
+		// the ouroboros queue drained: the customType check is the
+		// discriminator, and the marker must survive.
+		saveDigest(dataDir, buildDigest(notableEntries(), "sess-1", "/proj", "2026-08-30T12:00:00.000Z"));
+		await api.fire("session_start", {}, fakeCtx());
+		expect(readdirSync(digestsDir(dataDir))).toEqual(["sess-1.injected.json"]);
+		await api.fire("agent_end", { messages: [{ role: "custom", customType: "other-extension", content: "hello" }, { role: "assistant", stopReason: "stop" }] });
+		expect(readdirSync(digestsDir(dataDir))).toEqual(["sess-1.injected.json"]);
+	});
 	test("agent_end keeps the marker when the run failed (stopReason error)", async () => {
 		saveDigest(dataDir, buildDigest(notableEntries(), "sess-1", "/proj", "2026-08-30T12:00:00.000Z"));
 		await api.fire("session_start", {}, fakeCtx());
 		expect(readdirSync(digestsDir(dataDir))).toEqual(["sess-1.injected.json"]);
-		// A failed run emits agent_end with an error/aborted message — the
-		// reflection was not delivered, so the marker must survive.
-		await api.fire("agent_end", { messages: [{ role: "assistant", stopReason: "error" }] });
+		// A failed run drains the reflection (the custom message is in the
+		// run) but the LLM call failed — the early-return is the ONLY
+		// thing keeping the marker (TQ-R24-01).
+		await api.fire("agent_end", { messages: [{ role: "custom", customType: OUROBOROS_CUSTOM_TYPE, content: "[Ouroboros] ...\nsession: sess-1\ncwd: /proj" }, { role: "assistant", stopReason: "error" }] });
 		expect(readdirSync(digestsDir(dataDir))).toEqual(["sess-1.injected.json"]);
 	});
 	test("agent_end keeps the marker when the run was aborted (stopReason aborted)", async () => {
 		saveDigest(dataDir, buildDigest(notableEntries(), "sess-1", "/proj", "2026-08-30T12:00:00.000Z"));
 		await api.fire("session_start", {}, fakeCtx());
 		expect(readdirSync(digestsDir(dataDir))).toEqual(["sess-1.injected.json"]);
-		await api.fire("agent_end", { messages: [{ role: "assistant", stopReason: "aborted" }] });
+		await api.fire("agent_end", { messages: [{ role: "custom", customType: OUROBOROS_CUSTOM_TYPE, content: "[Ouroboros] ...\nsession: sess-1\ncwd: /proj" }, { role: "assistant", stopReason: "aborted" }] });
 		expect(readdirSync(digestsDir(dataDir))).toEqual(["sess-1.injected.json"]);
-	});
-	test("agent_end deletes the marker when the last message is benign", async () => {
-		saveDigest(dataDir, buildDigest(notableEntries(), "sess-1", "/proj", "2026-08-30T12:00:00.000Z"));
-		await api.fire("session_start", {}, fakeCtx());
-		// The drained custom message is in the run (FixAudit21).
-		await api.fire("agent_end", { messages: [{ role: "custom", customType: OUROBOROS_CUSTOM_TYPE, content: "[Ouroboros] ...\nsession: sess-1\ncwd: /proj" }, { role: "assistant", stopReason: "stop" }] });
-		expect(readdirSync(digestsDir(dataDir))).toEqual([]);
 	});
  });
 describe("ouroboros_learn tool", () => {

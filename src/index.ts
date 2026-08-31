@@ -58,6 +58,7 @@ import {
 	saveLastDigest,
 	safeSessionId,
 	lastDigestFile,
+	readInjectedDigestRawSessionId,
 } from "./persistence.ts";
 import { buildReflectionMessage, buildRulesAppendix, escapeTags, formatDigest, OUROBOROS_CUSTOM_TYPE } from "./reflect.ts";
 
@@ -231,7 +232,7 @@ export default function (pi: ExtensionAPI): void {
 						// wrong reflection and delete this marker as
 						// delivered. Plugin-written digests always match
 						// the filename; a mismatch is corrupt (SEC-24-02).
-						if (digest && safeSessionId(digest.sessionId) !== sid) {
+						if (digest && safeSessionId(readInjectedDigestRawSessionId(dataDir, sid) ?? digest.sessionId) !== sid) {
 							deleteInjectedDigest(dataDir, sid);
 							continue;
 						}
@@ -275,7 +276,7 @@ export default function (pi: ExtensionAPI): void {
 					}
 					// A filename/sessionId mismatch is a crafted file: the
 					// needle would alias another digest (SEC-24-02).
-					if (digest && safeSessionId(digest.sessionId) !== sid) {
+					if (digest && safeSessionId(readInjectedDigestRawSessionId(dataDir, sid) ?? digest.sessionId) !== sid) {
 						deleteInjectedDigest(dataDir, sid);
 						continue;
 					}
@@ -420,7 +421,7 @@ export default function (pi: ExtensionAPI): void {
 					if (!digest) continue;
 					// A filename/sessionId mismatch is a crafted file: the
 					// needle would alias another digest (SEC-24-02).
-					if (safeSessionId(digest.sessionId) !== sid) {
+					if (safeSessionId(readInjectedDigestRawSessionId(dataDir, sid) ?? digest.sessionId) !== sid) {
 						deleteInjectedDigest(dataDir, sid);
 						continue;
 					}

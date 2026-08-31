@@ -247,6 +247,18 @@ describe("buildDigest", () => {
 		expect(d.userPrompts[0]).toBe("abcde");
 		expect(isValidDigest(d)).toBe(true);
 	});
+	test("Cf and Zs format characters are stripped at capture (SEC-25-01)", () => {
+		// U+00AD (soft hyphen, Cf), U+034F (combining grapheme joiner,
+		// Cf), U+2000 (en quad, Zs), U+3000 (ideographic space, Zs).
+		const d = buildDigest([userMessage("a\u00adb\u034fc\u2000d\u3000e")], SID, CWD, END);
+		expect(d.userPrompts[0]).toBe("abcde");
+		expect(isValidDigest(d)).toBe(true);
+	});
+	test("a crafted digest with a soft hyphen fails validation (SEC-25-01)", () => {
+		const d = buildDigest([userMessage("hi")], SID, CWD, END);
+		(d as { userPrompts: string[] }).userPrompts = ["a\u00adb"];
+		expect(isValidDigest(d)).toBe(false);
+	});
 	test("a crafted digest with a bidi control fails validation (OURO-SEC-22-01)", () => {
 		// The validator must reject the extended class too: a hand-crafted
 		// digest carrying any of the four chars is corrupt, not

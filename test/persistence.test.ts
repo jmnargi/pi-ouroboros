@@ -454,6 +454,20 @@ describe("rules", () => {
 		expect(deleteDigest(dir, "sess-link")).toBe(true);
 		expect(fs.existsSync(victim)).toBe(true);
 	});
+	test("a symlinked INJECTED marker is never read through (TQ-R24-03)", () => {
+		const dir = tmpDataDir();
+		const victim = path.join(dir, "victim-injected.json");
+		fs.writeFileSync(victim, JSON.stringify(digest()));
+		const marker = `${digestFile(dir, "sess-link").slice(0, -".json".length)}.injected.json`;
+		fs.mkdirSync(path.dirname(marker), { recursive: true });
+		fs.symlinkSync(victim, marker);
+		// The listing must skip the link; the loader must refuse it.
+		expect(listInjectedDigests(dir)).toEqual([]);
+		expect(readInjectedDigest(dir, "sess-link")).toBeNull();
+		// The link itself is removed, never the target.
+		expect(deleteInjectedDigest(dir, "sess-link")).toBe(true);
+		expect(fs.existsSync(victim)).toBe(true);
+	});
 	test("a symlinked ouroboros parent is never read or deleted through (TestQuality5)", () => {
 		const dir = tmpDataDir();
 		// A symlinked ouroboros dir makes the digests path resolve inside
