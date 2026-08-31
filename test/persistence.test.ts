@@ -296,11 +296,12 @@ describe("rules", () => {
 		expect(loadRules(dir)).toEqual(["- external rule", "own rule"]);
 	});
 	test("rulesMissing negative cache is a single entry, cleared by any different-file load", () => {
-		// Pin the clock: the discriminating step must run inside the 1s
-		// negative-cache window, or a multi-entry cache would pass too
-		// (TQ-R23-03).
+		// Freeze the clock: the discriminating step must run inside the
+		// 1s negative-cache window, or a multi-entry cache would pass too
+		// (TQ-R23-03, TQ-28-02).
 		const realNow = Date.now;
-		Date.now = () => realNow();
+		const fixed = realNow();
+		Date.now = () => fixed;
 		try {
 			const dir1 = tmpDataDir();
 			const dir2 = tmpDataDir();

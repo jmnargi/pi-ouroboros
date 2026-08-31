@@ -259,7 +259,9 @@ export function stringifyArgs(args: unknown): string {
 	if (typeof args !== "object" || args === null) return "";
 	try {
 		const bounded = Array.isArray(args) ? args.slice(0, 200) : args;
-		let props = 0;
+		// Start at -1 so the root visit (key "") does not consume a
+		// property slot: exactly 200 properties are kept (SEC-28-02).
+		let props = -1;
 		return JSON.stringify(bounded, (_k, v) => {
 			if (++props > 200) return undefined;
 			// Slice nested arrays too: JSON.stringify renders undefined

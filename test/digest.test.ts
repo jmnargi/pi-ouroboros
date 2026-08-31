@@ -442,6 +442,14 @@ describe("buildDigest", () => {
 		// array — the unbounded form would be full of nulls.
 		expect(out.match(/null/g)?.length ?? 0).toBeLessThanOrEqual(2);
 	});
+	test("stringifyArgs keeps exactly 200 properties (SEC-28-02)", () => {
+		// The root visit must not consume a property slot: a 200-property
+		// object keeps all 200.
+		const obj: Record<string, number> = {};
+		for (let i = 0; i < 200; i++) obj[`k${i}`] = i;
+		const out = stringifyArgs(obj);
+		expect(out.match(/"k\d+":/g)?.length ?? 0).toBe(200);
+	});
 	test("tool names and models with control chars are sanitized at capture (SEC-ROUND8-02)", () => {
 		const d = buildDigest(
 			[

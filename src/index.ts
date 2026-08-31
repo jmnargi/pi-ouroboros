@@ -83,7 +83,9 @@ function envInt(name: string, fallback: number): number {
 	const raw = process.env[name];
 	if (!raw || !/^\d+$/.test(raw)) return fallback;
 	const n = Number.parseInt(raw, 10);
-	return n > 0 ? n : fallback;
+	// A >308-digit string parses to Infinity, which would silently
+	// disable the bound (SEC-28-01).
+	return Number.isFinite(n) && n > 0 ? n : fallback;
 }
 
 /** True when the session entries already contain the reflection for digest
@@ -389,12 +391,21 @@ export default function (pi: ExtensionAPI): void {
 		// Skipped entirely when nothing was injected (the common case):
 		// zero file IO per turn.
 		if (hasInjectedDigests) {
-			// A failed run also emits agent_end. Its message has stopReason
-			// "error" or "aborted". The reflection was not delivered —
-			// keep the marker.
+			// A failed run also emits agent_end. Its last message has
+			// stopReason "error" or "aborted". The reflection is drained
+			// into the FIRST prompt and persisted at message_end BEFORE
+			// the first LLM call. A benign assistant message in the run
+			// proves the first call succeeded, so the reflection was
+			// processed. A run that failed at the first call never
+			// processed it — keep the marker so a new session re-injects
+			// it (TQ-R24-01, RuntimeIntegration18).
 			const messages = (event as { messages?: unknown[] }).messages ?? [];
 			const last = messages[messages.length - 1] as { stopReason?: unknown } | undefined;
-			if (last?.stopReason === "error" || last?.stopReason === "aborted") return;
+			const failed = last?.stopReason === "error" || last?.stopReason === "aborted";
+			const processed = messages.some((m) => {
+				const msg = m as { role?: unknown; stopReason?: unknown };
+				return msg.role === "assistant" && msg.stopReason !== "error" && msg.stopReason !== "aborted";
+			});
 			try {
 				// Delete any injected marker whose reflection is
 				// verifiably delivered: in THIS run's messages (the
@@ -439,7 +450,16 @@ export default function (pi: ExtensionAPI): void {
 						const msg = m as { role?: unknown; customType?: unknown; content?: unknown };
 						return msg.role === "custom" && msg.customType === OUROBOROS_CUSTOM_TYPE && typeof msg.content === "string" && msg.content.includes(needle);
 					});
-					if (inRun || sessionHasOuroborosMessage(entries, digest.sessionId)) {
+					if (inRun && processed) {
+						// The reflection was verifiably delivered and
+						// processed by the model.
+						deleteInjectedDigest(dataDir, sid);
+					} else if (inRun && failed) {
+						// The first LLM call failed: the reflection was
+						// persisted but never processed. Keep the marker
+						// so a new session re-injects it (TQ-R24-01).
+						continue;
+					} else if (sessionHasOuroborosMessage(entries, digest.sessionId)) {
 						deleteInjectedDigest(dataDir, sid);
 					}
 				}

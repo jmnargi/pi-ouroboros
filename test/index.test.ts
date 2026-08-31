@@ -617,6 +617,12 @@ describe("session_start", () => {
 		mkdirSync(digestsDir(dataDir), { recursive: true });
 		writeFileSync(join(digestsDir(dataDir), "abc.json"), JSON.stringify({ ...crafted, sessionId: "def" }));
 		saveDigest(dataDir, buildDigest(notableEntries("sess-1"), "sess-1", "/proj", "2026-08-30T12:00:00.000Z"));
+		// Pin the mtimes: coarse-granularity filesystems can tie the two
+		// writes, and the name tiebreaker would then process the crafted
+		// file first (TQ-28-01).
+		const now = Date.now() / 1000;
+		utimesSync(join(digestsDir(dataDir), "abc.json"), now - 2, now - 2);
+		utimesSync(join(digestsDir(dataDir), "sess-1.json"), now - 1, now - 1);
 		const handler = api.fire.bind(api, "session_start");
 		await handler({}, fakeCtx());
 		expect(api.messages).toHaveLength(1);
@@ -815,9 +821,9 @@ describe("before_agent_start", () => {
 		saveDigest(dataDir, buildDigest(notableEntries(), "sess-1", "/proj", "2026-08-30T12:00:00.000Z"));
 		await api.fire("session_start", {}, fakeCtx());
 		expect(readdirSync(digestsDir(dataDir))).toEqual(["sess-1.injected.json"]);
-		// A failed run drains the reflection (the custom message is in the
-		// run) but the LLM call failed — the early-return is the ONLY
-		// thing keeping the marker (TQ-R24-01).
+		// A failed FIRST call drains the reflection (the custom message is
+		// in the run) but the model never processed it — the marker must
+		// survive so a new session re-injects it (TQ-R24-01).
 		await api.fire("agent_end", { messages: [{ role: "custom", customType: OUROBOROS_CUSTOM_TYPE, content: "[Ouroboros] ...\nsession: sess-1\ncwd: /proj" }, { role: "assistant", stopReason: "error" }] });
 		expect(readdirSync(digestsDir(dataDir))).toEqual(["sess-1.injected.json"]);
 	});
@@ -827,6 +833,24 @@ describe("before_agent_start", () => {
 		expect(readdirSync(digestsDir(dataDir))).toEqual(["sess-1.injected.json"]);
 		await api.fire("agent_end", { messages: [{ role: "custom", customType: OUROBOROS_CUSTOM_TYPE, content: "[Ouroboros] ...\nsession: sess-1\ncwd: /proj" }, { role: "assistant", stopReason: "aborted" }] });
 		expect(readdirSync(digestsDir(dataDir))).toEqual(["sess-1.injected.json"]);
+	});
+	test("agent_end deletes the marker when a LATER turn failed after the reflection was processed (RuntimeIntegration18)", async () => {
+		// The reflection was drained and processed in turn 1 (benign
+		// assistant message); turn 2 failed. The marker must be deleted —
+		// keeping it would re-inject the reflection into a new session
+		// (double delivery).
+		saveDigest(dataDir, buildDigest(notableEntries(), "sess-1", "/proj", "2026-08-30T12:00:00.000Z"));
+		await api.fire("session_start", {}, fakeCtx());
+		expect(readdirSync(digestsDir(dataDir))).toEqual(["sess-1.injected.json"]);
+		await api.fire("agent_end", {
+			messages: [
+				{ role: "custom", customType: OUROBOROS_CUSTOM_TYPE, content: "[Ouroboros] ...\nsession: sess-1\ncwd: /proj" },
+				{ role: "assistant", stopReason: "toolUse" },
+				{ role: "toolResult", toolCallId: "c1", toolName: "bash", content: "ok" },
+				{ role: "assistant", stopReason: "error" },
+			],
+		});
+		expect(readdirSync(digestsDir(dataDir))).toEqual([]);
 	});
  });
 describe("ouroboros_learn tool", () => {
@@ -851,6 +875,20 @@ describe("ouroboros_learn tool", () => {
 		const third = await t.execute("call-3", { kind: "rule", lesson: "rule three" }, undefined, undefined, fakeCtx());
 		expect(third.content[0]!.text).toContain("rule recorded (2/2)");
 		expect(loadRules(dataDir)).toEqual(["rule two", "rule three"]);
+		delete process.env.PI_OUROBOROS_RULES_CAP;
+	});
+	test("kind=rule falls back to the default cap for an Infinity-parsing env value (SEC-28-01)", async () => {
+		// A >308-digit string parses to Infinity, which would silently
+		// disable the cap. envInt must reject it.
+		process.env.PI_OUROBOROS_RULES_CAP = "9".repeat(400);
+		const capped = makeAPI();
+		plugin(capped as unknown as ExtensionAPI);
+		const t = capped.tools.find((x) => x.name === "ouroboros_learn")!;
+		for (let i = 0; i < 51; i++) {
+			await t.execute(`call-${i}`, { kind: "rule", lesson: `rule ${i}` }, undefined, undefined, fakeCtx());
+		}
+		// The default cap is 50: the 51st rule is evicted.
+		expect(loadRules(dataDir)).toHaveLength(50);
 		delete process.env.PI_OUROBOROS_RULES_CAP;
 	});
 	test("kind=rule respects PI_OUROBOROS_RULES_MAX_CHARS (TQ-16-06)", async () => {
