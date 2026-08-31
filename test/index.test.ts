@@ -858,5 +858,17 @@ describe("/ouroboros command", () => {
 		cmd().handler("digest", ctx);
 		expect(notified.join(" ")).toContain("refusing to read");
 		expect(notified.join(" ")).not.toContain("corrupt");
+		rmSync(victim, { recursive: true, force: true });
+	});
+	test("digest subcommand reports a DANGLING last-digest.json symlink (FixAudit20)", () => {
+		// saveLastDigest refuses to replace the dangling link, so the
+		// command must report it instead of 'no digest recorded yet'.
+		mkdirSync(join(dataDir, "ouroboros"), { recursive: true });
+		symlinkSync(join(dataDir, "missing-target.json"), join(dataDir, "ouroboros", "last-digest.json"));
+		const notified: string[] = [];
+		const ctx = fakeCtx({ hasUI: true, ui: { setStatus: () => {}, notify: (m: string) => notified.push(m) } });
+		cmd().handler("digest", ctx);
+		expect(notified.join(" ")).toContain("dangling symlink");
+		expect(notified.join(" ")).not.toContain("no digest recorded");
 	});
 });

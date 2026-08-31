@@ -54,6 +54,7 @@ import {
 	loadLastDigest,
 	ouroborosDirIsSymlink,
 	rulesFileIsDanglingSymlink,
+	lastDigestFileIsDanglingSymlink,
 	lastDigestFile,
 	saveLastDigest,
 } from "./persistence.ts";
@@ -566,6 +567,11 @@ export default function (pi: ExtensionAPI): void {
 					// The guard refused to read — the file is not corrupt
 					// (OURO-17-03).
 					if (cmdCtx.hasUI) cmdCtx.ui.notify("ouroboros: ouroboros dir is a symlink — refusing to read", "error");
+				} else if (lastDigestFileIsDanglingSymlink(dataDir)) {
+					// saveLastDigest refuses to replace the dangling link;
+					// report it instead of 'no digest recorded yet'
+					// (FixAudit20).
+					if (cmdCtx.hasUI) cmdCtx.ui.notify("ouroboros: last-digest.json is a dangling symlink — refusing to read", "error");
 				} else if (existsSync(lastDigestFile(dataDir))) {
 					if (cmdCtx.hasUI) cmdCtx.ui.notify("ouroboros: digest unreadable (corrupt file)", "error");
 				} else if (cmdCtx.hasUI) {

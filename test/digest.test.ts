@@ -240,6 +240,37 @@ describe("buildDigest", () => {
 		expect(d.userPrompts[0]).toBe("abcd");
 		expect(isValidDigest(d)).toBe(true);
 	});
+	test("bidi controls and NBSP are stripped at capture (OURO-SEC-22-01)", () => {
+		// U+061C (bidi control), U+180E, U+FEFF, U+00A0 (NBSP) are outside
+		// the old strip class; they must not reach the digest.
+		const d = buildDigest([userMessage("a\u061cb\u180ec\ufeffd\u00a0e")], SID, CWD, END);
+		expect(d.userPrompts[0]).toBe("abcde");
+		expect(isValidDigest(d)).toBe(true);
+	});
+	test("a crafted digest with a bidi control fails validation (OURO-SEC-22-01)", () => {
+		// The validator must reject the extended class too: a hand-crafted
+		// digest carrying U+061C is corrupt, not injectable.
+		const d = buildDigest([userMessage("hi")], SID, CWD, END);
+		(d as { userPrompts: string[] }).userPrompts = ["a\u061cb"];
+		expect(isValidDigest(d)).toBe(false);
+	});
+	test("usage accumulation clamps instead of overflowing (OURO-SEC-22-02)", () => {
+		// Two crafted 1e308 values would sum to Infinity, JSON.stringify
+		// emits null, and the digest would fail validation and be deleted.
+		const d = buildDigest(
+			[
+				entry({ message: { role: "assistant", content: "x", usage: { input: 1e308, output: 1e308, cost: { total: 1e308 } } } }),
+				entry({ message: { role: "assistant", content: "y", usage: { input: 1e308, output: 1e308, cost: { total: 1e308 } } } }),
+			],
+			SID,
+			CWD,
+			END,
+		);
+		expect(Number.isFinite(d.usage.input)).toBe(true);
+		expect(Number.isFinite(d.usage.output)).toBe(true);
+		expect(Number.isFinite(d.usage.cost)).toBe(true);
+		expect(isValidDigest(d)).toBe(true);
+	});
 
 	test("truncation never splits surrogate pairs and the digest round-trips (SEC-ROUND9-01)", () => {
 		const emoji = "😀".repeat(300); // 600 UTF-16 units, 300 code points

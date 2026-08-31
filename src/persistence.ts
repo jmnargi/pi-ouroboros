@@ -138,7 +138,7 @@ export function loadRules(dataDir: string): string[] {
 			.split("\n")
 			.map((l) =>
 				l
-					.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f]/g, "")
+					.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f\u061c\u180e\ufeff\u00a0]/g, "")
 					.replace(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g, "")
 					.trim()
 					// Match the write path: collapse whitespace runs so a
@@ -227,7 +227,7 @@ export function appendRule(
 	while (true) {
 		const candidate = rule
 			.slice(0, window)
-			.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f]/g, "")
+			.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f\u061c\u180e\ufeff\u00a0]/g, "")
 			.replace(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g, "")
 			.trim()
 			.replace(/\s+/g, " ");
@@ -352,6 +352,18 @@ export function rulesFileIsDanglingSymlink(dataDir: string): boolean {
 		return false; // missing file is fine
 	}
 }
+/** True when last-digest.json is a symlink whose target is absent.
+ * saveLastDigest refuses to replace such a link; the /ouroboros digest
+ * command reports the refusal instead of 'no digest recorded yet'
+ * (FixAudit20). */
+export function lastDigestFileIsDanglingSymlink(dataDir: string): boolean {
+	try {
+		const file = lastDigestFile(dataDir);
+		return fs.lstatSync(file).isSymbolicLink() && !fs.existsSync(file);
+	} catch {
+		return false; // missing file is fine
+	}
+}
 /** True when the digests dir (or its parent) is a symlink. The digest
  * read/delete path must never follow one: a symlinked digests dir would
  * make the plugin read and delete arbitrary *.json files in the target. */
@@ -459,7 +471,7 @@ function migrateDigest(p: unknown): unknown {
 	const strip = (s: unknown): string =>
 		typeof s === "string"
 			? s
-					.replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f]/g, "")
+					.replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f\u061c\u180e\ufeff\u00a0]/g, "")
 					// Lone surrogates (a legacy UTF-16 slice can split a
 					// pair) are removed, not rejected: the digest is
 					// repaired so the reflection is not lost.
@@ -720,8 +732,8 @@ export function isValidDigest(p: unknown): p is OuroborosDigest {
 		return n;
 	};
 	const clean = (v: unknown, max: number): v is string =>
-		typeof v === "string" && cpLen(v, max) <= max && !/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f]/.test(v) && !LONE_SURROGATE.test(v);
-	const noControl = (s: string): boolean => !/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f]/.test(s) && !LONE_SURROGATE.test(s);
+		typeof v === "string" && cpLen(v, max) <= max && !/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f\u061c\u180e\ufeff\u00a0]/.test(v) && !LONE_SURROGATE.test(v);
+	const noControl = (s: string): boolean => !/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f\u061c\u180e\ufeff\u00a0]/.test(s) && !LONE_SURROGATE.test(s);
 	const strArr = (v: unknown, max: number, maxLen: number): boolean =>
 		Array.isArray(v) && v.length <= max && v.every((e) => typeof e === "string" && cpLen(e, maxLen) <= maxLen && noControl(e));
 	const errArr = (v: unknown, max: number): boolean =>
@@ -773,7 +785,7 @@ export function isValidDigest(p: unknown): p is OuroborosDigest {
 		for (const k in o) {
 			if (++n > 20) return false;
 			if (cpLen(k, 100) > 100) return false;
-			if (/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f]/.test(k)) return false;
+			if (/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f\u061c\u180e\ufeff\u00a0]/.test(k)) return false;
 			if (LONE_SURROGATE.test(k)) return false;
 			const v = (o as Record<string, unknown>)[k];
 			if (typeof v !== "number" || !Number.isFinite(v) || v < 0) return false;
@@ -821,7 +833,7 @@ export function isValidSkillName(name: string): boolean {
  * surrogate can make the provider reject the request. */
 export function normalizeDescription(description: string): string {
 	return description
-		.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f]/g, "")
+		.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f\u061c\u180e\ufeff\u00a0]/g, "")
 		.replace(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g, "")
 		.trim()
 		.replace(/\s+/g, " ");
@@ -865,7 +877,7 @@ export function writeSkill(dataDir: string, name: string, description: string, b
 	// frontmatter. The body is also stripped: pi advertises the skill
 	// content in the system prompt.
 	const content = `---\nname: ${name}\ndescription: ${JSON.stringify(normalizeDescription(description))}\n---\n\n${body
-		.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f]/g, "")
+		.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f\u061c\u180e\ufeff\u00a0]/g, "")
 		.replace(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g, "")
 		.trim()}\n`;
 	// The no-overwrite check must be atomic. Two concurrent writers can

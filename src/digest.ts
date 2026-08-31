@@ -198,7 +198,7 @@ function truncate(s: string, max: number): string {
 	while (true) {
 		cleaned = s
 			.slice(0, bound)
-			.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f]/g, "")
+			.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f\u061c\u180e\ufeff\u00a0]/g, "")
 			.replace(LONE_SURROGATE, "")
 			.trim()
 			.replace(/\s+/g, " ");
@@ -219,7 +219,7 @@ function truncate(s: string, max: number): string {
  * (SEC-18-01). */
 function cleanName(s: string, max: number): string {
 	const cleaned = s
-		.replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f]/g, "")
+		.replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f\u061c\u180e\ufeff\u00a0]/g, "")
 		.replace(LONE_SURROGATE, "");
 	if (cleaned.length <= max) return cleaned;
 	return Array.from(cleaned.slice(0, max * 2 + 1))
@@ -239,7 +239,7 @@ function truncateTail(s: string, max: number): string {
 	while (true) {
 		cleaned = s
 			.slice(-bound)
-			.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f]/g, "")
+			.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f\u061c\u180e\ufeff\u00a0]/g, "")
 			.replace(LONE_SURROGATE, "")
 			.trim()
 			.replace(/\s+/g, " ");
@@ -411,9 +411,13 @@ export function buildDigest(
 			}
 			const usage = msg.usage;
 			if (usage) {
-				digest.usage.input += asNumber(usage.input);
-				digest.usage.output += asNumber(usage.output);
-				digest.usage.cost += asNumber(usage.cost?.total);
+				// Clamp the accumulation: two crafted 1e308 values would
+				// sum to Infinity, JSON.stringify emits null, and the
+				// digest would fail validation and be deleted
+				// (OURO-SEC-22-02).
+				digest.usage.input = Math.min(Number.MAX_SAFE_INTEGER, digest.usage.input + asNumber(usage.input));
+				digest.usage.output = Math.min(Number.MAX_SAFE_INTEGER, digest.usage.output + asNumber(usage.output));
+				digest.usage.cost = Math.min(Number.MAX_SAFE_INTEGER, digest.usage.cost + asNumber(usage.cost?.total));
 			}
 			// Remember bash commands so their tool results can be attributed.
 			// Bounded: a long session must not grow this map without limit.

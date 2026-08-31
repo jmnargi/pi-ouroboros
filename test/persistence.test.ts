@@ -304,9 +304,16 @@ describe("rules", () => {
 		fs.mkdirSync(path.dirname(rulesFile(dir2)), { recursive: true });
 		fs.writeFileSync(rulesFile(dir2), "- dir2 rule\n");
 		expect(loadRules(dir2)).toEqual(["- dir2 rule"]);
+		// The single-entry property: the dir2 load cleared dir1's missing
+		// entry, so a NEW dir1 rules file is seen immediately. A
+		// multi-entry cache would still serve the stale missing entry
+		// within the 1s window (TQ-22-02).
+		fs.mkdirSync(path.dirname(rulesFile(dir1)), { recursive: true });
+		fs.writeFileSync(rulesFile(dir1), "- dir1 rule\n");
+		expect(loadRules(dir1)).toEqual(["- dir1 rule"]);
 		// appendRule clears the negative cache: dir1's rules now exist.
 		appendRule(dir1, "own rule");
-		expect(loadRules(dir1)).toEqual(["own rule"]);
+		expect(loadRules(dir1)).toEqual(["- dir1 rule", "own rule"]);
 	});
 	test("appendRule dedupes semantically (case, punctuation, spacing)", async () => {
 		const dir = tmpDataDir();
