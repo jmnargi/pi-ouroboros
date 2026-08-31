@@ -321,6 +321,14 @@ describe("rules", () => {
 		await appendRule(dir, "always\u0000 re-read\u0007 before editing");
 		expect(loadRules(dir)).toEqual(["always re-read before editing"]);
 	});
+	test("loadRules collapses whitespace like the write path (OURO-SEC-21-02)", () => {
+		const dir = tmpDataDir();
+		fs.mkdirSync(path.dirname(rulesFile(dir)), { recursive: true });
+		// A hand-edited rules.md with tabs and repeated spaces must render
+		// like a plugin-written rule.
+		fs.writeFileSync(rulesFile(dir), "- always\t re-read   before editing\n");
+		expect(loadRules(dir)).toEqual(["- always re-read before editing"]);
+	});
 	test("appendRule writes through a symlinked rules.md (Data F12)", async () => {
 		const dir = tmpDataDir();
 		const target = path.join(dir, "linked-rules.md");
@@ -830,6 +838,26 @@ describe("rules", () => {
 		const d = digest();
 		saveLastDigest(dir, d);
 		expect(loadLastDigest(dir)).toEqual(d);
+	});
+	test("saveLastDigest writes through a symlinked last-digest.json (OURO-SEC-21-01)", () => {
+		const dir = tmpDataDir();
+		const target = path.join(dir, "linked-last-digest.json");
+		fs.writeFileSync(target, "{}");
+		fs.mkdirSync(path.dirname(lastDigestFile(dir)), { recursive: true });
+		fs.symlinkSync(target, lastDigestFile(dir));
+		saveLastDigest(dir, digest());
+		// The symlink must survive and the target must receive the digest.
+		expect(fs.lstatSync(lastDigestFile(dir)).isSymbolicLink()).toBe(true);
+		expect(loadLastDigest(dir)).toEqual(digest());
+	});
+	test("saveLastDigest refuses a DANGLING last-digest.json symlink (OURO-SEC-21-01)", () => {
+		const dir = tmpDataDir();
+		fs.mkdirSync(path.dirname(lastDigestFile(dir)), { recursive: true });
+		fs.symlinkSync(path.join(dir, "missing-target.json"), lastDigestFile(dir));
+		saveLastDigest(dir, digest());
+		expect(fs.lstatSync(lastDigestFile(dir)).isSymbolicLink()).toBe(true);
+		expect(fs.existsSync(path.join(dir, "missing-target.json"))).toBe(false);
+		expect(loadLastDigest(dir)).toBeNull();
 	});
 	test("loadLastDigest migrates legacy digests too (FixAudit3 P2)", () => {
 		const dir = tmpDataDir();

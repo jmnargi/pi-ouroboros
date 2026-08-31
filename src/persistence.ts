@@ -140,7 +140,11 @@ export function loadRules(dataDir: string): string[] {
 				l
 					.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f]/g, "")
 					.replace(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g, "")
-					.trim(),
+					.trim()
+					// Match the write path: collapse whitespace runs so a
+					// hand-edited rules.md renders like a plugin-written
+					// one (OURO-SEC-21-02).
+					.replace(/\s+/g, " "),
 			)
 			.filter((l) => l.length > 0);
 		rulesCache = { file, mtimeMs: stat.mtimeMs, size: stat.size, rules };
@@ -609,7 +613,21 @@ export function saveLastDigest(dataDir: string, digest: OuroborosDigest): void {
 	// digests dir does not matter — last-digest.json is not inside it.
 	if (ouroborosDirIsSymlink(dataDir)) return;
 	try {
-		const file = lastDigestFile(dataDir);
+		let file = lastDigestFile(dataDir);
+		// Mirror the rules.md write-through: a symlinked last-digest.json
+		// (dotfiles pattern) must be written through, not replaced by the
+		// atomicWrite rename (OURO-SEC-21-01). A dangling link is refused.
+		try {
+			if (fs.lstatSync(file).isSymbolicLink()) {
+				file = fs.realpathSync(file);
+			}
+		} catch {
+			try {
+				if (fs.lstatSync(file).isSymbolicLink()) return;
+			} catch {
+				// missing file — write the regular file
+			}
+		}
 		fs.mkdirSync(path.dirname(file), { recursive: true });
 		atomicWrite(file, `${JSON.stringify(digest, null, 2)}\n`);
 	} catch {

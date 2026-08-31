@@ -466,14 +466,14 @@ export default function (pi: ExtensionAPI): void {
 				const { added, reason, count, cap } = appendRule(dataDir, params.lesson, rulesCap, rulesMaxChars);
 				updateStatus();
 				const text =
-				reason === "duplicate"
-					? `duplicate rule skipped (${count}/${cap})`
-					: reason === "empty"
-						? "rule not recorded — lesson is empty after normalization"
-						: reason === "too-large"
-							? "rule not recorded — rules.md exceeds 1MB; trim it manually"
-							: reason === "symlink"
-								? "rule not recorded — a symlink is in the way; refusing to write"
+					reason === "duplicate"
+						? `duplicate rule skipped (${count}/${cap})`
+						: reason === "empty"
+							? "rule not recorded — lesson is empty after normalization"
+							: reason === "too-large"
+								? "rule not recorded — rules.md exceeds 1MB; trim it manually"
+								: reason === "symlink"
+									? "rule not recorded — a symlink is in the way; refusing to write"
 									: reason === "conflict"
 										? `rule not recorded — concurrent write (${count}/${cap})`
 										: `rule recorded (${count}/${cap}) — active from next turn`;

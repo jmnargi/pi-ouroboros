@@ -17,7 +17,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import plugin from "../src/index.ts";
 import { buildDigest } from "../src/digest.ts";
 
-import { appendRule, digestsDir, loadRules, markDigestInjected, saveDigest, saveLastDigest, skillsDir } from "../src/persistence.ts";
+import { appendRule, digestsDir, listInjectedDigests, loadRules, markDigestInjected, saveDigest, saveLastDigest, skillsDir } from "../src/persistence.ts";
 import { OUROBOROS_CUSTOM_TYPE } from "../src/reflect.ts";
 
 type Handler = (...args: unknown[]) => unknown;
@@ -400,6 +400,9 @@ describe("session_start", () => {
 		mkdirSync(markerA);
 		saveDigest(dataDir, buildDigest(notableEntries("sess-b"), "sess-b", "/proj", "2026-08-30T11:00:00.000Z"));
 		markDigestInjected(dataDir, "sess-b");
+		// The listing filter is what skips the directory marker: without
+		// it the listing would include sess-a (TQ-21-01).
+		expect(listInjectedDigests(dataDir)).toEqual(["sess-b"]);
 		const handler = api.fire.bind(api, "session_start");
 		await handler({}, fakeCtx());
 		expect(api.messages).toHaveLength(1);
@@ -471,6 +474,8 @@ describe("session_start", () => {
 		mkdirSync(markerA);
 		saveDigest(dataDir, buildDigest(notableEntries("sess-b"), "sess-b", "/proj", "2026-08-30T11:00:00.000Z"));
 		markDigestInjected(dataDir, "sess-b");
+		// The listing filter is what skips the directory marker (TQ-21-01).
+		expect(listInjectedDigests(dataDir)).toEqual(["sess-b"]);
 		const entries = [{ type: "custom_message", customType: OUROBOROS_CUSTOM_TYPE, content: "[Ouroboros] ...\nsession: sess-b\ncwd: /proj" }];
 		const handler = api.fire.bind(api, "session_start");
 		await handler({ reason: "reload" }, fakeCtx({ sessionManager: { getEntries: () => entries } }));
@@ -487,6 +492,8 @@ describe("session_start", () => {
 		mkdirSync(markerA);
 		saveDigest(dataDir, buildDigest(notableEntries("sess-b"), "sess-b", "/proj", "2026-08-30T11:00:00.000Z"));
 		markDigestInjected(dataDir, "sess-b");
+		// The listing filter is what skips the directory marker (TQ-21-01).
+		expect(listInjectedDigests(dataDir)).toEqual(["sess-b"]);
 		const handler = api.fire.bind(api, "session_start");
 		await handler({ reason: "reload" }, fakeCtx());
 		const entries = [{ type: "custom_message", customType: OUROBOROS_CUSTOM_TYPE, content: "[Ouroboros] ...\nsession: sess-b\ncwd: /proj" }];
@@ -737,7 +744,7 @@ describe("ouroboros_learn tool", () => {
 		const victim = mkdtempSync(join(tmpdir(), "ouroboros-victim-"));
 		symlinkSync(victim, join(dataDir, "ouroboros"));
 		const result = await t.execute("c1", { kind: "rule", lesson: "new rule" }, undefined, undefined, fakeCtx());
-		expect(result.content[0]!.text).toContain("symlink");
+		expect(result.content[0]!.text).toContain("a symlink is in the way");
 		expect(result.content[0]!.text).not.toContain("rule recorded");
 		// The lesson must not land in the victim.
 		expect(existsSync(join(victim, "rules.md"))).toBe(false);
