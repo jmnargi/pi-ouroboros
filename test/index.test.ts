@@ -8,7 +8,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -279,6 +279,24 @@ describe("session_start", () => {
 		expect(api.messages).toHaveLength(1);
 		expect(api.messages[0]!.message.content).toContain("sess-a");
 		expect(readdirSync(digestsDir(dataDir)).sort()).toEqual(["sess-a.injected.json", "sess-b.json"]);
+	});
+	test("a kept notable pending digest is injected at the SECOND session start (TQ-17-06)", async () => {
+		// start1: recovered A is injected, notable pending B is kept.
+		// agent_end deletes only A's marker. start2: B is injected.
+		saveDigest(dataDir, buildDigest(notableEntries("sess-a"), "sess-a", "/proj", "2026-08-30T10:00:00.000Z"));
+		markDigestInjected(dataDir, "sess-a");
+		saveDigest(dataDir, buildDigest(notableEntries("sess-b"), "sess-b", "/proj", "2026-08-30T11:00:00.000Z"));
+		const handler = api.fire.bind(api, "session_start");
+		await handler({}, fakeCtx());
+		expect(api.messages).toHaveLength(1);
+		expect(api.messages[0]!.message.content).toContain("sess-a");
+		expect(readdirSync(digestsDir(dataDir)).sort()).toEqual(["sess-a.injected.json", "sess-b.json"]);
+		await api.fire("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }] });
+		expect(readdirSync(digestsDir(dataDir))).toEqual(["sess-b.json"]);
+		await handler({}, fakeCtx());
+		expect(api.messages).toHaveLength(2);
+		expect(api.messages[1]!.message.content).toContain("sess-b");
+		expect(readdirSync(digestsDir(dataDir))).toEqual(["sess-b.injected.json"]);
 	});
 	test("digests marked injected at entry are never deleted as stale (Concurrency2/3)", async () => {
 		// Both sess-a (older) and sess-b (newer) are marked injected at
@@ -647,12 +665,13 @@ describe("ouroboros_learn tool", () => {
 		process.env.PI_OUROBOROS_REFLECT_MIN_PROMPTS = "1000";
 		const quiet = makeAPI();
 		plugin(quiet as unknown as ExtensionAPI);
-		// A clean session (no errors, 1 user prompt) is far below the
-		// 1000 threshold: the digest is saved but nothing is queued at
-		// the next session start.
+		// 20 user prompts cross the isNotable floor (max(minPrompts, 20))
+		// at the default 5 but NOT at the wired 1000: the digest is saved
+		// but nothing is queued at the next session start. A revert of
+		// the env wiring would queue a reflection (20 >= 20).
 		const cleanEntries = [
 			{ type: "session", id: "sess-1", cwd: "/proj", timestamp: "2026-08-30T10:00:00.000Z" },
-			{ type: "message", message: { role: "user", content: "hi" } },
+			...Array.from({ length: 20 }, (_, i) => ({ type: "message", message: { role: "user", content: `prompt ${i}` } })),
 		];
 		await quiet.fire("session_shutdown", { reason: "quit" }, fakeCtx({ sessionManager: { getEntries: () => cleanEntries } }));
 		await quiet.fire("session_start", {}, fakeCtx());
@@ -764,5 +783,19 @@ describe("/ouroboros command", () => {
 		const ctx = fakeCtx({ hasUI: true, ui: { setStatus: () => {}, notify: (m: string) => notified.push(m) } });
 		cmd().handler("digest", ctx);
 		expect(notified.join(" ")).toContain("digest unreadable");
+	});
+	test("digest subcommand reports a symlinked ouroboros dir (TQ-17-08)", () => {
+		// The guard refuses to read through a symlinked ouroboros dir —
+		// the message must say so, not claim the file is corrupt.
+		const victim = mkdtempSync(join(tmpdir(), "ouroboros-victim-"));
+		rmSync(victim, { recursive: true, force: true });
+		mkdirSync(victim, { recursive: true });
+		writeFileSync(join(victim, "last-digest.json"), JSON.stringify(buildDigest(notableEntries(), "sess-1", "/proj", "2026-08-30T12:00:00.000Z")));
+		symlinkSync(victim, join(dataDir, "ouroboros"));
+		const notified: string[] = [];
+		const ctx = fakeCtx({ hasUI: true, ui: { setStatus: () => {}, notify: (m: string) => notified.push(m) } });
+		cmd().handler("digest", ctx);
+		expect(notified.join(" ")).toContain("refusing to read");
+		expect(notified.join(" ")).not.toContain("corrupt");
 	});
 });

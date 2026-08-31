@@ -144,6 +144,15 @@ describe("rules", () => {
 		expect([...stored]).toHaveLength(500);
 		expect(stored.endsWith("END")).toBe(false);
 	});
+	test("appendRule grows the window past a strip-heavy prefix (TQ-17-01)", async () => {
+		const dir = tmpDataDir();
+		// 1001 control chars exceed the fixed 1001-unit window: the
+		// window must grow so the lesson after the garbage survives.
+		// A fixed-window revert would clean to '' and report 'empty'.
+		const lesson = "\u0000".repeat(1001) + "real lesson";
+		expect((await appendRule(dir, lesson)).added).toBe(true);
+		expect(loadRules(dir)).toEqual(["real lesson"]);
+	});
 
 	test("appendRule calls from one turn do not lose rules", async () => {
 		const dir = tmpDataDir();
@@ -414,6 +423,16 @@ describe("digests", () => {
 		const digests = path.dirname(digestFile(dir, "x"));
 		fs.symlinkSync("/nonexistent-target", path.join(digests, "broken.json"));
 		expect(listDigests(dir)).toEqual(["sess-abc"]);
+	});
+	test("listDigests skips a directory at a digest path (TQ-17-02)", () => {
+		const dir = tmpDataDir();
+		saveDigest(dir, digest());
+		// A directory named like a digest would be listed (statSync
+		// succeeds on dirs) and re-attempted (EISDIR) at every session
+		// start without the isFile filter.
+		fs.mkdirSync(digestFile(dir, "sess-dir"), { recursive: true });
+		expect(listDigests(dir)).toEqual(["sess-abc"]);
+		expect(listInjectedDigests(dir)).toEqual([]);
 	});
 
 	test("loadDigest rejects absurd values (Data F8)", () => {
@@ -980,7 +999,15 @@ describe("skills", () => {
 		expect(trueContent).toContain('description: "true"');
 		expect(quoteContent).toContain('description: "say \\"hi\\" now"');
 		expect(dashContent).toContain('description: "- leading dash"');
-		expect(colonContent).toContain('description: "Fix flaky tests: run them 10 times"');
+	});
+	test("listSkills sees a SKILL.md written into an existing subdir (TQ-17-03)", () => {
+		const dir = tmpDataDir();
+		fs.mkdirSync(path.join(dir, "skills", "empty"), { recursive: true });
+		expect(listSkills(dir)).toEqual([]);
+		// A root-keyed cache would go stale: the subdir's mtime changes,
+		// not the root's. The no-cache listing must see it immediately.
+		fs.writeFileSync(path.join(dir, "skills", "empty", "SKILL.md"), "x");
+		expect(listSkills(dir)).toEqual(["empty"]);
 	});
 	test("writeSkill strips control chars and lone surrogates from description and body (Security12)", () => {
 		const dir = tmpDataDir();

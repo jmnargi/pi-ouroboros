@@ -22,6 +22,9 @@ export const DEFAULT_RULES_CAP = 50;
 export const DEFAULT_RULES_MAX_CHARS = 3000;
 export const DEFAULT_REFLECT_MIN_PROMPTS = 5;
 export const MAX_RULE_CHARS = 500;
+/** The appendRule cleaning window never grows past this (a pathological
+ * multi-MB garbage prefix is not scanned in full). */
+export const MAX_RULE_WINDOW = 16 * 1024;
 /** Rules files over this size are not read (and never overwritten). */
 export const MAX_RULES_FILE_BYTES = 1024 * 1024;
 /** Rules files over this many lines are truncated at the read (the
@@ -197,9 +200,11 @@ export function appendRule(
 	}
 	// Bound the input BEFORE the regex passes: a multi-MB lesson must not
 	// materialize multi-MB intermediate strings. Grow the window until
-	// the cleaned prefix holds MAX_RULE_CHARS code points or the input is
-	// exhausted: a strip-heavy prefix (control chars, whitespace) must
-	// not shrink the lesson to empty.
+	// the cleaned prefix holds MAX_RULE_CHARS code points, the input is
+	// exhausted, or the window hits MAX_RULE_WINDOW: a strip-heavy prefix
+	// (control chars, whitespace) must not shrink the lesson to empty,
+	// but a pathological multi-MB garbage prefix must not be scanned in
+	// full either (FixAudit15).
 	let window = Math.min(rule.length, MAX_RULE_CHARS * 2 + 1);
 	let normalized = "";
 	while (true) {
@@ -209,7 +214,7 @@ export function appendRule(
 			.replace(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g, "")
 			.trim()
 			.replace(/\s+/g, " ");
-		if ([...candidate].length >= MAX_RULE_CHARS || window >= rule.length) {
+		if ([...candidate].length >= MAX_RULE_CHARS || window >= rule.length || window >= MAX_RULE_WINDOW) {
 			normalized = candidate;
 			break;
 		}
@@ -782,7 +787,7 @@ export function writeSkill(dataDir: string, name: string, description: string, b
 	const dir = path.join(skillsRoot, name);
 	const file = path.join(dir, "SKILL.md");
 	// Check the subdir BEFORE mkdir: a dangling symlink at skills/<name>
-	// would make mkdirSync throw a misleading ENOENT (RuntimeIntegration6).
+	// would make mkdirSync throw a misleading EEXIST (FixAudit15).
 	let dirStat: fs.Stats | null = null;
 	try {
 		dirStat = fs.lstatSync(dir);

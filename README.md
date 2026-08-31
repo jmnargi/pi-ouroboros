@@ -89,7 +89,7 @@ Measured costs:
 - Session start with 1 digest: 0.063 ms.
 - Session start with 50 digests: 0.129 ms.
 - Rules read per turn (cached): 0.001 ms.
-- Skills read per turn (cached): 0.001 ms.
+- Skills read (uncached): 0.006 ms.
 - Rule append at cap (char eviction): 0.054 ms.
 - Digest list with 10,000 digests: 23 ms.
 - Digest build with a 300 KB prompt: 0.026 ms.
@@ -97,10 +97,8 @@ Measured costs:
 - Digest save (atomic write): 0.030 ms.
 
 The plugin caches the rules file.
-The plugin invalidates the cache on its own writes.
-The plugin checks the file mtime for external writes.
 The plugin does not cache the skills list.
-The skills list is a few syscalls per turn.
+The skills list is a few syscalls at session start and on tool use.
 The plugin scans every pending digest at session start.
 The plugin injects one reflection per session start.
 The plugin keeps the remaining pending digests for the next session start.
@@ -149,10 +147,8 @@ bun test
 npx tsc --noEmit
 ```
 
-
 The tests cover digest extraction, persistence, prompt building, and the extension entry point.
-Run `bun bench/bench.ts` to measure the hot paths.
-The test suite has 193 tests.
+The test suite has 201 tests.
 The reflection happens at the start of the next session.
 The reflection does not happen at shutdown.
 Shutdown must stay fast.

@@ -74,6 +74,9 @@ export const TOOL_CALL_CAP = 20;
 export const TOOL_NAME_MAX_CHARS = 100;
 export const TOOL_ARGS_MAX_CHARS = 80;
 export const ASSISTANT_TEXT_CAP = 12;
+/** The truncate/truncateTail cleaning window never grows past this (a
+ * pathological multi-MB strip-heavy output is not scanned in full). */
+export const MAX_TRUNCATE_WINDOW = 16 * 1024;
 
 /** Stop reasons that do not indicate a problem (benign). */
 const BENIGN_STOP_REASONS: Record<string, true> = { stop: true, toolUse: true };
@@ -113,8 +116,12 @@ export function extractText(content: unknown): string {
 		if (!block || typeof block !== "object") continue;
 		const b = block as { type?: unknown; text?: unknown; name?: unknown; arguments?: unknown };
 		if (b.type === "text" && typeof b.text === "string") {
-			parts.push(b.text);
-			total += b.text.length;
+			// Keep BOTH ends of an oversized block: truncateTail needs the
+			// tail (bash errors put the exit code at the end), truncate
+			// needs the prefix. The join stays bounded (RuntimeIntegration7).
+			const t = b.text.length > 1000 ? `${b.text.slice(0, 1000)}…${b.text.slice(-1000)}` : b.text;
+			parts.push(t);
+			total += t.length;
 		} else if (b.type === "toolCall" && typeof b.name === "string") {
 			parts.push(`[tool:${b.name.slice(0, 100)}]`);
 			total += b.name.length + 7;
@@ -178,9 +185,11 @@ function cpSuffix(s: string, max: number): string {
 function truncate(s: string, max: number): string {
 	// Cleaning removes characters. The first max code points of the
 	// cleaned text can start arbitrarily far into the input. Grow the
-	// bound geometrically until enough survive or the string is exhausted.
-	// The count and the final cut are O(max), never O(n). A 10MB input
-	// must not materialize a 10M-element array.
+	// bound geometrically until enough survive, the string is exhausted,
+	// or the window hits MAX_TRUNCATE_WINDOW (a pathological multi-MB
+	// strip-heavy output is not scanned in full — SEC-18-02). The count
+	// and the final cut are O(max), never O(n). A 10MB input must not
+	// materialize a 10M-element array.
 	let bound = max * 2 + 1;
 	let cleaned = "";
 	while (true) {
@@ -190,7 +199,7 @@ function truncate(s: string, max: number): string {
 			.replace(LONE_SURROGATE, "")
 			.trim()
 			.replace(/\s+/g, " ");
-		if (cpCountAtMost(cleaned, max) > max || bound >= s.length) break;
+		if (cpCountAtMost(cleaned, max) > max || bound >= s.length || bound >= MAX_TRUNCATE_WINDOW) break;
 		bound = Math.min(s.length, bound * 2);
 	}
 	if (cpCountAtMost(cleaned, max) <= max) return cleaned;
@@ -201,20 +210,26 @@ function truncate(s: string, max: number): string {
  * strips the same control-char class the validator rejects (plus lone
  * surrogates), then slices. Cheaper than truncate (no whitespace collapse,
  * no ellipsis). The fast path (short names) avoids Array.from; only
- * over-long names pay for the code-point cut (never mid-surrogate-pair). */
+ * over-long names pay for the code-point cut (never mid-surrogate-pair).
+ * Bound the input first: max code points need at most max*2+1 UTF-16
+ * units, so a crafted multi-MB name never materializes a multi-MB array
+ * (SEC-18-01). */
 function cleanName(s: string, max: number): string {
 	const cleaned = s
 		.replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f]/g, "")
 		.replace(LONE_SURROGATE, "");
 	if (cleaned.length <= max) return cleaned;
-	return Array.from(cleaned).slice(0, max).join("");
+	return Array.from(cleaned.slice(0, max * 2 + 1))
+		.slice(0, max)
+		.join("");
 }
 
 /** Keep the LAST max code points — bash errors put the exit code at the end.
  * Bound the input before the code-point pass. A 10MB tool output must not
  * materialize a 10M-element array. Grow the tail bound geometrically until
- * enough code points survive or the string is exhausted. The count and the
- * final cut are O(max), never O(n). */
+ * enough code points survive, the string is exhausted, or the window hits
+ * MAX_TRUNCATE_WINDOW (SEC-18-02). The count and the final cut are
+ * O(max), never O(n). */
 function truncateTail(s: string, max: number): string {
 	let bound = max * 2 + 1;
 	let cleaned = "";
@@ -225,7 +240,7 @@ function truncateTail(s: string, max: number): string {
 			.replace(LONE_SURROGATE, "")
 			.trim()
 			.replace(/\s+/g, " ");
-		if (cpCountAtMost(cleaned, max) > max || bound >= s.length) break;
+		if (cpCountAtMost(cleaned, max) > max || bound >= s.length || bound >= MAX_TRUNCATE_WINDOW) break;
 		bound = Math.min(s.length, bound * 2);
 	}
 	if (cpCountAtMost(cleaned, max) <= max) return cleaned;
@@ -457,15 +472,23 @@ export function buildDigest(
 	// Stringify the kept trace calls (the raw buffers are already bounded).
 	// The replacer truncates string values and stops after 200 properties,
 	// so a crafted deeply-nested args object cannot serialize to a
-	// multi-MB string (OURO-17-07). A circular or too-deep object throws.
-	// The args are dropped rather than losing the digest.
+	// multi-MB string (OURO-17-07). Arrays are pre-sliced: JSON.stringify
+	// visits every element even when the replacer returns undefined.
+	// Object KEYS are emitted verbatim (a crafted long key is bounded by
+	// the session file — accepted, FixAudit15). A circular or too-deep
+	// object throws. The args are dropped rather than losing the digest.
 	for (const t of rawToolCalls) {
 		let args = "";
 		if (typeof t.args === "object" && t.args !== null) {
 			try {
+				const bounded = Array.isArray(t.args) ? t.args.slice(0, 200) : t.args;
 				let props = 0;
-				args = JSON.stringify(t.args, (_k, v) => {
+				args = JSON.stringify(bounded, (_k, v) => {
 					if (++props > 200) return undefined;
+					// Slice nested arrays too: JSON.stringify renders
+					// undefined array elements as null, so an unbounded
+					// nested array would still serialize in full (SEC-18-03).
+					if (Array.isArray(v)) return v.slice(0, 200);
 					return typeof v === "string" ? v.slice(0, 200) : v;
 				});
 			} catch {

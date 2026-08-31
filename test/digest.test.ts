@@ -331,6 +331,30 @@ describe("buildDigest", () => {
 			expect(cp < 0xd800 || cp > 0xdfff).toBe(true);
 		}
 	});
+	test("a multi-MB model string is bounded at capture (SEC-18-01)", () => {
+		// cleanName must not materialize a multi-MB array on a crafted
+		// session-file model string. The output contract: 200 code points.
+		const d = buildDigest(
+			[entry({ message: { role: "assistant", content: [], stopReason: "stop", model: "m".repeat(5_000_000) } })],
+			SID,
+			CWD,
+			END,
+		);
+		expect(d.models[0]).toBe("m".repeat(200));
+		expect(isValidDigest(d)).toBe(true);
+	});
+	test("a nested-array args object is bounded at capture (SEC-18-03)", () => {
+		// JSON.stringify renders undefined array elements as null, so a
+		// nested array must be sliced in the replacer, not just at the top.
+		const d = buildDigest(
+			[entry({ message: { role: "assistant", content: [{ type: "toolCall", id: "c1", name: "bash", arguments: { command: Array.from({ length: 1_000_000 }, (_, i) => i) } }], stopReason: "toolUse" } })],
+			SID,
+			CWD,
+			END,
+		);
+		expect(d.toolCalls[0]!.args.length).toBeLessThan(200);
+		expect(isValidDigest(d)).toBe(true);
+	});
 	test("tool names and models with control chars are sanitized at capture (SEC-ROUND8-02)", () => {
 		const d = buildDigest(
 			[
@@ -395,6 +419,15 @@ describe("buildDigest", () => {
 		expect(extractText([{ type: "toolCall", name: "bash", arguments: {} }])).toBe("[tool:bash]");
 		expect(extractText([{ type: "thinking", thinking: "hidden" }])).toBe("");
 		expect(extractText(42)).toBe("");
+	});
+	test("extractText keeps both ends of an oversized block (RuntimeIntegration7)", () => {
+		// truncateTail needs the tail (bash errors put the exit code at
+		// the end); truncate needs the prefix. The block slice must keep
+		// both.
+		const out = extractText([{ type: "text", text: "x".repeat(5000) + "Command exited with code 2" }]);
+		expect(out.startsWith("x".repeat(1000))).toBe(true);
+		expect(out.endsWith("Command exited with code 2")).toBe(true);
+		expect(out.length).toBeLessThan(2100);
 	});
 	test("a control char in the cwd parameter cannot break validation (TestQuality3)", () => {
 		// No session-header entry: the production path (session_shutdown)
