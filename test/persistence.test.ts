@@ -294,26 +294,35 @@ describe("rules", () => {
 		expect(loadRules(dir)).toEqual(["- external rule", "own rule"]);
 	});
 	test("rulesMissing negative cache is a single entry, cleared by any different-file load", () => {
-		const dir1 = tmpDataDir();
-		const dir2 = tmpDataDir();
-		// dir1's rules are missing — the negative cache records dir1's path.
-		expect(loadRules(dir1)).toEqual([]);
-		// dir2 has rules. A GLOBAL negative cache would return [] from dir1's
-		// entry; the single-entry cache is cleared by the dir2 load and
-		// re-stats dir2, returning its rules.
-		fs.mkdirSync(path.dirname(rulesFile(dir2)), { recursive: true });
-		fs.writeFileSync(rulesFile(dir2), "- dir2 rule\n");
-		expect(loadRules(dir2)).toEqual(["- dir2 rule"]);
-		// The single-entry property: the dir2 load cleared dir1's missing
-		// entry, so a NEW dir1 rules file is seen immediately. A
-		// multi-entry cache would still serve the stale missing entry
-		// within the 1s window (TQ-22-02).
-		fs.mkdirSync(path.dirname(rulesFile(dir1)), { recursive: true });
-		fs.writeFileSync(rulesFile(dir1), "- dir1 rule\n");
-		expect(loadRules(dir1)).toEqual(["- dir1 rule"]);
-		// appendRule clears the negative cache: dir1's rules now exist.
-		appendRule(dir1, "own rule");
-		expect(loadRules(dir1)).toEqual(["- dir1 rule", "own rule"]);
+		// Pin the clock: the discriminating step must run inside the 1s
+		// negative-cache window, or a multi-entry cache would pass too
+		// (TQ-R23-03).
+		const realNow = Date.now;
+		Date.now = () => realNow();
+		try {
+			const dir1 = tmpDataDir();
+			const dir2 = tmpDataDir();
+			// dir1's rules are missing — the negative cache records dir1's path.
+			expect(loadRules(dir1)).toEqual([]);
+			// dir2 has rules. A GLOBAL negative cache would return [] from dir1's
+			// entry; the single-entry cache is cleared by the dir2 load and
+			// re-stats dir2, returning its rules.
+			fs.mkdirSync(path.dirname(rulesFile(dir2)), { recursive: true });
+			fs.writeFileSync(rulesFile(dir2), "- dir2 rule\n");
+			expect(loadRules(dir2)).toEqual(["- dir2 rule"]);
+			// The single-entry property: the dir2 load cleared dir1's missing
+			// entry, so a NEW dir1 rules file is seen immediately. A
+			// multi-entry cache would still serve the stale missing entry
+			// within the 1s window (TQ-22-02).
+			fs.mkdirSync(path.dirname(rulesFile(dir1)), { recursive: true });
+			fs.writeFileSync(rulesFile(dir1), "- dir1 rule\n");
+			expect(loadRules(dir1)).toEqual(["- dir1 rule"]);
+			// appendRule clears the negative cache: dir1's rules now exist.
+			appendRule(dir1, "own rule");
+			expect(loadRules(dir1)).toEqual(["- dir1 rule", "own rule"]);
+		} finally {
+			Date.now = realNow;
+		}
 	});
 	test("appendRule dedupes semantically (case, punctuation, spacing)", async () => {
 		const dir = tmpDataDir();
@@ -431,6 +440,19 @@ describe("rules", () => {
 		fs.mkdirSync(marker, { recursive: true });
 		expect(deleteInjectedDigest(dir, "sess-dir")).toBe(false);
 		expect(fs.existsSync(marker)).toBe(true);
+	});
+	test("a symlinked digest FILE is never read through (SEC-24-01)", () => {
+		const dir = tmpDataDir();
+		const victim = path.join(dir, "victim.json");
+		fs.writeFileSync(victim, JSON.stringify(digest()));
+		fs.mkdirSync(path.dirname(digestFile(dir, "sess-link")), { recursive: true });
+		fs.symlinkSync(victim, digestFile(dir, "sess-link"));
+		// The listing must skip the link; the loader must refuse it.
+		expect(listDigests(dir)).toEqual([]);
+		expect(loadDigest(dir, "sess-link")).toBeNull();
+		// The link itself is removed, never the target.
+		expect(deleteDigest(dir, "sess-link")).toBe(true);
+		expect(fs.existsSync(victim)).toBe(true);
 	});
 	test("a symlinked ouroboros parent is never read or deleted through (TestQuality5)", () => {
 		const dir = tmpDataDir();
@@ -570,6 +592,42 @@ describe("rules", () => {
 		expect(migrated!.models).toHaveLength(20);
 		expect(migrated!.models[0]).toBe("vitruvixcode");
 		expect(migrated!.errors[0]!.tool).toBe("editevil");
+	});
+	test("the extended control-char class is stripped in every persistence path (TQ-R23-01)", async () => {
+		const dirty = "a\u061cb\u180ec\ufeffd\u00a0e";
+		// appendRule: a lesson with the four chars is cleaned.
+		const dir = tmpDataDir();
+		await appendRule(dir, dirty);
+		expect(loadRules(dir)).toEqual(["abcde"]);
+		// loadRules: a hand-edited rules.md is cleaned on read.
+		const dir2 = tmpDataDir();
+		fs.mkdirSync(path.dirname(rulesFile(dir2)), { recursive: true });
+		fs.writeFileSync(rulesFile(dir2), `- ${dirty}\n`);
+		expect(loadRules(dir2)).toEqual(["- abcde"]);
+		// migrateDigest: a legacy digest with a dirty model is repaired.
+		const dir3 = tmpDataDir();
+		const file = digestFile(dir3, "sess-legacy");
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		fs.writeFileSync(file, JSON.stringify({ ...digest(), models: ["m" + dirty] }));
+		const migrated = loadDigest(dir3, "sess-legacy");
+		expect(migrated).not.toBeNull();
+		expect(migrated!.models[0]).toBe("mabcde");
+		// stopReasons: a crafted key with a bidi control is cleaned by
+		// migrateDigest before validation (the key never reaches the
+		// reflection).
+		const dir4 = tmpDataDir();
+		const file4 = digestFile(dir4, "sess-keys");
+		fs.mkdirSync(path.dirname(file4), { recursive: true });
+		fs.writeFileSync(file4, JSON.stringify({ ...digest(), stopReasons: { "ok\u061creason": 1 } }));
+		const keyed = loadDigest(dir4, "sess-keys");
+		expect(keyed).not.toBeNull();
+		expect(keyed!.stopReasons).toEqual({ okreason: 1 });
+		// normalizeDescription: a skill description is cleaned.
+		expect(normalizeDescription("d" + dirty)).toBe("dabcde");
+		// writeSkill: a skill body with the four chars is cleaned.
+		const dir5 = tmpDataDir();
+		writeSkill(dir5, "ok-name", "desc", "# Body\n" + dirty);
+		expect(fs.readFileSync(path.join(dir5, "skills", "ok-name", "SKILL.md"), "utf8")).toContain("abcde");
 	});
 	test("over-bounded arrays stay rejected after migration (TestQuality3)", () => {
 		const dir = tmpDataDir();

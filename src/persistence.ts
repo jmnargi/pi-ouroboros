@@ -402,7 +402,7 @@ export function listInjectedDigests(dataDir: string): string[] {
 			const stem = f.slice(0, -".injected.json".length);
 			if (safeSessionId(stem) !== stem) continue;
 			try {
-				const st = fs.statSync(path.join(dir, f));
+				const st = fs.lstatSync(path.join(dir, f));
 				// Skip non-regular files (same rule as listDigests).
 				if (!st.isFile()) continue;
 				entries.push({ name: f, mtime: st.mtimeMs });
@@ -568,7 +568,7 @@ export function loadDigest(dataDir: string, sessionId: string): OuroborosDigest 
 		const file = digestFile(dataDir, sessionId);
 		// A special file (FIFO, socket, device) would block the read
 		// forever. Directories still throw EISDIR (transient — kept).
-		const st = fs.statSync(file);
+		const st = fs.lstatSync(file);
 		if ((!st.isFile() && !st.isDirectory()) || st.size > MAX_DIGEST_FILE_BYTES) return null;
 		text = fs.readFileSync(file, "utf8");
 	} catch {
@@ -597,7 +597,7 @@ export function readInjectedDigest(dataDir: string, sessionId: string): Ouroboro
 		const file = `${digestFile(dataDir, sessionId).slice(0, -".json".length)}.injected.json`;
 		// A special file (FIFO, socket, device) would block the read
 		// forever. Directories still throw EISDIR (transient — kept).
-		const st = fs.statSync(file);
+		const st = fs.lstatSync(file);
 		if ((!st.isFile() && !st.isDirectory()) || st.size > MAX_DIGEST_FILE_BYTES) return null;
 		text = fs.readFileSync(file, "utf8");
 	} catch {
@@ -696,7 +696,7 @@ export function listDigests(dataDir: string): string[] {
 			const stem = f.slice(0, -".json".length);
 			if (safeSessionId(stem) !== stem) continue;
 			try {
-				const st = fs.statSync(path.join(dir, f));
+				const st = fs.lstatSync(path.join(dir, f));
 				// Skip non-regular files: a directory at a digest path
 				// would otherwise be listed and re-attempted (EISDIR) at
 				// every session start, accumulating forever (OURO-17-04).

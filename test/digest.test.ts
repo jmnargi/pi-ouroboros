@@ -249,10 +249,28 @@ describe("buildDigest", () => {
 	});
 	test("a crafted digest with a bidi control fails validation (OURO-SEC-22-01)", () => {
 		// The validator must reject the extended class too: a hand-crafted
-		// digest carrying U+061C is corrupt, not injectable.
+		// digest carrying any of the four chars is corrupt, not
+		// injectable (TQ-R23-01).
 		const d = buildDigest([userMessage("hi")], SID, CWD, END);
-		(d as { userPrompts: string[] }).userPrompts = ["a\u061cb"];
+		(d as { userPrompts: string[] }).userPrompts = ["a\u061cb\u180ec\ufeffd\u00a0e"];
 		expect(isValidDigest(d)).toBe(false);
+	});
+	test("the extended control-char class is stripped in every digest path (TQ-R23-01)", () => {
+		const dirty = "a\u061cb\u180ec\ufeffd\u00a0e";
+		// truncateTail: failed-command errors.
+		const tail = buildDigest([bashFailure("npm test", 1, dirty)], SID, CWD, END);
+		expect(tail.failedCommands[0]!.error).toBe("abcde");
+		// cleanName: tool names, models, and the cwd.
+		const named = buildDigest(
+			[entry({ message: { role: "assistant", content: [{ type: "toolCall", id: "c1", name: "bash" + dirty, arguments: { command: "x" } }], stopReason: "toolUse", model: "m" + dirty } })],
+			SID,
+			"/proj" + dirty,
+			END,
+		);
+		expect(named.toolCalls[0]!.tool).toBe("bashabcde");
+		expect(named.models[0]).toBe("mabcde");
+		expect(named.cwd).toBe("/projabcde");
+		expect(isValidDigest(named)).toBe(true);
 	});
 	test("usage accumulation clamps instead of overflowing (OURO-SEC-22-02)", () => {
 		// Two crafted 1e308 values would sum to Infinity, JSON.stringify
@@ -266,9 +284,12 @@ describe("buildDigest", () => {
 			CWD,
 			END,
 		);
-		expect(Number.isFinite(d.usage.input)).toBe(true);
-		expect(Number.isFinite(d.usage.output)).toBe(true);
-		expect(Number.isFinite(d.usage.cost)).toBe(true);
+		// The clamp target is MAX_SAFE_INTEGER, not just 'finite'
+		// (TQ-R23-02): 1e308 already exceeds it, so the first addition
+		// clamps.
+		expect(d.usage.input).toBe(Number.MAX_SAFE_INTEGER);
+		expect(d.usage.output).toBe(Number.MAX_SAFE_INTEGER);
+		expect(d.usage.cost).toBe(Number.MAX_SAFE_INTEGER);
 		expect(isValidDigest(d)).toBe(true);
 	});
 

@@ -55,8 +55,9 @@ import {
 	ouroborosDirIsSymlink,
 	rulesFileIsDanglingSymlink,
 	lastDigestFileIsDanglingSymlink,
-	lastDigestFile,
 	saveLastDigest,
+	safeSessionId,
+	lastDigestFile,
 } from "./persistence.ts";
 import { buildReflectionMessage, buildRulesAppendix, escapeTags, formatDigest, OUROBOROS_CUSTOM_TYPE } from "./reflect.ts";
 
@@ -225,6 +226,15 @@ export default function (pi: ExtensionAPI): void {
 						} catch {
 							continue;
 						}
+						// A crafted file whose sessionId field aliases
+						// another digest would make the needle match the
+						// wrong reflection and delete this marker as
+						// delivered. Plugin-written digests always match
+						// the filename; a mismatch is corrupt (SEC-24-02).
+						if (digest && safeSessionId(digest.sessionId) !== sid) {
+							deleteInjectedDigest(dataDir, sid);
+							continue;
+						}
 						const alreadyDelivered = digest ? sessionHasOuroborosMessage(entries, digest.sessionId) : false;
 						if (alreadyDelivered) {
 							deleteInjectedDigest(dataDir, sid);
@@ -261,6 +271,12 @@ export default function (pi: ExtensionAPI): void {
 					try {
 						digest = readInjectedDigest(dataDir, sid);
 					} catch {
+						continue;
+					}
+					// A filename/sessionId mismatch is a crafted file: the
+					// needle would alias another digest (SEC-24-02).
+					if (digest && safeSessionId(digest.sessionId) !== sid) {
+						deleteInjectedDigest(dataDir, sid);
 						continue;
 					}
 					if (digest && sessionHasOuroborosMessage(entries, digest.sessionId)) {
@@ -367,11 +383,21 @@ export default function (pi: ExtensionAPI): void {
 			const last = messages[messages.length - 1] as { stopReason?: unknown } | undefined;
 			if (last?.stopReason === "error" || last?.stopReason === "aborted") return;
 			try {
-				// Delete ONLY the markers queued in this session_start. A
-				// recovered-but-not-queued digest keeps its marker for the
-				// next session start.
-				for (const sid of queuedInjected) {
-					deleteInjectedDigest(dataDir, sid);
+				// Delete ONLY the markers queued in this session_start, and
+				// only when the run actually drained the reflection: a turn
+				// started via sendMessage with triggerTurn bypasses the
+				// _pendingNextTurnMessages drain, so the reflection is
+				// still queued and the marker must survive (FixAudit21).
+				// All pending nextTurn messages drain together, so one
+				// ouroboros custom message in the run proves the drain.
+				const drained = messages.some((m) => {
+					const msg = m as { role?: unknown; customType?: unknown };
+					return msg.role === "custom" && msg.customType === OUROBOROS_CUSTOM_TYPE;
+				});
+				if (drained) {
+					for (const sid of queuedInjected) {
+						deleteInjectedDigest(dataDir, sid);
+					}
 				}
 				// A reload re-imported the module, so a marker queued before
 				// the reload is not in queuedInjected. Delete any injected
@@ -392,6 +418,12 @@ export default function (pi: ExtensionAPI): void {
 						continue;
 					}
 					if (!digest) continue;
+					// A filename/sessionId mismatch is a crafted file: the
+					// needle would alias another digest (SEC-24-02).
+					if (safeSessionId(digest.sessionId) !== sid) {
+						deleteInjectedDigest(dataDir, sid);
+						continue;
+					}
 					const needle = `\nsession: ${escapeTags(digest.sessionId)}\n`;
 					// Match ONLY the ouroboros custom message: the marker is
 					// the only copy of the digest, so a false positive
