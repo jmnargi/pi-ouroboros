@@ -149,7 +149,7 @@ npx tsc --noEmit
 
 The tests cover digest extraction, persistence, prompt building, and the extension entry point.
 Run `bun bench/bench.ts` to measure the hot paths.
-The test suite has 179 tests.
+The test suite has 185 tests.
 The reflection happens at the start of the next session.
 The reflection does not happen at shutdown.
 Shutdown must stay fast.

@@ -164,6 +164,7 @@ beforeEach(() => {
 
 afterEach(() => {
 	delete process.env.PI_CODING_AGENT_DIR;
+	delete process.env.PI_OUROBOROS_RULES_CAP;
 	rmSync(dataDir, { recursive: true, force: true });
 });
 

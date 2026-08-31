@@ -187,21 +187,61 @@ describe("rules", () => {
 		fs.writeFileSync(rulesFile(dir), "- " + "x".repeat(2 * 1024 * 1024));
 		expect(loadRules(dir)).toEqual([]);
 	});
+	test("appendRule refuses to overwrite a >1MB rules.md (FixAudit12)", async () => {
+		const dir = tmpDataDir();
+		fs.mkdirSync(path.dirname(rulesFile(dir)), { recursive: true });
+		// A hand-edited or write-tool-bypassed rules.md over the read
+		// bound must be preserved for manual repair, not replaced by the
+		// read-modify-write.
+		const huge = "- " + "x".repeat(2 * 1024 * 1024);
+		fs.writeFileSync(rulesFile(dir), huge);
+		expect((await appendRule(dir, "new rule")).reason).toBe("conflict");
+		expect(fs.readFileSync(rulesFile(dir), "utf8")).toBe(huge);
+	});
+	test("loadRules bounds the line count of a rules file (Security11)", () => {
+		const dir = tmpDataDir();
+		fs.mkdirSync(path.dirname(rulesFile(dir)), { recursive: true });
+		// 20k one-char lines fit in 1MB but exceed the 10k line bound:
+		// the split limit must cap the materialized array.
+		fs.writeFileSync(rulesFile(dir), Array.from({ length: 20_000 }, (_, i) => `r${i}`).join("\n"));
+		const rules = loadRules(dir);
+		expect(rules.length).toBeLessThanOrEqual(10_001);
+		expect(rules[0]).toBe("r0");
+	});
 
 	test("loadRules degrades to empty on unreadable file", () => {
 		const dir = tmpDataDir();
+		const other = tmpDataDir();
 		expect(loadRules(dir)).toEqual([]);
+		// Clear the negative cache (a different-file load resets it) so
+		// the next call actually re-stats and hits the EISDIR branch.
+		loadRules(other);
 		// A directory at the rules path makes readFileSync throw (EISDIR).
 		fs.mkdirSync(rulesFile(dir), { recursive: true });
 		expect(loadRules(dir)).toEqual([]);
 	});
-	test("rulesMissing negative cache is keyed by file path and cleared by writes", () => {
+	test("appendRule bypasses the negative cache so an external rules.md survives (TQ-14-01)", async () => {
+		const dir = tmpDataDir();
+		// 1. A missing rules.md sets the negative cache (1s window).
+		expect(loadRules(dir)).toEqual([]);
+		// 2. Another process creates rules.md within the window.
+		fs.mkdirSync(path.dirname(rulesFile(dir)), { recursive: true });
+		fs.writeFileSync(rulesFile(dir), "- external rule\n");
+		// 3. appendRule must see the external rule. Without the
+		// top-of-appendRule invalidateRulesCache, loadRules returns [] and
+		// the write clobbers the external rule.
+		await appendRule(dir, "own rule");
+		// 4. Both rules survive.
+		expect(loadRules(dir)).toEqual(["- external rule", "own rule"]);
+	});
+	test("rulesMissing negative cache is a single entry, cleared by any different-file load", () => {
 		const dir1 = tmpDataDir();
 		const dir2 = tmpDataDir();
 		// dir1's rules are missing — the negative cache records dir1's path.
 		expect(loadRules(dir1)).toEqual([]);
 		// dir2 has rules. A GLOBAL negative cache would return [] from dir1's
-		// entry; the keyed cache re-stats dir2 and returns its rules.
+		// entry; the single-entry cache is cleared by the dir2 load and
+		// re-stats dir2, returning its rules.
 		fs.mkdirSync(path.dirname(rulesFile(dir2)), { recursive: true });
 		fs.writeFileSync(rulesFile(dir2), "- dir2 rule\n");
 		expect(loadRules(dir2)).toEqual(["- dir2 rule"]);
@@ -271,6 +311,26 @@ describe("digests", () => {
 		expect(listInjectedDigests(dir)).toEqual([]);
 		expect(deleteDigest(dir, "package")).toBe(false);
 		expect(fs.existsSync(path.join(victim, "package.json"))).toBe(true);
+		// The write/read guards (round 14): saveDigest and saveLastDigest
+		// must not write into the victim; loadLastDigest must not read it.
+		saveDigest(dir, digest());
+		saveLastDigest(dir, digest());
+		expect(fs.readdirSync(victim)).toEqual(["package.json"]);
+		expect(loadLastDigest(dir)).toBeNull();
+	});
+	test("deleteDigest/deleteInjectedDigest never throw on a failed rmSync (TQ-14-03)", () => {
+		const dir = tmpDataDir();
+		// A directory at the digest path makes rmSync (non-recursive)
+		// throw EISDIR. The delete must return false, not throw, so the
+		// reconciliation loops are not stalled.
+		const file = digestFile(dir, "sess-dir");
+		fs.mkdirSync(file, { recursive: true });
+		expect(deleteDigest(dir, "sess-dir")).toBe(false);
+		expect(fs.existsSync(file)).toBe(true);
+		const marker = `${file.slice(0, -".json".length)}.injected.json`;
+		fs.mkdirSync(marker, { recursive: true });
+		expect(deleteInjectedDigest(dir, "sess-dir")).toBe(false);
+		expect(fs.existsSync(marker)).toBe(true);
 	});
 	test("a symlinked ouroboros parent is never read or deleted through (TestQuality5)", () => {
 		const dir = tmpDataDir();
@@ -699,14 +759,35 @@ describe("digests", () => {
 		fs.mkdirSync(path.dirname(file), { recursive: true });
 		// The bounded counter/cut is verified by inspection (the output is
 		// identical with the bound removed). This pins the observable
-		// contract: a multi-MB header string is repaired to the cap, and
-		// a multi-million-element array is rejected as corrupt.
-		fs.writeFileSync(file, JSON.stringify({ ...digest(), cwd: "x".repeat(5_000_000) }));
+		// contract: an over-cap header string (under the file-size bound)
+		// is repaired to the cap, and a multi-million-element array is
+		// rejected as corrupt.
+		fs.writeFileSync(file, JSON.stringify({ ...digest(), cwd: "x".repeat(100_000) }));
 		const loaded = loadDigest(dir, "sess-huge");
 		expect(loaded).not.toBeNull();
 		expect([...loaded!.cwd]).toHaveLength(2000);
+		// A file over the size bound is not writer-produced: skipped
+		// entirely (Security11). The multi-million-element arrays below
+		// also exceed the bound, so they are skipped before parsing.
+		fs.writeFileSync(file, JSON.stringify({ ...digest(), cwd: "x".repeat(5_000_000) }));
+		expect(loadDigest(dir, "sess-huge")).toBeNull();
 		fs.writeFileSync(file, JSON.stringify({ ...digest(), userPrompts: Array.from({ length: 5_000_000 }, () => "p") }));
 		expect(loadDigest(dir, "sess-huge")).toBeNull();
+		// A multi-million-element legacy string[] failedCommands must not
+		// materialize a mapped array (FixAudit12) — and stays rejected.
+		fs.writeFileSync(file, JSON.stringify({ ...digest(), failedCommands: Array.from({ length: 5_000_000 }, () => "cmd") }));
+		expect(loadDigest(dir, "sess-huge")).toBeNull();
+		// 21 stopReasons keys where the first 20 strip to empty: the 21st
+		// (non-numeric value) must still land in `cleaned` and fail the
+		// value check — the digest stays rejected (FixAudit12).
+		const stopReasons: Record<string, unknown> = Object.create(null);
+		for (let i = 0; i < 20; i++) stopReasons[String.fromCharCode(i === 8 ? 0x0b : i === 9 ? 0x0c : i === 10 ? 0x0e : i)] = 1;
+		stopReasons["bad"] = "x";
+		fs.writeFileSync(file, JSON.stringify({ ...digest(), stopReasons }));
+		expect(loadDigest(dir, "sess-huge")).toBeNull();
+		// loadLastDigest applies the same size bound (Security11).
+		fs.writeFileSync(lastDigestFile(dir), JSON.stringify({ ...digest(), cwd: "x".repeat(5_000_000) }));
+		expect(loadLastDigest(dir)).toBeNull();
 	});
 	test("atomicWrite cleans its tmp when the rename fails (Security10)", () => {
 		const dir = tmpDataDir();
@@ -830,6 +911,29 @@ describe("skills", () => {
 		const dir = tmpDataDir();
 		fs.mkdirSync(path.join(dir, "skills", "empty"), { recursive: true });
 		expect(listSkills(dir)).toEqual([]);
+	});
+	test("listSkills never reads through a symlinked skills root (Security11)", () => {
+		const dir = tmpDataDir();
+		const victim = fs.mkdtempSync(path.join(os.tmpdir(), "ouroboros-target-"));
+		tmpDirs.push(victim);
+		fs.mkdirSync(path.join(victim, "planted"), { recursive: true });
+		fs.writeFileSync(path.join(victim, "planted", "SKILL.md"), "x");
+		fs.symlinkSync(victim, path.join(dir, "skills"));
+		expect(listSkills(dir)).toEqual([]);
+	});
+	test("writeSkill refuses to write through a symlinked skills root or subdir (Security11)", () => {
+		const dir = tmpDataDir();
+		const victim = fs.mkdtempSync(path.join(os.tmpdir(), "ouroboros-target-"));
+		tmpDirs.push(victim);
+		fs.symlinkSync(victim, path.join(dir, "skills"));
+		expect(() => writeSkill(dir, "my-skill", "desc", "body")).toThrow(/symlink/);
+		expect(fs.readdirSync(victim)).toEqual([]);
+		// A real skills root with a symlinked skill subdir is also refused.
+		const dir2 = tmpDataDir();
+		fs.mkdirSync(path.join(dir2, "skills"), { recursive: true });
+		fs.symlinkSync(victim, path.join(dir2, "skills", "planted"));
+		expect(() => writeSkill(dir2, "planted", "desc", "body")).toThrow(/symlink/);
+		expect(fs.readdirSync(victim)).toEqual([]);
 	});
 });
 

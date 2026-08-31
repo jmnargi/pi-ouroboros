@@ -22,6 +22,14 @@ export const DEFAULT_RULES_CAP = 50;
 export const DEFAULT_RULES_MAX_CHARS = 3000;
 export const DEFAULT_REFLECT_MIN_PROMPTS = 5;
 export const MAX_RULE_CHARS = 500;
+/** Rules files over this size are not read (and never overwritten). */
+export const MAX_RULES_FILE_BYTES = 1024 * 1024;
+/** Rules files over this many lines are truncated at the read (the
+ * default cap is 50 rules; 10k lines is a generous ceiling). */
+export const MAX_RULES_LINES = 10_000;
+/** Digest files over this size are not writer-produced (all fields are
+ * capped): skip the read so a crafted multi-MB file never materializes. */
+export const MAX_DIGEST_FILE_BYTES = 1024 * 1024;
 
 /** Session ids are UUIDs; anything else is hashed before touching the fs. */
 const SAFE_ID = /^[a-zA-Z0-9_-]+$/;
@@ -91,14 +99,16 @@ export function loadRules(dataDir: string): string[] {
 		// Bound the read: a multi-MB rules.md (model write-tool bypass or
 		// hand-edit) must not be read and split into a giant line array.
 		// The appendRule cap is 3000 chars; 1MB is a generous ceiling.
-		if (stat.size > 1024 * 1024) return [];
+		if (stat.size > MAX_RULES_FILE_BYTES) return [];
 		const text = fs.readFileSync(file, "utf8");
 		// Strip control chars and lone surrogates at the injection boundary
 		// too. Older plugin versions or hand-editing bypass appendRule's
 		// strip. A lone surrogate in the system prompt can make the
-		// provider reject the request.
+		// provider reject the request. The split limit bounds the line
+		// count: a 1MB file of 1-char lines must not materialize a
+		// 500k-element array (the default cap is 50 rules).
 		const rules = text
-			.split("\n")
+			.split("\n", MAX_RULES_LINES + 1)
 			.map((l) =>
 				l
 					.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f]/g, "")
@@ -156,6 +166,16 @@ export function appendRule(
 	// within the 1s window must be seen. Otherwise this write would
 	// clobber it.
 	invalidateRulesCache();
+	// A rules.md over the read bound (model write-tool bypass or
+	// hand-edit) must not be silently replaced by the read-modify-write.
+	// Preserve it for manual repair.
+	try {
+		if (fs.statSync(rulesFile(dataDir)).size > MAX_RULES_FILE_BYTES) {
+			return { added: false, reason: "conflict", count: 0, cap };
+		}
+	} catch {
+		// missing file is fine
+	}
 	// Strip control chars and lone surrogates: a rule is injected into the
 	// system prompt verbatim. The cap is by code points — a UTF-16 slice
 	// could split a surrogate pair and store a lone surrogate.
@@ -330,7 +350,10 @@ function migrateDigest(p: unknown): unknown {
 	if (typeof d.userPromptCount !== "number" && Array.isArray(d.userPrompts)) {
 		d.userPromptCount = d.userPrompts.length;
 	}
-	if (Array.isArray(d.failedCommands) && d.failedCommands.every((c) => typeof c === "string")) {
+	// Bound the legacy conversion: a crafted multi-million-element
+	// string[] must not materialize a multi-MB mapped array. Over-bounded
+	// arrays skip the conversion and stay rejected by the validator.
+	if (Array.isArray(d.failedCommands) && d.failedCommands.length <= 21 && d.failedCommands.every((c) => typeof c === "string")) {
 		d.failedCommands = d.failedCommands.map((c) => ({ command: c, error: "" }));
 	}
 	if (!Array.isArray(d.toolCalls)) d.toolCalls = [];
@@ -403,28 +426,37 @@ function migrateDigest(p: unknown): unknown {
 		// Use a null prototype. A '__proto__' key must be an own property.
 		// The writer already uses Object.create(null). The load path must
 		// match. Iterate with for...in: Object.entries would materialize
-		// every key of a crafted object. The loop stops at 20 keys.
+		// every key of a crafted object. The loop stops at 21 keys and
+		// adds at most 20 non-empty ones — the old add semantics (a key
+		// beyond the 20th still lands in `cleaned` when earlier keys
+		// stripped to empty, so a bad value still fails validation).
 		const cleaned: Record<string, number> = Object.create(null);
 		let n = 0;
+		let added = 0;
 		for (const k in d.stopReasons as Record<string, unknown>) {
-			if (++n > 20) break;
+			if (++n > 21) break;
 			// Keys are sanitized (the round-7 writer stored them raw); values
 			// are kept as-is so a non-numeric value still fails validation.
 			const key = cpCut(strip(k), 100);
-			if (key) cleaned[key] = (d.stopReasons as Record<string, unknown>)[k] as number;
+			if (key && added < 20) {
+				cleaned[key] = (d.stopReasons as Record<string, unknown>)[k] as number;
+				added++;
+			}
 		}
 		d.stopReasons = cleaned;
 	}
 	return d;
 }
-
 export function loadDigest(dataDir: string, sessionId: string): OuroborosDigest | null {
 	// A JSON.parse failure means the file is corrupt. Return null so the
 	// caller deletes it. A readFileSync failure is transient. Throw so the
-	// caller skips the digest and keeps the file.
+	// caller skips the digest and keeps the file. A file over the size
+	// bound is not writer-produced: treat it as corrupt (null).
 	let text: string;
 	try {
-		text = fs.readFileSync(digestFile(dataDir, sessionId), "utf8");
+		const file = digestFile(dataDir, sessionId);
+		if (fs.statSync(file).size > MAX_DIGEST_FILE_BYTES) return null;
+		text = fs.readFileSync(file, "utf8");
 	} catch {
 		throw new Error("digest unreadable");
 	}
@@ -437,15 +469,16 @@ export function loadDigest(dataDir: string, sessionId: string): OuroborosDigest 
 	const migrated = migrateDigest(parsed);
 	return isValidDigest(migrated) ? (migrated as OuroborosDigest) : null;
 }
-
 /** Load a digest that is currently marked injected (awaiting delivery). */
 export function readInjectedDigest(dataDir: string, sessionId: string): OuroborosDigest | null {
 	// Use the same corrupt-vs-transient split as loadDigest. A parse
 	// failure is corruption. The caller deletes the marker. An IO failure
-	// is transient. The caller keeps the marker.
+	// is transient. The caller keeps the marker. A file over the size
+	// bound is not writer-produced: treat it as corrupt (null).
 	let text: string;
 	try {
 		const file = `${digestFile(dataDir, sessionId).slice(0, -".json".length)}.injected.json`;
+		if (fs.statSync(file).size > MAX_DIGEST_FILE_BYTES) return null;
 		text = fs.readFileSync(file, "utf8");
 	} catch {
 		throw new Error("injected digest unreadable");
@@ -480,10 +513,13 @@ export function saveLastDigest(dataDir: string, digest: OuroborosDigest): void {
 }
 export function loadLastDigest(dataDir: string): OuroborosDigest | null {
 	// Never read through a symlinked ouroboros dir (same rule as
-	// listDigests): the file would come from the target.
+	// listDigests): the file would come from the target. A file over the
+	// size bound is not writer-produced: treat it as corrupt (null).
 	if (digestsDirIsSymlink(dataDir)) return null;
 	try {
-		const parsed: unknown = JSON.parse(fs.readFileSync(lastDigestFile(dataDir), "utf8"));
+		const file = lastDigestFile(dataDir);
+		if (fs.statSync(file).size > MAX_DIGEST_FILE_BYTES) return null;
+		const parsed: unknown = JSON.parse(fs.readFileSync(file, "utf8"));
 		const migrated = migrateDigest(parsed);
 		return isValidDigest(migrated) ? (migrated as OuroborosDigest) : null;
 	} catch {
@@ -655,9 +691,19 @@ export function normalizeDescription(description: string): string {
 
 /** Write a skill and return its SKILL.md path. Refuses to overwrite. */
 export function writeSkill(dataDir: string, name: string, description: string, body: string): string {
-	const dir = path.join(skillsDir(dataDir), name);
+	// Never write through a symlinked skills root or skill subdir: the
+	// SKILL.md would land in the target (same trust boundary as the
+	// digests guards). A missing skills root is fine — mkdir creates it.
+	const skillsRoot = skillsDir(dataDir);
+	if (fs.existsSync(skillsRoot) && fs.lstatSync(skillsRoot).isSymbolicLink()) {
+		throw new Error("skills dir is a symlink — refusing to write through it");
+	}
+	const dir = path.join(skillsRoot, name);
 	const file = path.join(dir, "SKILL.md");
 	fs.mkdirSync(dir, { recursive: true });
+	if (fs.lstatSync(dir).isSymbolicLink()) {
+		throw new Error(`skill dir "${name}" is a symlink — refusing to write through it`);
+	}
 	// JSON.stringify produces a valid YAML double-quoted scalar.
 	// Descriptions with colons or leading dashes must not break the
 	// frontmatter.
@@ -728,7 +774,10 @@ let skillsCache: { dir: string; mtimeMs: number; size: number; names: string[] }
 export function listSkills(dataDir: string): string[] {
 	try {
 		const dir = skillsDir(dataDir);
-		if (!fs.existsSync(dir)) return [];
+		// Never read through a symlinked skills root (same trust boundary
+		// as the digests guards): the subdir names would come from the
+		// target.
+		if (!fs.existsSync(dir) || fs.lstatSync(dir).isSymbolicLink()) return [];
 		const stat = fs.statSync(dir);
 		// A new skill directory changes the parent's mtime+size, so the
 		// cache stays valid until the next write.
