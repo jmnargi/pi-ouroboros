@@ -249,15 +249,26 @@ describe("buildDigest", () => {
 	});
 	test("Cf and Zs format characters are stripped at capture (SEC-25-01)", () => {
 		// U+00AD (soft hyphen, Cf), U+034F (combining grapheme joiner,
-		// Cf), U+2000 (en quad, Zs), U+3000 (ideographic space, Zs).
-		const d = buildDigest([userMessage("a\u00adb\u034fc\u2000d\u3000e")], SID, CWD, END);
-		expect(d.userPrompts[0]).toBe("abcde");
+		// Mn), U+115F/U+1160/U+3164/U+FFA0 (Hangul fillers, Lo),
+		// U+17B4/U+17B5 (Mn), U+1680/U+2000/U+202F/U+205F/U+3000 (Zs).
+		const d = buildDigest(
+			[userMessage("a\u00adb\u034fc\u115fd\u1160e\u17b4f\u17b5g\u3164h\uffa0i\u1680j\u2000k\u202fl\u205fm\u3000n")],
+			SID,
+			CWD,
+			END,
+		);
+		expect(d.userPrompts[0]).toBe("abcdefghijklmn");
 		expect(isValidDigest(d)).toBe(true);
 	});
-	test("a crafted digest with a soft hyphen fails validation (SEC-25-01)", () => {
+	test("a crafted digest with a soft hyphen or Hangul filler fails validation (SEC-25-01)", () => {
 		const d = buildDigest([userMessage("hi")], SID, CWD, END);
 		(d as { userPrompts: string[] }).userPrompts = ["a\u00adb"];
 		expect(isValidDigest(d)).toBe(false);
+		// U+3164 is a Lo filler, NOT covered by \p{Cf}: the explicit
+		// range must be pinned (TQ-25-01).
+		const d2 = buildDigest([userMessage("hi")], SID, CWD, END);
+		(d2 as { userPrompts: string[] }).userPrompts = ["a\u3164b"];
+		expect(isValidDigest(d2)).toBe(false);
 	});
 	test("a crafted digest with a bidi control fails validation (OURO-SEC-22-01)", () => {
 		// The validator must reject the extended class too: a hand-crafted
@@ -529,8 +540,8 @@ describe("buildDigest", () => {
 	test("a huge whitespace tail collapses without unbounded work (FixAudit8)", () => {
 		const big = "x".repeat(100) + " ".repeat(5_000_000) + "END";
 		const d = buildDigest([bashFailure("npm test", 1, big)], SID, CWD, END);
-	expect(d.failedCommands[0]!.error).toContain("END");
-});
+		expect(d.failedCommands[0]!.error).toContain("END");
+	});
 	test("truncateTail caps the window: content beyond 16KB from the end is lost (TQ-19-03)", () => {
 		// 'END' + MAX_TRUNCATE_WINDOW+1 NULs: the window caps at 16KB,
 		// the tail slice is all NULs, and the error falls back to

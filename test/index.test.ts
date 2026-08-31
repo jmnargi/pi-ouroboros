@@ -542,16 +542,19 @@ describe("session_start", () => {
 		expect(readdirSync(digestsDir(dataDir))).toEqual([]);
 	});
 	test("the agent_end loop deletes a mismatched marker (TQ-R24-02)", async () => {
+		// The reload branch keeps a VALID marker (matching id), then the
+		// marker is rewritten with a mismatched sessionId (a concurrent
+		// rewrite between session_start and agent_end). The agent_end
+		// mismatch check must delete it (TQ-25-03).
 		const crafted = buildDigest(notableEntries("sess-2"), "sess-2", "/proj", "2026-08-30T12:00:00.000Z");
 		saveDigest(dataDir, crafted);
 		markDigestInjected(dataDir, "sess-2");
 		const marker = join(digestsDir(dataDir), "sess-2.injected.json");
-		writeFileSync(marker, JSON.stringify({ ...crafted, sessionId: "sess-1" }));
 		const handler = api.fire.bind(api, "session_start");
 		await handler({ reason: "reload" }, fakeCtx());
-		// The run carries sess-2's reflection needle; the mismatched
-		// sessionId must be rejected before the needle is built.
-		await api.fire("agent_end", { messages: [{ role: "custom", customType: OUROBOROS_CUSTOM_TYPE, content: "[Ouroboros] ...\nsession: sess-2\ncwd: /proj" }, { role: "assistant", stopReason: "stop" }] });
+		expect(readdirSync(digestsDir(dataDir))).toEqual(["sess-2.injected.json"]);
+		writeFileSync(marker, JSON.stringify({ ...crafted, sessionId: "sess-1" }));
+		await api.fire("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }] });
 		expect(readdirSync(digestsDir(dataDir))).toEqual([]);
 	});
 	test("a digest with a stripped raw sessionId is NOT deleted as mismatched (FixAudit22)", async () => {
@@ -568,6 +571,41 @@ describe("session_start", () => {
 		await handler({}, fakeCtx());
 		expect(api.messages).toHaveLength(1);
 		expect(api.messages[0]!.message.content).toContain("sess1");
+	});
+	test("the reload branch keeps a raw-id marker whose id round-trips only via the raw comparison (TQ-25-02)", async () => {
+		const raw = "sess\u00001";
+		const sid = safeSessionId(raw);
+		const d = buildDigest(notableEntries("sess-1"), "sess-1", "/proj", "2026-08-30T12:00:00.000Z");
+		mkdirSync(digestsDir(dataDir), { recursive: true });
+		writeFileSync(join(digestsDir(dataDir), `${sid}.injected.json`), JSON.stringify({ ...d, sessionId: raw }));
+		const handler = api.fire.bind(api, "session_start");
+		await handler({ reason: "reload" }, fakeCtx());
+		// The reflection is not in the history: the marker must survive.
+		expect(readdirSync(digestsDir(dataDir))).toEqual([`${sid}.injected.json`]);
+	});
+	test("the agent_end loop keeps a raw-id marker whose id round-trips only via the raw comparison (TQ-25-02)", async () => {
+		const raw = "sess\u00001";
+		const sid = safeSessionId(raw);
+		const d = buildDigest(notableEntries("sess-1"), "sess-1", "/proj", "2026-08-30T12:00:00.000Z");
+		mkdirSync(digestsDir(dataDir), { recursive: true });
+		writeFileSync(join(digestsDir(dataDir), `${sid}.injected.json`), JSON.stringify({ ...d, sessionId: raw }));
+		const handler = api.fire.bind(api, "session_start");
+		await handler({ reason: "reload" }, fakeCtx());
+		// The run does not carry the reflection: the marker must survive.
+		await api.fire("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }] });
+		expect(readdirSync(digestsDir(dataDir))).toEqual([`${sid}.injected.json`]);
+	});
+	test("a crafted PENDING digest whose sessionId mismatches its filename is deleted, not injected (SEC-26-01)", async () => {
+		// abc.json containing sessionId 'def' would alias def's marker in
+		// the needle checks. The pending loop must treat the mismatch as
+		// corrupt: delete the file, inject nothing.
+		const crafted = buildDigest(notableEntries("def"), "def", "/proj", "2026-08-30T12:00:00.000Z");
+		mkdirSync(digestsDir(dataDir), { recursive: true });
+		writeFileSync(join(digestsDir(dataDir), "abc.json"), JSON.stringify({ ...crafted, sessionId: "def" }));
+		const handler = api.fire.bind(api, "session_start");
+		await handler({}, fakeCtx());
+		expect(api.messages).toHaveLength(0);
+		expect(readdirSync(digestsDir(dataDir))).toEqual([]);
 	});
 	test("sendMessage failure on a RECOVERED digest keeps the marker (TestQuality3)", async () => {
 		// The marker is the atomic claim: unmarking would open a pending

@@ -59,6 +59,7 @@ import {
 	safeSessionId,
 	lastDigestFile,
 	readInjectedDigestRawSessionId,
+	readDigestRawSessionId,
 } from "./persistence.ts";
 import { buildReflectionMessage, buildRulesAppendix, escapeTags, formatDigest, OUROBOROS_CUSTOM_TYPE } from "./reflect.ts";
 
@@ -307,6 +308,15 @@ export default function (pi: ExtensionAPI): void {
 			try {
 				const digest = recoveredSet.has(sid) ? readInjectedDigest(dataDir, sid) : loadDigest(dataDir, sid);
 				if (!digest) {
+					if (recoveredSet.has(sid)) deleteInjectedDigest(dataDir, sid);
+					else deleteDigest(dataDir, sid);
+					continue;
+				}
+				// Filename/sessionId consistency (SEC-26-01): a crafted
+				// pending file whose sessionId aliases another digest is
+				// corrupt, not injectable.
+				const rawSid = recoveredSet.has(sid) ? readInjectedDigestRawSessionId(dataDir, sid) : readDigestRawSessionId(dataDir, sid);
+				if (digest && safeSessionId(rawSid ?? digest.sessionId) !== sid) {
 					if (recoveredSet.has(sid)) deleteInjectedDigest(dataDir, sid);
 					else deleteDigest(dataDir, sid);
 					continue;

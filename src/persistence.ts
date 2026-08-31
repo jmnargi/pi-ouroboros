@@ -630,6 +630,23 @@ export function readInjectedDigestRawSessionId(dataDir: string, sessionId: strin
 		return null;
 	}
 }
+/** The RAW sessionId field of a PENDING digest (pre-migration). The
+ * pending-injection loop applies the same filename/sessionId consistency
+ * check as the marker reconciliation (SEC-26-01). */
+export function readDigestRawSessionId(dataDir: string, sessionId: string): string | null {
+	if (digestsDirIsSymlink(dataDir)) return null;
+	try {
+		const file = digestFile(dataDir, sessionId);
+		const st = fs.lstatSync(file);
+		if ((!st.isFile() && !st.isDirectory()) || st.size > MAX_DIGEST_FILE_BYTES) return null;
+		const parsed: unknown = JSON.parse(fs.readFileSync(file, "utf8"));
+		if (typeof parsed !== "object" || parsed === null) return null;
+		const raw = (parsed as Record<string, unknown>).sessionId;
+		return typeof raw === "string" ? raw : null;
+	} catch {
+		return null;
+	}
+}
 
 /** The last session's digest, kept for /ouroboros digest. Pending digests
  * are consumed at the next session start. The command reads this copy. */
