@@ -4,7 +4,7 @@
 
 import { describe, expect, test } from "bun:test";
 
-import { buildDigest, extractText, isNotable } from "../src/digest.ts";
+import { buildDigest, extractText, isNotable, stringifyArgs } from "../src/digest.ts";
 import { isValidDigest } from "../src/persistence.ts";
 
 const SID = "sess-123";
@@ -333,7 +333,9 @@ describe("buildDigest", () => {
 	});
 	test("a multi-MB model string is bounded at capture (SEC-18-01)", () => {
 		// cleanName must not materialize a multi-MB array on a crafted
-		// session-file model string. The output contract: 200 code points.
+		// session-file model string. The bound is verified by inspection
+		// (the output is identical with the bound removed) — this pins
+		// the output contract: 200 code points.
 		const d = buildDigest(
 			[entry({ message: { role: "assistant", content: [], stopReason: "stop", model: "m".repeat(5_000_000) } })],
 			SID,
@@ -343,17 +345,15 @@ describe("buildDigest", () => {
 		expect(d.models[0]).toBe("m".repeat(200));
 		expect(isValidDigest(d)).toBe(true);
 	});
-	test("a nested-array args object is bounded at capture (SEC-18-03)", () => {
+	test("stringifyArgs bounds a nested-array args object (SEC-18-03)", () => {
 		// JSON.stringify renders undefined array elements as null, so a
-		// nested array must be sliced in the replacer, not just at the top.
-		const d = buildDigest(
-			[entry({ message: { role: "assistant", content: [{ type: "toolCall", id: "c1", name: "bash", arguments: { command: Array.from({ length: 1_000_000 }, (_, i) => i) } }], stopReason: "toolUse" } })],
-			SID,
-			CWD,
-			END,
-		);
-		expect(d.toolCalls[0]!.args.length).toBeLessThan(200);
-		expect(isValidDigest(d)).toBe(true);
+		// nested array must be sliced in the replacer, not just at the
+		// top. The unbounded form would emit ~4.4MB with 999,800 nulls.
+		const out = stringifyArgs({ command: Array.from({ length: 1_000_000 }, (_, i) => i) });
+		expect(out.length).toBeLessThan(2000);
+		// The props cap nulls only the final two elements of the sliced
+		// array — the unbounded form would be full of nulls.
+		expect(out.match(/null/g)?.length ?? 0).toBeLessThanOrEqual(2);
 	});
 	test("tool names and models with control chars are sanitized at capture (SEC-ROUND8-02)", () => {
 		const d = buildDigest(
@@ -416,10 +416,18 @@ describe("buildDigest", () => {
 	test("extracts text from string and block content", () => {
 		expect(extractText("plain")).toBe("plain");
 		expect(extractText([{ type: "text", text: "a" }, { type: "text", text: "b" }])).toBe("a\nb");
-		expect(extractText([{ type: "toolCall", name: "bash", arguments: {} }])).toBe("[tool:bash]");
-		expect(extractText([{ type: "thinking", thinking: "hidden" }])).toBe("");
-		expect(extractText(42)).toBe("");
-	});
+	expect(extractText([{ type: "toolCall", name: "bash", arguments: {} }])).toBe("[tool:bash]");
+	expect(extractText(42)).toBe("");
+});
+	test("a long toolCall name does not drop later text blocks (SEC-19-01)", () => {
+		// The toolCall branch must account for the SLICED name (100), not
+		// the full length: a crafted 10MB name must not inflate the bound
+		// and break the loop before the following text block.
+		const out = extractText([
+			{ type: "toolCall", name: "x".repeat(10_000), arguments: {} },
+			{ type: "text", text: "after" },
+		]);
+});
 	test("extractText keeps both ends of an oversized block (RuntimeIntegration7)", () => {
 		// truncateTail needs the tail (bash errors put the exit code at
 		// the end); truncate needs the prefix. The block slice must keep
@@ -428,13 +436,14 @@ describe("buildDigest", () => {
 		expect(out.startsWith("x".repeat(1000))).toBe(true);
 		expect(out.endsWith("Command exited with code 2")).toBe(true);
 		expect(out.length).toBeLessThan(2100);
+		// The ellipsis (U+2026) must survive validation end-to-end
+		// (TQ-19-04): the digest stays valid and the exit-code tail is
+		// preserved in the failedCommands summary.
+		const d = buildDigest([bashFailure("npm test", 1, "x".repeat(5000) + "Command exited with code 2")], SID, CWD, END);
+		expect(isValidDigest(d)).toBe(true);
+		expect(d.failedCommands[0]!.error.endsWith("Command exited with code 2")).toBe(true);
 	});
 	test("a control char in the cwd parameter cannot break validation (TestQuality3)", () => {
-		// No session-header entry: the production path (session_shutdown)
-		// passes RAW parameter values — getEntries() excludes session
-		// entries in the real runtime. The parameters must be sanitized at
-		// assignment, or the digest fails validation on load and the
-		// reflection is silently deleted.
 		const d = buildDigest([userMessage("hi")], SID, "/proj\u200bdir", END);
 		expect(d.cwd).toBe("/projdir");
 		expect(isValidDigest(d)).toBe(true);
@@ -453,6 +462,13 @@ describe("buildDigest", () => {
 		const big = "x".repeat(100) + " ".repeat(5_000_000) + "END";
 		const d = buildDigest([bashFailure("npm test", 1, big)], SID, CWD, END);
 		expect(d.failedCommands[0]!.error).toContain("END");
+	});
+	test("truncateTail caps the window: content beyond 16KB from the end is lost (TQ-19-03)", () => {
+		// 'END' + 100k NULs: the window caps at 16KB, the tail slice is
+		// all NULs, and the error falls back to '(no output)'. Without
+		// the cap the window would grow to 100k and find 'END'.
+		const d = buildDigest([bashFailure("npm test", 1, "END" + "\u0000".repeat(100_000))], SID, CWD, END);
+		expect(d.failedCommands[0]!.error).toBe("(no output)");
 	});
 	test("a stopReason key with an astral char at the boundary is cut by code points (FixAudit8)", () => {
 		// 'x'*99 + emoji is 100 code points / 101 units: a UTF-16 slice

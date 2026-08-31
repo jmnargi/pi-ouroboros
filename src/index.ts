@@ -348,8 +348,13 @@ export default function (pi: ExtensionAPI): void {
 		// The queued reflection was delivered in this turn.
 		// The marker is no longer needed.
 		// The plugin deletes it here, not at before_agent_start.
-		// The LLM call can fail after the message drains.
-		// The marker must survive so the next session_start re-injects it.
+		// The LLM call can fail after the message drains: the runtime
+		// persists the drained message at message_end BEFORE the call,
+		// so a failed first call still leaves the reflection in the
+		// session history. The next session_start recovery finds it
+		// there and deletes the marker (no re-inject) — the reflection
+		// is treated as delivered to avoid double delivery; its content
+		// stays visible in the session context (SEC-19-02).
 		// Skipped entirely when nothing was injected (the common case):
 		// zero file IO per turn.
 		if (hasInjectedDigests) {
@@ -459,9 +464,11 @@ export default function (pi: ExtensionAPI): void {
 							? "rule not recorded — lesson is empty after normalization"
 							: reason === "too-large"
 								? "rule not recorded — rules.md exceeds 1MB; trim it manually"
-								: reason === "conflict"
-									? `rule not recorded — concurrent write (${count}/${cap})`
-									: `rule recorded (${count}/${cap}) — active from next turn`;
+								: reason === "symlink"
+									? "rule not recorded — ouroboros dir is a symlink; refusing to write"
+									: reason === "conflict"
+										? `rule not recorded — concurrent write (${count}/${cap})`
+										: `rule recorded (${count}/${cap}) — active from next turn`;
 				return {
 					content: [{ type: "text" as const, text }],
 					details: { added, reason, count, cap },

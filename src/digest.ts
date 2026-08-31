@@ -123,8 +123,11 @@ export function extractText(content: unknown): string {
 			parts.push(t);
 			total += t.length;
 		} else if (b.type === "toolCall" && typeof b.name === "string") {
+			// Account for what is actually pushed: the name is sliced to
+			// 100, so a crafted 10MB name must not inflate the bound and
+			// drop every later block (SEC-19-01).
 			parts.push(`[tool:${b.name.slice(0, 100)}]`);
-			total += b.name.length + 7;
+			total += Math.min(b.name.length, 100) + 7;
 		}
 	}
 	return parts.join("\n");
@@ -200,7 +203,7 @@ function truncate(s: string, max: number): string {
 			.trim()
 			.replace(/\s+/g, " ");
 		if (cpCountAtMost(cleaned, max) > max || bound >= s.length || bound >= MAX_TRUNCATE_WINDOW) break;
-		bound = Math.min(s.length, bound * 2);
+		bound = Math.min(s.length, bound * 2, MAX_TRUNCATE_WINDOW);
 	}
 	if (cpCountAtMost(cleaned, max) <= max) return cleaned;
 	return `${cpPrefix(cleaned, max)}…`;
@@ -241,10 +244,33 @@ function truncateTail(s: string, max: number): string {
 			.trim()
 			.replace(/\s+/g, " ");
 		if (cpCountAtMost(cleaned, max) > max || bound >= s.length || bound >= MAX_TRUNCATE_WINDOW) break;
-		bound = Math.min(s.length, bound * 2);
+		bound = Math.min(s.length, bound * 2, MAX_TRUNCATE_WINDOW);
 	}
 	if (cpCountAtMost(cleaned, max) <= max) return cleaned;
 	return `…${cpSuffix(cleaned, max)}`;
+}
+
+/** Bounded JSON.stringify for tool-call args: string values are sliced to
+ * 200, arrays (top-level and nested) to 200 elements, and the walk stops
+ * after 200 properties. A crafted deeply-nested args object cannot
+ * serialize to a multi-MB string (OURO-17-07, SEC-18-03). Exported for
+ * direct testing. */
+export function stringifyArgs(args: unknown): string {
+	if (typeof args !== "object" || args === null) return "";
+	try {
+		const bounded = Array.isArray(args) ? args.slice(0, 200) : args;
+		let props = 0;
+		return JSON.stringify(bounded, (_k, v) => {
+			if (++props > 200) return undefined;
+			// Slice nested arrays too: JSON.stringify renders undefined
+			// array elements as null, so an unbounded nested array would
+			// still serialize in full (SEC-18-03).
+			if (Array.isArray(v)) return v.slice(0, 200);
+			return typeof v === "string" ? v.slice(0, 200) : v;
+		});
+	} catch {
+		return "";
+	}
 }
 
 function asNumber(v: unknown): number {
@@ -478,24 +504,7 @@ export function buildDigest(
 	// the session file — accepted, FixAudit15). A circular or too-deep
 	// object throws. The args are dropped rather than losing the digest.
 	for (const t of rawToolCalls) {
-		let args = "";
-		if (typeof t.args === "object" && t.args !== null) {
-			try {
-				const bounded = Array.isArray(t.args) ? t.args.slice(0, 200) : t.args;
-				let props = 0;
-				args = JSON.stringify(bounded, (_k, v) => {
-					if (++props > 200) return undefined;
-					// Slice nested arrays too: JSON.stringify renders
-					// undefined array elements as null, so an unbounded
-					// nested array would still serialize in full (SEC-18-03).
-					if (Array.isArray(v)) return v.slice(0, 200);
-					return typeof v === "string" ? v.slice(0, 200) : v;
-				});
-			} catch {
-				args = "";
-			}
-		}
-		digest.toolCalls.push({ tool: t.tool, args: truncate(args, TOOL_ARGS_MAX_CHARS) });
+		digest.toolCalls.push({ tool: t.tool, args: truncate(stringifyArgs(t.args), TOOL_ARGS_MAX_CHARS) });
 	}
 	for (const t of rawAssistantText) {
 		digest.assistantText.push(truncate(t, PROMPT_MAX_CHARS));

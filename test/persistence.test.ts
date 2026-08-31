@@ -153,6 +153,32 @@ describe("rules", () => {
 		expect((await appendRule(dir, lesson)).added).toBe(true);
 		expect(loadRules(dir)).toEqual(["real lesson"]);
 	});
+	test("appendRule caps the window: a >16KB garbage prefix loses the lesson (TQ-19-02)", async () => {
+		const dir = tmpDataDir();
+		// 100k control chars exceed MAX_RULE_WINDOW: the window caps at
+		// 16KB, the cleaned prefix is empty, and the lesson is not
+		// scanned. Without the cap the window would grow to 100k and
+		// find the lesson (added: true).
+		const lesson = "\u0000".repeat(100_000) + "real lesson";
+		expect((await appendRule(dir, lesson)).reason).toBe("empty");
+		expect(loadRules(dir)).toEqual([]);
+	});
+	test("rules are never read or written through a symlinked ouroboros dir (RuntimeIntegration8)", async () => {
+		const dir = tmpDataDir();
+		const victim = fs.mkdtempSync(path.join(os.tmpdir(), "ouroboros-victim-"));
+		tmpDirs.push(victim);
+		fs.writeFileSync(path.join(victim, "rules.md"), "- injected rule\n");
+		fs.symlinkSync(victim, path.join(dir, "ouroboros"));
+		// loadRules must not read the victim's rules (they would be
+		// injected into the system prompt every turn).
+		expect(loadRules(dir)).toEqual([]);
+		// appendRule must refuse to write into the victim.
+		expect((await appendRule(dir, "new rule")).reason).toBe("symlink");
+		expect(fs.readFileSync(path.join(victim, "rules.md"), "utf8")).toBe("- injected rule\n");
+		// clearRules must not overwrite the victim.
+		clearRules(dir);
+		expect(fs.readFileSync(path.join(victim, "rules.md"), "utf8")).toBe("- injected rule\n");
+	});
 
 	test("appendRule calls from one turn do not lose rules", async () => {
 		const dir = tmpDataDir();
@@ -999,6 +1025,7 @@ describe("skills", () => {
 		expect(trueContent).toContain('description: "true"');
 		expect(quoteContent).toContain('description: "say \\"hi\\" now"');
 		expect(dashContent).toContain('description: "- leading dash"');
+		expect(colonContent).toContain('description: "Fix flaky tests: run them 10 times"');
 	});
 	test("listSkills sees a SKILL.md written into an existing subdir (TQ-17-03)", () => {
 		const dir = tmpDataDir();

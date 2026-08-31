@@ -90,6 +90,11 @@ let rulesMissingFile: string | null = null;
 let rulesMissingAt = 0;
 /** Load rules as a list of non-empty lines (comments starting with `#` kept). */
 export function loadRules(dataDir: string): string[] {
+	// Never read through a symlinked ouroboros dir (same trust boundary
+	// as every other ouroboros state path): the rules would come from
+	// the target and be injected into the system prompt every turn
+	// (RuntimeIntegration8).
+	if (ouroborosDirIsSymlink(dataDir)) return [];
 	const file = rulesFile(dataDir);
 	if (rulesMissingFile === file && Date.now() - rulesMissingAt < 1000) return [];
 	rulesMissingFile = null;
@@ -183,7 +188,11 @@ export function appendRule(
 	rule: string,
 	cap: number = DEFAULT_RULES_CAP,
 	maxChars: number = DEFAULT_RULES_MAX_CHARS,
-): { added: boolean; reason: "added" | "duplicate" | "conflict" | "empty" | "too-large"; count: number; cap: number } {
+): { added: boolean; reason: "added" | "duplicate" | "conflict" | "empty" | "too-large" | "symlink"; count: number; cap: number } {
+	// Never write through a symlinked ouroboros dir (same trust boundary
+	// as every other ouroboros state path): the lesson would land in the
+	// target (RuntimeIntegration8).
+	if (ouroborosDirIsSymlink(dataDir)) return { added: false, reason: "symlink", count: 0, cap };
 	// Bypass the negative cache. A rules.md created by another process
 	// within the 1s window must be seen. Otherwise this write would
 	// clobber it.
@@ -218,7 +227,7 @@ export function appendRule(
 			normalized = candidate;
 			break;
 		}
-		window = Math.min(rule.length, window * 2);
+		window = Math.min(rule.length, window * 2, MAX_RULE_WINDOW);
 	}
 	const chars = Array.from(normalized);
 	const capped = chars.length <= MAX_RULE_CHARS ? normalized : chars.slice(0, MAX_RULE_CHARS).join("");
@@ -259,6 +268,11 @@ export function appendRule(
 }
 
 function writeRules(dataDir: string, rules: string[]): void {
+	// Never write through a symlinked ouroboros dir (same trust boundary
+	// as every other ouroboros state path): the file would land in the
+	// target (RuntimeIntegration8). The rules.md FILE symlink write-through
+	// below is a separate, documented feature.
+	if (ouroborosDirIsSymlink(dataDir)) return;
 	let file = rulesFile(dataDir);
 	// Write through a symlink instead of replacing it — atomicWrite renames
 	// over the link, silently destroying the user's symlink setup. lstatSync
@@ -787,7 +801,7 @@ export function writeSkill(dataDir: string, name: string, description: string, b
 	const dir = path.join(skillsRoot, name);
 	const file = path.join(dir, "SKILL.md");
 	// Check the subdir BEFORE mkdir: a dangling symlink at skills/<name>
-	// would make mkdirSync throw a misleading EEXIST (FixAudit15).
+	// would make mkdirSync throw a misleading ENOENT (RuntimeIntegration6).
 	let dirStat: fs.Stats | null = null;
 	try {
 		dirStat = fs.lstatSync(dir);

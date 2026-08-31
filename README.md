@@ -75,6 +75,13 @@ The tool appends, dedupes, and caps the rules.
 The tool strips control characters from rules.
 The tool refuses to overwrite an existing skill.
 The tool caps the skill body and description.
+The plugin refuses to read or write rules through a symlinked ouroboros dir.
+The plugin refuses to read or write digests through a symlinked ouroboros dir.
+The plugin refuses to read or write skills through a symlinked skills dir.
+The plugin treats a symlinked dir as untrusted.
+The plugin never follows a symlinked ouroboros, digests, or skills dir.
+The plugin does follow a symlinked rules.md file.
+The rules.md file symlink is a deliberate feature for dotfiles setups.
 The reflection message tells the model to use the tool, not the write tool.
 If the model uses its write tool anyway, it overwrites the file and bypasses the dedup and cap.
 
@@ -148,7 +155,7 @@ npx tsc --noEmit
 ```
 
 The tests cover digest extraction, persistence, prompt building, and the extension entry point.
-The test suite has 201 tests.
+The test suite has 205 tests.
 The reflection happens at the start of the next session.
 The reflection does not happen at shutdown.
 Shutdown must stay fast.
