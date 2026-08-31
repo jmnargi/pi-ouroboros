@@ -282,18 +282,28 @@ describe("rules", () => {
 		expect(loadRules(dir)).toEqual([]);
 	});
 	test("appendRule bypasses the negative cache so an external rules.md survives (TQ-14-01)", async () => {
-		const dir = tmpDataDir();
-		// 1. A missing rules.md sets the negative cache (1s window).
-		expect(loadRules(dir)).toEqual([]);
-		// 2. Another process creates rules.md within the window.
-		fs.mkdirSync(path.dirname(rulesFile(dir)), { recursive: true });
-		fs.writeFileSync(rulesFile(dir), "- external rule\n");
-		// 3. appendRule must see the external rule. Without the
-		// top-of-appendRule invalidateRulesCache, loadRules returns [] and
-		// the write clobbers the external rule.
-		await appendRule(dir, "own rule");
-		// 4. Both rules survive.
-		expect(loadRules(dir)).toEqual(["- external rule", "own rule"]);
+		// Freeze the clock: the discriminating step (appendRule's internal
+		// loadRules) must run inside the 1s negative-cache window, or a
+		// >1s stall would expire the cache and pass vacuously (TQ29-01).
+		const realNow = Date.now;
+		const fixed = realNow();
+		Date.now = () => fixed;
+		try {
+			const dir = tmpDataDir();
+			// 1. A missing rules.md sets the negative cache (1s window).
+			expect(loadRules(dir)).toEqual([]);
+			// 2. Another process creates rules.md within the window.
+			fs.mkdirSync(path.dirname(rulesFile(dir)), { recursive: true });
+			fs.writeFileSync(rulesFile(dir), "- external rule\n");
+			// 3. appendRule must see the external rule. Without the
+			// top-of-appendRule invalidateRulesCache, loadRules returns [] and
+			// the write clobbers the external rule.
+			await appendRule(dir, "own rule");
+			// 4. Both rules survive.
+			expect(loadRules(dir)).toEqual(["- external rule", "own rule"]);
+		} finally {
+			Date.now = realNow;
+		}
 	});
 	test("rulesMissing negative cache is a single entry, cleared by any different-file load", () => {
 		// Freeze the clock: the discriminating step must run inside the

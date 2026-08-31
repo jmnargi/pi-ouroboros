@@ -114,6 +114,30 @@ function sessionHasOuroborosMessage(entries: unknown[], sessionId: string): bool
 	return false;
 }
 
+/** True when a benign assistant message follows the reflection for
+ * sessionId in the session history. A thrown first-call failure persists
+ * the custom message at message_end but never processes it: the marker
+ * must survive for a new-session re-inject (RuntimeIntegration19,
+ * OURO-R30-01). */
+function processedInHistory(entries: unknown[], sessionId: string): boolean {
+	const needle = `\nsession: ${escapeTags(sessionId)}\n`;
+	let seen = false;
+	for (const raw of entries) {
+		if (!raw || typeof raw !== "object") continue;
+		const entry = raw as { type?: unknown; customType?: unknown; content?: unknown; message?: { role?: unknown; stopReason?: unknown } };
+		if (!seen) {
+			if (entry.type === "custom_message" && entry.customType === OUROBOROS_CUSTOM_TYPE && typeof entry.content === "string" && entry.content.includes(needle)) {
+				seen = true;
+			}
+			continue;
+		}
+		if (entry.type === "message" && entry.message?.role === "assistant" && entry.message.stopReason !== "error" && entry.message.stopReason !== "aborted") {
+			return true;
+		}
+	}
+	return false;
+}
+
 export default function (pi: ExtensionAPI): void {
 	if (process.env.PI_OUROBOROS_DISABLED === "1") return;
 
@@ -460,7 +484,17 @@ export default function (pi: ExtensionAPI): void {
 						// so a new session re-injects it (TQ-R24-01).
 						continue;
 					} else if (sessionHasOuroborosMessage(entries, digest.sessionId)) {
-						deleteInjectedDigest(dataDir, sid);
+						// The reflection is in the session history (persisted
+						// at message_end before the LLM call). On a failed
+						// run it was processed only if a benign assistant
+						// message follows it: a thrown first-call failure
+						// (handleRunFailure emits agent_end with only the
+						// failure message) must keep the marker so a new
+						// session re-injects it (RuntimeIntegration19,
+						// OURO-R30-01).
+						if (!failed || processedInHistory(entries, digest.sessionId)) {
+							deleteInjectedDigest(dataDir, sid);
+						}
 					}
 				}
 			} catch {

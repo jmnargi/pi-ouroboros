@@ -438,9 +438,11 @@ describe("buildDigest", () => {
 		// top. The unbounded form would emit ~4.4MB with 999,800 nulls.
 		const out = stringifyArgs({ command: Array.from({ length: 1_000_000 }, (_, i) => i) });
 		expect(out.length).toBeLessThan(2000);
-		// The props cap nulls only the final two elements of the sliced
-		// array — the unbounded form would be full of nulls.
-		expect(out.match(/null/g)?.length ?? 0).toBeLessThanOrEqual(2);
+		// The props cap nulls only the final element of the sliced array
+		// (199 of 200 elements kept + 1 null) — the unbounded form would
+		// be full of nulls. The exact count pins the props/array-element
+		// interaction (SEC-28-02, TQ29-02).
+		expect(out.match(/null/g)).toHaveLength(1);
 	});
 	test("stringifyArgs keeps exactly 200 properties (SEC-28-02)", () => {
 		// The root visit must not consume a property slot: a 200-property

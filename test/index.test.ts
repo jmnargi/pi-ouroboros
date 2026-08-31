@@ -852,6 +852,33 @@ describe("before_agent_start", () => {
 		});
 		expect(readdirSync(digestsDir(dataDir))).toEqual([]);
 	});
+	test("agent_end keeps the marker on a THROWN first-call failure (RuntimeIntegration19)", async () => {
+		// A thrown run (handleRunFailure) emits agent_end with only the
+		// failure message. The custom message was persisted at message_end
+		// but the first LLM call never processed it: the marker must
+		// survive so a new session re-injects the reflection.
+		saveDigest(dataDir, buildDigest(notableEntries(), "sess-1", "/proj", "2026-08-30T12:00:00.000Z"));
+		await api.fire("session_start", {}, fakeCtx());
+		expect(readdirSync(digestsDir(dataDir))).toEqual(["sess-1.injected.json"]);
+		const entries = [{ type: "custom_message", customType: OUROBOROS_CUSTOM_TYPE, content: "[Ouroboros] ...\nsession: sess-1\ncwd: /proj" }];
+		await api.fire("agent_end", { messages: [{ role: "assistant", stopReason: "error" }] }, fakeCtx({ sessionManager: { getEntries: () => entries } }));
+		expect(readdirSync(digestsDir(dataDir))).toEqual(["sess-1.injected.json"]);
+	});
+	test("agent_end deletes the marker on a THROWN later-turn failure after processing (RuntimeIntegration19)", async () => {
+		// Turn 1 processed the reflection (benign assistant in the
+		// history); turn 2 threw. The marker must be deleted — keeping it
+		// would re-inject the reflection into a new session (double
+		// delivery).
+		saveDigest(dataDir, buildDigest(notableEntries(), "sess-1", "/proj", "2026-08-30T12:00:00.000Z"));
+		await api.fire("session_start", {}, fakeCtx());
+		expect(readdirSync(digestsDir(dataDir))).toEqual(["sess-1.injected.json"]);
+		const entries = [
+			{ type: "custom_message", customType: OUROBOROS_CUSTOM_TYPE, content: "[Ouroboros] ...\nsession: sess-1\ncwd: /proj" },
+			{ type: "message", message: { role: "assistant", stopReason: "stop" } },
+		];
+		await api.fire("agent_end", { messages: [{ role: "assistant", stopReason: "error" }] }, fakeCtx({ sessionManager: { getEntries: () => entries } }));
+		expect(readdirSync(digestsDir(dataDir))).toEqual([]);
+	});
  });
 describe("ouroboros_learn tool", () => {
 	const tool = (): MockTool => api.tools.find((t) => t.name === "ouroboros_learn")!;
