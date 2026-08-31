@@ -195,18 +195,20 @@ describe("rules", () => {
 		// read-modify-write.
 		const huge = "- " + "x".repeat(2 * 1024 * 1024);
 		fs.writeFileSync(rulesFile(dir), huge);
-		expect((await appendRule(dir, "new rule")).reason).toBe("conflict");
+		expect((await appendRule(dir, "new rule")).reason).toBe("too-large");
 		expect(fs.readFileSync(rulesFile(dir), "utf8")).toBe(huge);
 	});
-	test("loadRules bounds the line count of a rules file (Security11)", () => {
+	test("loadRules bounds the line count and keeps the newest lines (Security11, FixAudit13)", () => {
 		const dir = tmpDataDir();
 		fs.mkdirSync(path.dirname(rulesFile(dir)), { recursive: true });
 		// 20k one-char lines fit in 1MB but exceed the 10k line bound:
-		// the split limit must cap the materialized array.
+		// the read must keep the LAST MAX_RULES_LINES lines (the newest
+		// lessons take priority) without materializing a 20k-element array.
 		fs.writeFileSync(rulesFile(dir), Array.from({ length: 20_000 }, (_, i) => `r${i}`).join("\n"));
 		const rules = loadRules(dir);
 		expect(rules.length).toBeLessThanOrEqual(10_001);
-		expect(rules[0]).toBe("r0");
+		expect(rules[0]).toBe("r9999");
+		expect(rules[rules.length - 1]).toBe("r19999");
 	});
 
 	test("loadRules degrades to empty on unreadable file", () => {
@@ -316,7 +318,15 @@ describe("digests", () => {
 		saveDigest(dir, digest());
 		saveLastDigest(dir, digest());
 		expect(fs.readdirSync(victim)).toEqual(["package.json"]);
+		// Pre-seed the victim with a valid last-digest.json: loadLastDigest
+		// must return null because of its OWN guard, not because the file
+		// is missing (TQ-16-06).
+		fs.writeFileSync(path.join(victim, "last-digest.json"), JSON.stringify(digest()));
 		expect(loadLastDigest(dir)).toBeNull();
+		// The loaders (TQ-16-04): loadDigest/readInjectedDigest must not
+		// read the victim's files either.
+		expect(loadDigest(dir, "package")).toBeNull();
+		expect(readInjectedDigest(dir, "package")).toBeNull();
 	});
 	test("deleteDigest/deleteInjectedDigest never throw on a failed rmSync (TQ-14-03)", () => {
 		const dir = tmpDataDir();
@@ -588,6 +598,23 @@ describe("digests", () => {
 		expect(() => readInjectedDigest(dir, "sess-io")).toThrow();
 		expect(fs.existsSync(file)).toBe(true);
 	});
+	test("loadDigest rejects a FIFO at the digest path without blocking (Security12)", () => {
+		const dir = tmpDataDir();
+		const file = digestFile(dir, "sess-fifo");
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		// A FIFO has size 0 (passes the size bound) but would block a
+		// read forever. The special-file check must reject it.
+		const r = Bun.spawnSync(["mkfifo", file]);
+		if (r.exitCode !== 0) return; // non-Unix filesystem — skip
+		expect(loadDigest(dir, "sess-fifo")).toBeNull();
+	});
+	test("readInjectedDigest skips a file over the size bound (TQ-16-03)", () => {
+		const dir = tmpDataDir();
+		const file = `${digestFile(dir, "sess-huge").slice(0, -".json".length)}.injected.json`;
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		fs.writeFileSync(file, JSON.stringify({ ...digest(), cwd: "x".repeat(5_000_000) }));
+		expect(readInjectedDigest(dir, "sess-huge")).toBeNull();
+	});
 	test("listInjectedDigests skips non-round-tripping stems (Security7)", () => {
 		const dir = tmpDataDir();
 		const digests = path.join(dir, "ouroboros", "digests");
@@ -768,7 +795,10 @@ describe("digests", () => {
 		expect([...loaded!.cwd]).toHaveLength(2000);
 		// A file over the size bound is not writer-produced: skipped
 		// entirely (Security11). The multi-million-element arrays below
-		// also exceed the bound, so they are skipped before parsing.
+		// also exceed the bound, so they are skipped before parsing. The
+		// array cases pin nothing observable (the validator rejects
+		// over-cap arrays either way) — the memory-only guards are
+		// verified by inspection.
 		fs.writeFileSync(file, JSON.stringify({ ...digest(), cwd: "x".repeat(5_000_000) }));
 		expect(loadDigest(dir, "sess-huge")).toBeNull();
 		fs.writeFileSync(file, JSON.stringify({ ...digest(), userPrompts: Array.from({ length: 5_000_000 }, () => "p") }));
@@ -779,11 +809,21 @@ describe("digests", () => {
 		expect(loadDigest(dir, "sess-huge")).toBeNull();
 		// 21 stopReasons keys where the first 20 strip to empty: the 21st
 		// (non-numeric value) must still land in `cleaned` and fail the
-		// value check — the digest stays rejected (FixAudit12).
+		// value check — the digest stays rejected (FixAudit12). The 20
+		// control chars are distinct (String.fromCharCode(0..19)), so
+		// "bad" is truly the 21st key.
 		const stopReasons: Record<string, unknown> = Object.create(null);
-		for (let i = 0; i < 20; i++) stopReasons[String.fromCharCode(i === 8 ? 0x0b : i === 9 ? 0x0c : i === 10 ? 0x0e : i)] = 1;
+		for (let i = 0; i < 20; i++) stopReasons[String.fromCharCode(i)] = 1;
 		stopReasons["bad"] = "x";
 		fs.writeFileSync(file, JSON.stringify({ ...digest(), stopReasons }));
+		expect(loadDigest(dir, "sess-huge")).toBeNull();
+		// 22 keys where the first 21 strip to empty: the loop hits the
+		// 21-key bound and the digest is rejected (over-bounded stays
+		// rejected — FixAudit13).
+		const stopReasons22: Record<string, unknown> = Object.create(null);
+		for (let i = 0; i < 21; i++) stopReasons22[String.fromCharCode(i)] = 1;
+		stopReasons22["bad"] = "x";
+		fs.writeFileSync(file, JSON.stringify({ ...digest(), stopReasons: stopReasons22 }));
 		expect(loadDigest(dir, "sess-huge")).toBeNull();
 		// loadLastDigest applies the same size bound (Security11).
 		fs.writeFileSync(lastDigestFile(dir), JSON.stringify({ ...digest(), cwd: "x".repeat(5_000_000) }));
@@ -906,6 +946,19 @@ describe("skills", () => {
 		expect(dashContent).toContain('description: "- leading dash"');
 		expect(colonContent).toContain('description: "Fix flaky tests: run them 10 times"');
 	});
+	test("writeSkill strips control chars and lone surrogates from description and body (Security12)", () => {
+		const dir = tmpDataDir();
+		// The description and body are advertised in the system prompt
+		// (pi's escapeXml does not escape control chars). They must be
+		// stripped like the rules path.
+		writeSkill(dir, "clean-skill", "desc\u0007with\u200bcontrols", "body\u0000with\ud800 lone");
+		const content = fs.readFileSync(path.join(dir, "skills", "clean-skill", "SKILL.md"), "utf8");
+		expect(content).toContain("description: \"descwithcontrols\"");
+		expect(content).toContain("bodywith lone");
+		expect(content).not.toContain("\u0007");
+		expect(content).not.toContain("\u200b");
+		expect(content).not.toContain("\ud800");
+	});
 
 	test("listSkills ignores dirs without SKILL.md", () => {
 		const dir = tmpDataDir();
@@ -934,6 +987,11 @@ describe("skills", () => {
 		fs.symlinkSync(victim, path.join(dir2, "skills", "planted"));
 		expect(() => writeSkill(dir2, "planted", "desc", "body")).toThrow(/symlink/);
 		expect(fs.readdirSync(victim)).toEqual([]);
+		// A DANGLING symlink at the skills root is also refused
+		// (RuntimeIntegration5): existsSync would miss it, lstatSync sees it.
+		const dir3 = tmpDataDir();
+		fs.symlinkSync(path.join(dir3, "nonexistent-target"), path.join(dir3, "skills"));
+		expect(() => writeSkill(dir3, "my-skill", "desc", "body")).toThrow(/symlink/);
 	});
 });
 

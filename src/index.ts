@@ -453,9 +453,11 @@ export default function (pi: ExtensionAPI): void {
 						? `duplicate rule skipped (${count}/${cap})`
 						: reason === "empty"
 							? "rule not recorded — lesson is empty after normalization"
-							: reason === "conflict"
-								? `rule not recorded — concurrent write (${count}/${cap})`
-								: `rule recorded (${count}/${cap}) — active from next turn`;
+							: reason === "too-large"
+								? "rule not recorded — rules.md exceeds 1MB; trim it manually"
+								: reason === "conflict"
+									? `rule not recorded — concurrent write (${count}/${cap})`
+									: `rule recorded (${count}/${cap}) — active from next turn`;
 				return {
 					content: [{ type: "text" as const, text }],
 					details: { added, reason, count, cap },

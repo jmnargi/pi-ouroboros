@@ -99,16 +99,29 @@ export function loadRules(dataDir: string): string[] {
 		// Bound the read: a multi-MB rules.md (model write-tool bypass or
 		// hand-edit) must not be read and split into a giant line array.
 		// The appendRule cap is 3000 chars; 1MB is a generous ceiling.
-		if (stat.size > MAX_RULES_FILE_BYTES) return [];
+		// A non-regular file (FIFO, socket) would block the read forever.
+		if (!stat.isFile() || stat.size > MAX_RULES_FILE_BYTES) return [];
 		const text = fs.readFileSync(file, "utf8");
 		// Strip control chars and lone surrogates at the injection boundary
 		// too. Older plugin versions or hand-editing bypass appendRule's
 		// strip. A lone surrogate in the system prompt can make the
-		// provider reject the request. The split limit bounds the line
-		// count: a 1MB file of 1-char lines must not materialize a
-		// 500k-element array (the default cap is 50 rules).
-		const rules = text
-			.split("\n", MAX_RULES_LINES + 1)
+		// provider reject the request. Bound the line count: a 1MB file
+		// of 1-char lines must not materialize a 500k-element array (the
+		// default cap is 50 rules). Keep the LAST MAX_RULES_LINES lines —
+		// split-with-limit drops the tail, and the newest rules are the
+		// freshest lessons. Scan from the end for the (MAX_RULES_LINES+1)th
+		// newline and split only that tail (O(n) scan, no array).
+		let start = 0;
+		let newlines = 0;
+		for (let i = text.length - 1; i >= 0; i--) {
+			if (text[i] === "\n" && ++newlines > MAX_RULES_LINES) {
+				start = i + 1;
+				break;
+			}
+		}
+		const tail = start === 0 ? text : text.slice(start);
+		const rules = tail
+			.split("\n")
 			.map((l) =>
 				l
 					.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f]/g, "")
@@ -161,7 +174,7 @@ export function appendRule(
 	rule: string,
 	cap: number = DEFAULT_RULES_CAP,
 	maxChars: number = DEFAULT_RULES_MAX_CHARS,
-): { added: boolean; reason: "added" | "duplicate" | "conflict" | "empty"; count: number; cap: number } {
+): { added: boolean; reason: "added" | "duplicate" | "conflict" | "empty" | "too-large"; count: number; cap: number } {
 	// Bypass the negative cache. A rules.md created by another process
 	// within the 1s window must be seen. Otherwise this write would
 	// clobber it.
@@ -171,25 +184,26 @@ export function appendRule(
 	// Preserve it for manual repair.
 	try {
 		if (fs.statSync(rulesFile(dataDir)).size > MAX_RULES_FILE_BYTES) {
-			return { added: false, reason: "conflict", count: 0, cap };
+			return { added: false, reason: "too-large", count: 0, cap };
 		}
 	} catch {
 		// missing file is fine
 	}
+	// Bound the input BEFORE the regex passes: a multi-MB lesson must not
+	// materialize multi-MB intermediate strings. MAX_RULE_CHARS*2+1 units
+	// cover the first MAX_RULE_CHARS code points even when every one is
+	// astral.
+	const bounded = rule.slice(0, MAX_RULE_CHARS * 2 + 1);
 	// Strip control chars and lone surrogates: a rule is injected into the
 	// system prompt verbatim. The cap is by code points — a UTF-16 slice
 	// could split a surrogate pair and store a lone surrogate.
-	const normalized = rule
+	const normalized = bounded
 		.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f]/g, "")
 		.replace(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g, "")
 		.trim()
 		.replace(/\s+/g, " ");
-	// Bound the input before the code-point pass: a multi-MB lesson must
-	// not materialize a multi-MB array. MAX_RULE_CHARS*2+1 units cover the
-	// first MAX_RULE_CHARS code points even when every one is astral.
-	const bounded = normalized.slice(0, MAX_RULE_CHARS * 2 + 1);
-	const chars = Array.from(bounded);
-	const capped = chars.length <= MAX_RULE_CHARS ? bounded : chars.slice(0, MAX_RULE_CHARS).join("");
+	const chars = Array.from(normalized);
+	const capped = chars.length <= MAX_RULE_CHARS ? normalized : chars.slice(0, MAX_RULE_CHARS).join("");
 	// A rule with no letter or number content is not a lesson. Every such
 	// rule shares the empty dedupKey. The first would shadow all later
 	// ones as 'duplicate'. Unicode-aware: CJK lessons (the model can write
@@ -443,11 +457,19 @@ function migrateDigest(p: unknown): unknown {
 				added++;
 			}
 		}
+		// The loop hit the 21-key bound: keys beyond it (possibly with bad
+		// values) were never seen. Leave the object unsanitized so the
+		// validator's >20-key count check rejects the digest (over-bounded
+		// stays rejected).
+		if (n > 21) return p;
 		d.stopReasons = cleaned;
 	}
 	return d;
 }
 export function loadDigest(dataDir: string, sessionId: string): OuroborosDigest | null {
+	// Never read through a symlinked digests dir (same trust boundary as
+	// every other digest function): the file would come from the target.
+	if (digestsDirIsSymlink(dataDir)) return null;
 	// A JSON.parse failure means the file is corrupt. Return null so the
 	// caller deletes it. A readFileSync failure is transient. Throw so the
 	// caller skips the digest and keeps the file. A file over the size
@@ -455,7 +477,10 @@ export function loadDigest(dataDir: string, sessionId: string): OuroborosDigest 
 	let text: string;
 	try {
 		const file = digestFile(dataDir, sessionId);
-		if (fs.statSync(file).size > MAX_DIGEST_FILE_BYTES) return null;
+		// A special file (FIFO, socket, device) would block the read
+		// forever. Directories still throw EISDIR (transient — kept).
+		const st = fs.statSync(file);
+		if ((!st.isFile() && !st.isDirectory()) || st.size > MAX_DIGEST_FILE_BYTES) return null;
 		text = fs.readFileSync(file, "utf8");
 	} catch {
 		throw new Error("digest unreadable");
@@ -471,6 +496,9 @@ export function loadDigest(dataDir: string, sessionId: string): OuroborosDigest 
 }
 /** Load a digest that is currently marked injected (awaiting delivery). */
 export function readInjectedDigest(dataDir: string, sessionId: string): OuroborosDigest | null {
+	// Never read through a symlinked digests dir (same trust boundary as
+	// every other digest function): the file would come from the target.
+	if (digestsDirIsSymlink(dataDir)) return null;
 	// Use the same corrupt-vs-transient split as loadDigest. A parse
 	// failure is corruption. The caller deletes the marker. An IO failure
 	// is transient. The caller keeps the marker. A file over the size
@@ -478,7 +506,10 @@ export function readInjectedDigest(dataDir: string, sessionId: string): Ouroboro
 	let text: string;
 	try {
 		const file = `${digestFile(dataDir, sessionId).slice(0, -".json".length)}.injected.json`;
-		if (fs.statSync(file).size > MAX_DIGEST_FILE_BYTES) return null;
+		// A special file (FIFO, socket, device) would block the read
+		// forever. Directories still throw EISDIR (transient — kept).
+		const st = fs.statSync(file);
+		if ((!st.isFile() && !st.isDirectory()) || st.size > MAX_DIGEST_FILE_BYTES) return null;
 		text = fs.readFileSync(file, "utf8");
 	} catch {
 		throw new Error("injected digest unreadable");
@@ -518,7 +549,10 @@ export function loadLastDigest(dataDir: string): OuroborosDigest | null {
 	if (digestsDirIsSymlink(dataDir)) return null;
 	try {
 		const file = lastDigestFile(dataDir);
-		if (fs.statSync(file).size > MAX_DIGEST_FILE_BYTES) return null;
+		// A special file (FIFO, socket, device) would block the read
+		// forever. Directories still throw EISDIR (transient — kept).
+		const st = fs.statSync(file);
+		if ((!st.isFile() && !st.isDirectory()) || st.size > MAX_DIGEST_FILE_BYTES) return null;
 		const parsed: unknown = JSON.parse(fs.readFileSync(file, "utf8"));
 		const migrated = migrateDigest(parsed);
 		return isValidDigest(migrated) ? (migrated as OuroborosDigest) : null;
@@ -684,9 +718,16 @@ export function isValidSkillName(name: string): boolean {
 	return /^[a-z0-9]+(-[a-z0-9]+)*$/.test(name) && name.length <= 64;
 }
 
-/** Normalize a description for safe YAML frontmatter (single line). */
+/** Normalize a description for safe YAML frontmatter (single line).
+ * Strip control chars and lone surrogates: the description is advertised
+ * in the system prompt (pi's escapeXml does not escape them), and a lone
+ * surrogate can make the provider reject the request. */
 export function normalizeDescription(description: string): string {
-	return description.trim().replace(/\s+/g, " ");
+	return description
+		.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f]/g, "")
+		.replace(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g, "")
+		.trim()
+		.replace(/\s+/g, " ");
 }
 
 /** Write a skill and return its SKILL.md path. Refuses to overwrite. */
@@ -694,8 +735,15 @@ export function writeSkill(dataDir: string, name: string, description: string, b
 	// Never write through a symlinked skills root or skill subdir: the
 	// SKILL.md would land in the target (same trust boundary as the
 	// digests guards). A missing skills root is fine — mkdir creates it.
+	// lstatSync (not existsSync): a DANGLING symlink is still detected.
 	const skillsRoot = skillsDir(dataDir);
-	if (fs.existsSync(skillsRoot) && fs.lstatSync(skillsRoot).isSymbolicLink()) {
+	let skillsRootStat: fs.Stats | null = null;
+	try {
+		skillsRootStat = fs.lstatSync(skillsRoot);
+	} catch (err) {
+		if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+	}
+	if (skillsRootStat?.isSymbolicLink()) {
 		throw new Error("skills dir is a symlink — refusing to write through it");
 	}
 	const dir = path.join(skillsRoot, name);
@@ -706,8 +754,12 @@ export function writeSkill(dataDir: string, name: string, description: string, b
 	}
 	// JSON.stringify produces a valid YAML double-quoted scalar.
 	// Descriptions with colons or leading dashes must not break the
-	// frontmatter.
-	const content = `---\nname: ${name}\ndescription: ${JSON.stringify(normalizeDescription(description))}\n---\n\n${body.trim()}\n`;
+	// frontmatter. The body is also stripped: pi advertises the skill
+	// content in the system prompt.
+	const content = `---\nname: ${name}\ndescription: ${JSON.stringify(normalizeDescription(description))}\n---\n\n${body
+		.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f]/g, "")
+		.replace(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g, "")
+		.trim()}\n`;
 	// The no-overwrite check must be atomic. Two concurrent writers can
 	// both pass an existsSync pre-check. The second rename would then
 	// overwrite the first. Write a unique tmp, then link it to the final

@@ -8,7 +8,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -285,6 +285,11 @@ describe("session_start", () => {
 		markDigestInjected(dataDir, "sess-a");
 		saveDigest(dataDir, buildDigest(notableEntries("sess-b"), "sess-b", "/proj", "2026-08-30T11:00:00.000Z"));
 		markDigestInjected(dataDir, "sess-b");
+		// Pin the marker mtimes: the recovery order is mtime-sorted, and
+		// coarse-granularity filesystems can tie the two writes.
+		const now = Date.now() / 1000;
+		utimesSync(join(digestsDir(dataDir), "sess-a.injected.json"), now - 2, now - 2);
+		utimesSync(join(digestsDir(dataDir), "sess-b.injected.json"), now - 1, now - 1);
 		const handler = api.fire.bind(api, "session_start");
 		await handler({}, fakeCtx());
 		expect(api.messages).toHaveLength(1);
@@ -300,6 +305,10 @@ describe("session_start", () => {
 		markDigestInjected(dataDir, "sess-a");
 		saveDigest(dataDir, buildDigest(notableEntries("sess-b"), "sess-b", "/proj", "2026-08-30T11:00:00.000Z"));
 		markDigestInjected(dataDir, "sess-b");
+		// Pin the marker mtimes (see Concurrency2/3 above).
+		const now = Date.now() / 1000;
+		utimesSync(join(digestsDir(dataDir), "sess-a.injected.json"), now - 2, now - 2);
+		utimesSync(join(digestsDir(dataDir), "sess-b.injected.json"), now - 1, now - 1);
 		await api.fire("session_start", {}, fakeCtx());
 		expect(api.messages).toHaveLength(1);
 		expect(api.messages[0]!.message.content).toContain("sess-b");
@@ -339,6 +348,17 @@ describe("session_start", () => {
 		// returns null, the marker is deleted, and nothing is queued.
 		mkdirSync(digestsDir(dataDir), { recursive: true });
 		writeFileSync(join(digestsDir(dataDir), "sess-x.injected.json"), "{not json");
+		const handler = api.fire.bind(api, "session_start");
+		await handler({}, fakeCtx());
+		expect(api.messages).toHaveLength(0);
+		expect(readdirSync(digestsDir(dataDir))).toEqual([]);
+	});
+	test("an oversized recovered digest's marker is removed without re-injecting (TQ-16-03)", async () => {
+		// The .injected.json marker is over the size bound:
+		// readInjectedDigest returns null (treated as corrupt), the marker
+		// is deleted, and nothing is queued.
+		mkdirSync(digestsDir(dataDir), { recursive: true });
+		writeFileSync(join(digestsDir(dataDir), "sess-x.injected.json"), JSON.stringify({ ...buildDigest(notableEntries(), "sess-x", "/proj", "2026-08-30T12:00:00.000Z"), cwd: "x".repeat(5_000_000) }));
 		const handler = api.fire.bind(api, "session_start");
 		await handler({}, fakeCtx());
 		expect(api.messages).toHaveLength(0);
