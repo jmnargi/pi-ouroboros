@@ -165,6 +165,8 @@ beforeEach(() => {
 afterEach(() => {
 	delete process.env.PI_CODING_AGENT_DIR;
 	delete process.env.PI_OUROBOROS_RULES_CAP;
+	delete process.env.PI_OUROBOROS_RULES_MAX_CHARS;
+	delete process.env.PI_OUROBOROS_REFLECT_MIN_PROMPTS;
 	rmSync(dataDir, { recursive: true, force: true });
 });
 
@@ -266,7 +268,9 @@ describe("session_start", () => {
 	test("recovered digests are injected ahead of newer pending digests", async () => {
 		// Digest A (older, notable) has an undelivered reflection marker.
 		// Digest B (newer, notable) is pending. The recovered A must be
-		// injected FIRST; B is then deleted by the newest-wins rule.
+		// injected FIRST; B is KEPT pending for the next session start
+		// (OURO-17-01) — deleting it would lose the newest session's
+		// reflection.
 		saveDigest(dataDir, buildDigest(notableEntries("sess-a"), "sess-a", "/proj", "2026-08-30T10:00:00.000Z"));
 		markDigestInjected(dataDir, "sess-a");
 		saveDigest(dataDir, buildDigest(notableEntries("sess-b"), "sess-b", "/proj", "2026-08-30T11:00:00.000Z"));
@@ -274,7 +278,7 @@ describe("session_start", () => {
 		await handler({}, fakeCtx());
 		expect(api.messages).toHaveLength(1);
 		expect(api.messages[0]!.message.content).toContain("sess-a");
-		expect(readdirSync(digestsDir(dataDir))).toEqual(["sess-a.injected.json"]);
+		expect(readdirSync(digestsDir(dataDir)).sort()).toEqual(["sess-a.injected.json", "sess-b.json"]);
 	});
 	test("digests marked injected at entry are never deleted as stale (Concurrency2/3)", async () => {
 		// Both sess-a (older) and sess-b (newer) are marked injected at
@@ -479,11 +483,12 @@ describe("session_start", () => {
 		expect(api.messages).toHaveLength(0);
 		expect(readdirSync(digestsDir(dataDir))).toEqual(["sess-1.injected.json"]);
 	});
-	test("a corrupt digest after an injected one is deleted by filename without parsing", async () => {
+	test("a corrupt digest after an injected one is deleted", async () => {
 		saveDigest(dataDir, buildDigest(notableEntries("sess-a"), "sess-a", "/proj", "2026-08-30T10:00:00.000Z"));
 		markDigestInjected(dataDir, "sess-a");
-		// sess-b is corrupt (not JSON). The injected flag is checked BEFORE
-		// loadDigest, so sess-b is deleted without a parse attempt.
+		// sess-b is corrupt (not JSON): loadDigest returns null and the
+		// digest is deleted even after the first injection (OURO-17-01
+		// keeps only NOTABLE pending digests).
 		writeFileSync(join(digestsDir(dataDir), "sess-b.json"), "{not json");
 		const handler = api.fire.bind(api, "session_start");
 		await handler({}, fakeCtx());
@@ -623,6 +628,37 @@ describe("ouroboros_learn tool", () => {
 		expect(loadRules(dataDir)).toEqual(["rule two", "rule three"]);
 		delete process.env.PI_OUROBOROS_RULES_CAP;
 	});
+	test("kind=rule respects PI_OUROBOROS_RULES_MAX_CHARS (TQ-16-06)", async () => {
+		process.env.PI_OUROBOROS_RULES_MAX_CHARS = "100";
+		const capped = makeAPI();
+		plugin(capped as unknown as ExtensionAPI);
+		const t = capped.tools.find((x) => x.name === "ouroboros_learn")!;
+		// Three ~40-char rules exceed a 100-char budget: the eviction
+		// loop must drop the oldest so the stored file fits.
+		await t.execute("call-1", { kind: "rule", lesson: "a".repeat(40) }, undefined, undefined, fakeCtx());
+		await t.execute("call-2", { kind: "rule", lesson: "b".repeat(40) }, undefined, undefined, fakeCtx());
+		await t.execute("call-3", { kind: "rule", lesson: "c".repeat(40) }, undefined, undefined, fakeCtx());
+		const rules = loadRules(dataDir);
+		expect(rules.join("\n").length + 1).toBeLessThanOrEqual(100);
+		expect(rules[rules.length - 1]).toBe("c".repeat(40));
+		delete process.env.PI_OUROBOROS_RULES_MAX_CHARS;
+	});
+	test("PI_OUROBOROS_REFLECT_MIN_PROMPTS gates notability (TQ-16-06)", async () => {
+		process.env.PI_OUROBOROS_REFLECT_MIN_PROMPTS = "1000";
+		const quiet = makeAPI();
+		plugin(quiet as unknown as ExtensionAPI);
+		// A clean session (no errors, 1 user prompt) is far below the
+		// 1000 threshold: the digest is saved but nothing is queued at
+		// the next session start.
+		const cleanEntries = [
+			{ type: "session", id: "sess-1", cwd: "/proj", timestamp: "2026-08-30T10:00:00.000Z" },
+			{ type: "message", message: { role: "user", content: "hi" } },
+		];
+		await quiet.fire("session_shutdown", { reason: "quit" }, fakeCtx({ sessionManager: { getEntries: () => cleanEntries } }));
+		await quiet.fire("session_start", {}, fakeCtx());
+		expect(quiet.messages).toHaveLength(0);
+		delete process.env.PI_OUROBOROS_REFLECT_MIN_PROMPTS;
+	});
 
 	test("kind=skill writes a SKILL.md and validates the name", async () => {
 		const t = tool();
@@ -652,6 +688,14 @@ describe("ouroboros_learn tool", () => {
 		const result = await t.execute("c1", { kind: "rule", lesson: "   \n\t " }, undefined, undefined, fakeCtx());
 		expect(result.content[0]!.text).toContain("lesson is empty");
 		expect(loadRules(dataDir)).toHaveLength(0);
+	});
+	test("kind=rule reports the real cause for a >1MB rules.md (FixAudit14)", async () => {
+		const t = tool();
+		mkdirSync(join(dataDir, "ouroboros"), { recursive: true });
+		writeFileSync(join(dataDir, "ouroboros", "rules.md"), "- " + "x".repeat(2 * 1024 * 1024));
+		const result = await t.execute("c1", { kind: "rule", lesson: "new rule" }, undefined, undefined, fakeCtx());
+		expect(result.content[0]!.text).toContain("exceeds 1MB");
+		expect(result.content[0]!.text).not.toContain("concurrent write");
 	});
 	test("sendMessage failure restores the digest to pending (defense-in-depth)", async () => {
 		saveDigest(dataDir, buildDigest(notableEntries(), "sess-1", "/proj", "2026-08-30T12:00:00.000Z"));

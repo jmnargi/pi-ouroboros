@@ -210,6 +210,18 @@ describe("rules", () => {
 		expect(rules[0]).toBe("r9999");
 		expect(rules[rules.length - 1]).toBe("r19999");
 	});
+	test("loadRules reads a 10,001-line file in full (the +1 boundary, TQ-16-03)", () => {
+		const dir = tmpDataDir();
+		fs.mkdirSync(path.dirname(rulesFile(dir)), { recursive: true });
+		// 10,001 lines have 10,000 newlines — the scan does not trigger
+		// (newlines > MAX_RULES_LINES is false), so the file is read in
+		// full. Truncation starts at 10,002 lines.
+		fs.writeFileSync(rulesFile(dir), Array.from({ length: 10_001 }, (_, i) => `r${i}`).join("\n"));
+		const rules = loadRules(dir);
+		expect(rules).toHaveLength(10_001);
+		expect(rules[0]).toBe("r0");
+		expect(rules[rules.length - 1]).toBe("r10000");
+	});
 
 	test("loadRules degrades to empty on unreadable file", () => {
 		const dir = tmpDataDir();
@@ -306,27 +318,34 @@ describe("digests", () => {
 		// plugin must not list, read, or delete the victim's *.json files.
 		const victim = fs.mkdtempSync(path.join(os.tmpdir(), "ouroboros-victim-"));
 		tmpDirs.push(victim);
-		fs.writeFileSync(path.join(victim, "package.json"), "{}");
+		// A VALID digest at the victim path: the loadDigest assertion
+		// below must fail on revert of the guard (a corrupt '{}' would
+		// return null either way — FixAudit14).
+		fs.writeFileSync(path.join(victim, "package.json"), JSON.stringify(digest()));
 		fs.mkdirSync(path.join(dir, "ouroboros"), { recursive: true });
 		fs.symlinkSync(victim, path.join(dir, "ouroboros", "digests"));
 		expect(listDigests(dir)).toEqual([]);
 		expect(listInjectedDigests(dir)).toEqual([]);
 		expect(deleteDigest(dir, "package")).toBe(false);
 		expect(fs.existsSync(path.join(victim, "package.json"))).toBe(true);
-		// The write/read guards (round 14): saveDigest and saveLastDigest
-		// must not write into the victim; loadLastDigest must not read it.
+		// The write/read guards (round 14): saveDigest must not write
+		// into the victim. saveLastDigest writes ouroboros/last-digest.json
+		// (the ouroboros dir is real) — the digests-dir symlink does not
+		// block it (OURO-17-03).
 		saveDigest(dir, digest());
 		saveLastDigest(dir, digest());
 		expect(fs.readdirSync(victim)).toEqual(["package.json"]);
-		// Pre-seed the victim with a valid last-digest.json: loadLastDigest
-		// must return null because of its OWN guard, not because the file
-		// is missing (TQ-16-06).
-		fs.writeFileSync(path.join(victim, "last-digest.json"), JSON.stringify(digest()));
-		expect(loadLastDigest(dir)).toBeNull();
+		expect(loadLastDigest(dir)).not.toBeNull();
 		// The loaders (TQ-16-04): loadDigest/readInjectedDigest must not
 		// read the victim's files either.
 		expect(loadDigest(dir, "package")).toBeNull();
 		expect(readInjectedDigest(dir, "package")).toBeNull();
+		// The marker functions (TQ-16-05): mark/unmark/delete must not
+		// touch the victim's files.
+		expect(markDigestInjected(dir, "package")).toBe(false);
+		expect(unmarkDigestInjected(dir, "package")).toBe(false);
+		expect(deleteInjectedDigest(dir, "package")).toBe(false);
+		expect(fs.readdirSync(victim)).toEqual(["package.json"]);
 	});
 	test("deleteDigest/deleteInjectedDigest never throw on a failed rmSync (TQ-14-03)", () => {
 		const dir = tmpDataDir();
@@ -354,6 +373,12 @@ describe("digests", () => {
 		expect(listInjectedDigests(dir)).toEqual([]);
 		expect(deleteDigest(dir, "package")).toBe(false);
 		expect(fs.existsSync(path.join(victim, "package.json"))).toBe(true);
+		// last-digest.json lives in the ouroboros dir: the symlinked
+		// ouroboros dir must block reading it (OURO-17-03).
+		fs.writeFileSync(path.join(victim, "last-digest.json"), JSON.stringify(digest()));
+		expect(loadLastDigest(dir)).toBeNull();
+		expect(saveLastDigest(dir, digest())).toBeUndefined();
+		expect(fs.readdirSync(victim).sort()).toEqual(["last-digest.json", "package.json"]);
 	});
 
 	test("loadDigest rejects corrupt files", () => {
@@ -607,6 +632,17 @@ describe("digests", () => {
 		const r = Bun.spawnSync(["mkfifo", file]);
 		if (r.exitCode !== 0) return; // non-Unix filesystem — skip
 		expect(loadDigest(dir, "sess-fifo")).toBeNull();
+		// The same check guards the other read paths (TQ-16-02).
+		const marker = `${file.slice(0, -".json".length)}.injected.json`;
+		Bun.spawnSync(["mkfifo", marker]);
+		expect(readInjectedDigest(dir, "sess-fifo")).toBeNull();
+		Bun.spawnSync(["mkfifo", lastDigestFile(dir)]);
+		expect(loadLastDigest(dir)).toBeNull();
+		// loadRules: a FIFO at the rules path would hang every turn
+		// (TQ-16-01).
+		fs.mkdirSync(path.dirname(rulesFile(dir)), { recursive: true });
+		Bun.spawnSync(["mkfifo", rulesFile(dir)]);
+		expect(loadRules(dir)).toEqual([]);
 	});
 	test("readInjectedDigest skips a file over the size bound (TQ-16-03)", () => {
 		const dir = tmpDataDir();
@@ -959,7 +995,6 @@ describe("skills", () => {
 		expect(content).not.toContain("\u200b");
 		expect(content).not.toContain("\ud800");
 	});
-
 	test("listSkills ignores dirs without SKILL.md", () => {
 		const dir = tmpDataDir();
 		fs.mkdirSync(path.join(dir, "skills", "empty"), { recursive: true });
@@ -992,6 +1027,13 @@ describe("skills", () => {
 		const dir3 = tmpDataDir();
 		fs.symlinkSync(path.join(dir3, "nonexistent-target"), path.join(dir3, "skills"));
 		expect(() => writeSkill(dir3, "my-skill", "desc", "body")).toThrow(/symlink/);
+		// A DANGLING symlink at the skill SUBDIR is also refused with the
+		// friendly error (RuntimeIntegration6): mkdirSync would otherwise
+		// throw a misleading ENOENT.
+		const dir4 = tmpDataDir();
+		fs.mkdirSync(path.join(dir4, "skills"), { recursive: true });
+		fs.symlinkSync(path.join(dir4, "nonexistent-target"), path.join(dir4, "skills", "planted"));
+		expect(() => writeSkill(dir4, "planted", "desc", "body")).toThrow(/symlink/);
 	});
 });
 

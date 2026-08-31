@@ -25,7 +25,8 @@ export const MAX_RULE_CHARS = 500;
 /** Rules files over this size are not read (and never overwritten). */
 export const MAX_RULES_FILE_BYTES = 1024 * 1024;
 /** Rules files over this many lines are truncated at the read (the
- * default cap is 50 rules; 10k lines is a generous ceiling). */
+ * default cap is 50 rules; 10k lines is a generous ceiling). A file
+ * without a trailing newline keeps at most MAX_RULES_LINES+1 lines. */
 export const MAX_RULES_LINES = 10_000;
 /** Digest files over this size are not writer-produced (all fields are
  * capped): skip the read so a crafted multi-MB file never materializes. */
@@ -92,7 +93,11 @@ export function loadRules(dataDir: string): string[] {
 	try {
 		const stat = fs.statSync(file);
 		// Use mtime + size. On coarse-granularity filesystems, two writes
-		// in the same second are caught by the size change.
+		// in the same second are caught by the size change. Two SAME-SIZE
+		// external writes within the granularity window are not
+		// distinguishable (accepted: the plugin's own writes always
+		// invalidate; only hand-edits or write-tool bypasses can serve
+		// stale rules for a turn or two — OURO-17-05).
 		if (rulesCache && rulesCache.file === file && rulesCache.mtimeMs === stat.mtimeMs && rulesCache.size === stat.size) {
 			return rulesCache.rules;
 		}
@@ -110,7 +115,8 @@ export function loadRules(dataDir: string): string[] {
 		// default cap is 50 rules). Keep the LAST MAX_RULES_LINES lines —
 		// split-with-limit drops the tail, and the newest rules are the
 		// freshest lessons. Scan from the end for the (MAX_RULES_LINES+1)th
-		// newline and split only that tail (O(n) scan, no array).
+		// newline and split only that tail (O(n) scan, no array). A file
+		// without a trailing newline keeps at most MAX_RULES_LINES+1 lines.
 		let start = 0;
 		let newlines = 0;
 		for (let i = text.length - 1; i >= 0; i--) {
@@ -190,18 +196,25 @@ export function appendRule(
 		// missing file is fine
 	}
 	// Bound the input BEFORE the regex passes: a multi-MB lesson must not
-	// materialize multi-MB intermediate strings. MAX_RULE_CHARS*2+1 units
-	// cover the first MAX_RULE_CHARS code points even when every one is
-	// astral.
-	const bounded = rule.slice(0, MAX_RULE_CHARS * 2 + 1);
-	// Strip control chars and lone surrogates: a rule is injected into the
-	// system prompt verbatim. The cap is by code points — a UTF-16 slice
-	// could split a surrogate pair and store a lone surrogate.
-	const normalized = bounded
-		.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f]/g, "")
-		.replace(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g, "")
-		.trim()
-		.replace(/\s+/g, " ");
+	// materialize multi-MB intermediate strings. Grow the window until
+	// the cleaned prefix holds MAX_RULE_CHARS code points or the input is
+	// exhausted: a strip-heavy prefix (control chars, whitespace) must
+	// not shrink the lesson to empty.
+	let window = Math.min(rule.length, MAX_RULE_CHARS * 2 + 1);
+	let normalized = "";
+	while (true) {
+		const candidate = rule
+			.slice(0, window)
+			.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f]/g, "")
+			.replace(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g, "")
+			.trim()
+			.replace(/\s+/g, " ");
+		if ([...candidate].length >= MAX_RULE_CHARS || window >= rule.length) {
+			normalized = candidate;
+			break;
+		}
+		window = Math.min(rule.length, window * 2);
+	}
 	const chars = Array.from(normalized);
 	const capped = chars.length <= MAX_RULE_CHARS ? normalized : chars.slice(0, MAX_RULE_CHARS).join("");
 	// A rule with no letter or number content is not a lesson. Every such
@@ -279,12 +292,23 @@ export function markDigestInjected(dataDir: string, sessionId: string): boolean 
 		return false;
 	}
 }
+/** True when the ouroboros dir is a symlink. last-digest.json lives
+ * there; the read/write path must never follow a symlinked ouroboros
+ * dir. */
+export function ouroborosDirIsSymlink(dataDir: string): boolean {
+	try {
+		return fs.lstatSync(ouroborosDir(dataDir)).isSymbolicLink();
+	} catch {
+		return false; // missing dirs are fine
+	}
+}
 /** True when the digests dir (or its parent) is a symlink. The digest
  * read/delete path must never follow one: a symlinked digests dir would
  * make the plugin read and delete arbitrary *.json files in the target. */
 function digestsDirIsSymlink(dataDir: string): boolean {
+	if (ouroborosDirIsSymlink(dataDir)) return true;
 	try {
-		return fs.lstatSync(ouroborosDir(dataDir)).isSymbolicLink() || fs.lstatSync(digestsDir(dataDir)).isSymbolicLink();
+		return fs.lstatSync(digestsDir(dataDir)).isSymbolicLink();
 	} catch {
 		return false; // missing dirs are fine
 	}
@@ -316,7 +340,10 @@ export function listInjectedDigests(dataDir: string): string[] {
 			const stem = f.slice(0, -".injected.json".length);
 			if (safeSessionId(stem) !== stem) continue;
 			try {
-				entries.push({ name: f, mtime: fs.statSync(path.join(dir, f)).mtimeMs });
+				const st = fs.statSync(path.join(dir, f));
+				// Skip non-regular files (same rule as listDigests).
+				if (!st.isFile()) continue;
+				entries.push({ name: f, mtime: st.mtimeMs });
 			} catch {
 				// unstatable — skip it
 			}
@@ -532,8 +559,9 @@ export function lastDigestFile(dataDir: string): string {
 
 export function saveLastDigest(dataDir: string, digest: OuroborosDigest): void {
 	// Never write through a symlinked ouroboros dir (same rule as
-	// saveDigest): the file would land in the target and be lost.
-	if (digestsDirIsSymlink(dataDir)) return;
+	// saveDigest): the file would land in the target and be lost. The
+	// digests dir does not matter — last-digest.json is not inside it.
+	if (ouroborosDirIsSymlink(dataDir)) return;
 	try {
 		const file = lastDigestFile(dataDir);
 		fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -546,7 +574,7 @@ export function loadLastDigest(dataDir: string): OuroborosDigest | null {
 	// Never read through a symlinked ouroboros dir (same rule as
 	// listDigests): the file would come from the target. A file over the
 	// size bound is not writer-produced: treat it as corrupt (null).
-	if (digestsDirIsSymlink(dataDir)) return null;
+	if (ouroborosDirIsSymlink(dataDir)) return null;
 	try {
 		const file = lastDigestFile(dataDir);
 		// A special file (FIFO, socket, device) would block the read
@@ -592,7 +620,12 @@ export function listDigests(dataDir: string): string[] {
 			const stem = f.slice(0, -".json".length);
 			if (safeSessionId(stem) !== stem) continue;
 			try {
-				entries.push({ name: f, mtime: fs.statSync(path.join(dir, f)).mtimeMs });
+				const st = fs.statSync(path.join(dir, f));
+				// Skip non-regular files: a directory at a digest path
+				// would otherwise be listed and re-attempted (EISDIR) at
+				// every session start, accumulating forever (OURO-17-04).
+				if (!st.isFile()) continue;
+				entries.push({ name: f, mtime: st.mtimeMs });
 			} catch {
 				// unstatable — skip it
 			}
@@ -748,6 +781,17 @@ export function writeSkill(dataDir: string, name: string, description: string, b
 	}
 	const dir = path.join(skillsRoot, name);
 	const file = path.join(dir, "SKILL.md");
+	// Check the subdir BEFORE mkdir: a dangling symlink at skills/<name>
+	// would make mkdirSync throw a misleading ENOENT (RuntimeIntegration6).
+	let dirStat: fs.Stats | null = null;
+	try {
+		dirStat = fs.lstatSync(dir);
+	} catch (err) {
+		if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+	}
+	if (dirStat?.isSymbolicLink()) {
+		throw new Error(`skill dir "${name}" is a symlink — refusing to write through it`);
+	}
 	fs.mkdirSync(dir, { recursive: true });
 	if (fs.lstatSync(dir).isSymbolicLink()) {
 		throw new Error(`skill dir "${name}" is a symlink — refusing to write through it`);
@@ -809,20 +853,18 @@ export function writeSkill(dataDir: string, name: string, description: string, b
 				}
 				throw err2;
 			}
-			skillsCache = null;
 			return file;
 		}
 		throw err;
 	}
 	fs.rmSync(tmp, { force: true });
-	skillsCache = null;
 	return file;
 }
 
-/** In-memory skills cache: updateStatus reads it every turn. */
-let skillsCache: { dir: string; mtimeMs: number; size: number; names: string[] } | null = null;
-
-/** Names of skills ouroboros has written (directories under the skills dir). */
+/** Names of skills ouroboros has written (directories under the skills dir).
+ * No cache: a SKILL.md created or deleted inside an existing subdir does
+ * not change the root mtime, so a root-keyed cache would go stale
+ * (OURO-17-06). The listing is a few syscalls — negligible per turn. */
 export function listSkills(dataDir: string): string[] {
 	try {
 		const dir = skillsDir(dataDir);
@@ -830,19 +872,11 @@ export function listSkills(dataDir: string): string[] {
 		// as the digests guards): the subdir names would come from the
 		// target.
 		if (!fs.existsSync(dir) || fs.lstatSync(dir).isSymbolicLink()) return [];
-		const stat = fs.statSync(dir);
-		// A new skill directory changes the parent's mtime+size, so the
-		// cache stays valid until the next write.
-		if (skillsCache && skillsCache.dir === dir && skillsCache.mtimeMs === stat.mtimeMs && skillsCache.size === stat.size) {
-			return skillsCache.names;
-		}
-		const names = fs
+		return fs
 			.readdirSync(dir, { withFileTypes: true })
 			.filter((e) => e.isDirectory() && fs.existsSync(path.join(dir, e.name, "SKILL.md")))
 			.map((e) => e.name)
 			.sort();
-		skillsCache = { dir, mtimeMs: stat.mtimeMs, size: stat.size, names };
-		return names;
 	} catch {
 		return [];
 	}

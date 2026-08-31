@@ -80,9 +80,9 @@ try {
 	// 4. appendRule at cap (char eviction runs).
 	bench("appendRule at cap (char eviction)", 200, () => appendRule(dir, `new rule ${Date.now()}`));
 
-	// 5. listSkills (cached).
+	// 5. listSkills (no cache — a few syscalls).
 	writeSkill(dir, "bench-skill", "bench", "body");
-	bench("listSkills (1 skill, cached)", 10_000, () => listSkills(dir));
+	bench("listSkills (1 skill)", 10_000, () => listSkills(dir));
 
 	// 6. saveDigest (atomic write).
 	const digest = buildDigest(entries, "sess-1", "/proj", "2026-08-30T12:00:00.000Z");

@@ -99,17 +99,25 @@ interface RawEntry {
 	timestamp?: unknown;
 }
 
-/** Extract plain text from a message content (string or content blocks). */
+/** Extract plain text from a message content (string or content blocks).
+ * Bound the accumulation: a crafted content array with many large text
+ * blocks must not materialize a multi-MB join. The callers truncate to
+ * <= 300 code points anyway (OURO-17-07). */
 export function extractText(content: unknown): string {
 	if (typeof content === "string") return content;
 	if (!Array.isArray(content)) return "";
 	const parts: string[] = [];
+	let total = 0;
 	for (const block of content) {
+		if (parts.length >= 100 || total >= 1000) break;
 		if (!block || typeof block !== "object") continue;
 		const b = block as { type?: unknown; text?: unknown; name?: unknown; arguments?: unknown };
-		if (b.type === "text" && typeof b.text === "string") parts.push(b.text);
-		else if (b.type === "toolCall" && typeof b.name === "string") {
-			parts.push(`[tool:${b.name}]`);
+		if (b.type === "text" && typeof b.text === "string") {
+			parts.push(b.text);
+			total += b.text.length;
+		} else if (b.type === "toolCall" && typeof b.name === "string") {
+			parts.push(`[tool:${b.name.slice(0, 100)}]`);
+			total += b.name.length + 7;
 		}
 	}
 	return parts.join("\n");
@@ -447,14 +455,19 @@ export function buildDigest(
 		digest.failedCommands = digest.failedCommands.slice(-COMMAND_CAP);
 	}
 	// Stringify the kept trace calls (the raw buffers are already bounded).
-	// The replacer truncates string values. A huge field is then not fully
-	// serialized. A circular or too-deep object throws. The args are
-	// dropped rather than losing the digest.
+	// The replacer truncates string values and stops after 200 properties,
+	// so a crafted deeply-nested args object cannot serialize to a
+	// multi-MB string (OURO-17-07). A circular or too-deep object throws.
+	// The args are dropped rather than losing the digest.
 	for (const t of rawToolCalls) {
 		let args = "";
 		if (typeof t.args === "object" && t.args !== null) {
 			try {
-				args = JSON.stringify(t.args, (_k, v) => (typeof v === "string" ? v.slice(0, 200) : v));
+				let props = 0;
+				args = JSON.stringify(t.args, (_k, v) => {
+					if (++props > 200) return undefined;
+					return typeof v === "string" ? v.slice(0, 200) : v;
+				});
 			} catch {
 				args = "";
 			}

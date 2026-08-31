@@ -60,6 +60,8 @@ The plugin does not lock the file across instances.
 Run one pi instance at a time to avoid lost rules.
 Two concurrent instances can also deliver the same reflection twice.
 The marker protocol has no ownership across processes.
+A crash between the reflection delivery and the marker cleanup can also deliver it twice.
+The lessons are deduplicated, so the second delivery is harmless.
 After a reload, the plugin reconciles the markers.
 The queued message survives the reload.
 The plugin delivers it once.
@@ -88,19 +90,20 @@ Measured costs:
 - Session start with 50 digests: 0.129 ms.
 - Rules read per turn (cached): 0.001 ms.
 - Skills read per turn (cached): 0.001 ms.
-- Rule append at cap (char eviction): 0.029 ms.
+- Rule append at cap (char eviction): 0.054 ms.
 - Digest list with 10,000 digests: 23 ms.
 - Digest build with a 300 KB prompt: 0.026 ms.
 - Digest build with 10,000 tool calls (capped): 6.3 ms.
-- Digest save (atomic write): 0.039 ms.
+- Digest save (atomic write): 0.030 ms.
 
 The plugin caches the rules file.
 The plugin invalidates the cache on its own writes.
 The plugin checks the file mtime for external writes.
-The plugin caches the skills list.
-The plugin invalidates the skills cache on its own writes.
+The plugin does not cache the skills list.
+The skills list is a few syscalls per turn.
 The plugin scans every pending digest at session start.
-The plugin deletes the rest after the first notable digest is queued.
+The plugin injects one reflection per session start.
+The plugin keeps the remaining pending digests for the next session start.
 The plugin deletes non-notable and corrupt digests during the scan.
 The plugin skips the per-turn cleanup when nothing is pending.
 Run `bun bench/bench.ts` to re-measure the hot paths.
@@ -149,7 +152,7 @@ npx tsc --noEmit
 
 The tests cover digest extraction, persistence, prompt building, and the extension entry point.
 Run `bun bench/bench.ts` to measure the hot paths.
-The test suite has 189 tests.
+The test suite has 193 tests.
 The reflection happens at the start of the next session.
 The reflection does not happen at shutdown.
 Shutdown must stay fast.

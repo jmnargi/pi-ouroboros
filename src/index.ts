@@ -52,6 +52,7 @@ import {
 	isValidSkillName,
 	cleanupStaleTmp,
 	loadLastDigest,
+	ouroborosDirIsSymlink,
 	lastDigestFile,
 	saveLastDigest,
 } from "./persistence.ts";
@@ -275,8 +276,9 @@ export default function (pi: ExtensionAPI): void {
 		}
 		// Recovered digests keep their markers (still injected), so they are
 		// NOT in `all` (which lists pending digests only). They go FIRST,
-		// mtime-sorted newest-first (listInjectedDigests sorts), so the
-		// freshest undelivered reflection is injected. Pending digests follow.
+		// mtime-sorted newest-first (listInjectedDigests sorts): a claimed
+		// but undelivered reflection must be delivered. Pending digests
+		// follow.
 		const all = listDigests(dataDir);
 		const recoveredSet = new Set(recovered);
 		const ordered = [...recovered, ...all.filter((s) => !recoveredSet.has(s))];
@@ -284,13 +286,6 @@ export default function (pi: ExtensionAPI): void {
 		for (const sid of ordered) {
 			// One corrupt digest must not stall the rest.
 			try {
-				if (injected) {
-					// Recovered digests keep their markers (still claimed) —
-					// they are re-processed at the next session start.
-					// Pending digests are stale once one reflection is queued.
-					if (!recoveredSet.has(sid)) deleteDigest(dataDir, sid);
-					continue;
-				}
 				const digest = recoveredSet.has(sid) ? readInjectedDigest(dataDir, sid) : loadDigest(dataDir, sid);
 				if (!digest) {
 					if (recoveredSet.has(sid)) deleteInjectedDigest(dataDir, sid);
@@ -301,6 +296,15 @@ export default function (pi: ExtensionAPI): void {
 					// Nothing worth reflecting on — do not waste tokens.
 					if (recoveredSet.has(sid)) deleteInjectedDigest(dataDir, sid);
 					else deleteDigest(dataDir, sid);
+					continue;
+				}
+				if (injected) {
+					// A notable digest after the first injection is KEPT
+					// for the next session start (one reflection per
+					// start). Deleting it would lose the newest session's
+					// reflection when a recovered digest was injected
+					// first (OURO-17-01). Recovered digests keep their
+					// markers (still claimed).
 					continue;
 				}
 				// Pending digests are claimed with the rename (the atomic
@@ -537,6 +541,10 @@ export default function (pi: ExtensionAPI): void {
 				const digest = loadLastDigest(dataDir);
 				if (digest) {
 					if (cmdCtx.hasUI) cmdCtx.ui.notify(formatDigest(digest), "info");
+				} else if (ouroborosDirIsSymlink(dataDir)) {
+					// The guard refused to read — the file is not corrupt
+					// (OURO-17-03).
+					if (cmdCtx.hasUI) cmdCtx.ui.notify("ouroboros: ouroboros dir is a symlink — refusing to read", "error");
 				} else if (existsSync(lastDigestFile(dataDir))) {
 					if (cmdCtx.hasUI) cmdCtx.ui.notify("ouroboros: digest unreadable (corrupt file)", "error");
 				} else if (cmdCtx.hasUI) {
