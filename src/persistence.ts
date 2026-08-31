@@ -193,6 +193,10 @@ export function appendRule(
 	// as every other ouroboros state path): the lesson would land in the
 	// target (RuntimeIntegration8).
 	if (ouroborosDirIsSymlink(dataDir)) return { added: false, reason: "symlink", count: 0, cap };
+	// A dangling rules.md symlink makes writeRules refuse silently; report
+	// the real cause instead of a misleading 'conflict' after the retry
+	// loop fails (FixAudit18).
+	if (rulesFileIsDanglingSymlink(dataDir)) return { added: false, reason: "symlink", count: 0, cap };
 	// Bypass the negative cache. A rules.md created by another process
 	// within the 1s window must be seen. Otherwise this write would
 	// clobber it.
@@ -329,6 +333,19 @@ export function ouroborosDirIsSymlink(dataDir: string): boolean {
 		return fs.lstatSync(ouroborosDir(dataDir)).isSymbolicLink();
 	} catch {
 		return false; // missing dirs are fine
+	}
+}
+/** True when rules.md is a symlink whose target is absent. writeRules
+ * refuses to replace such a link (OURO-SEC-20-01); callers report the
+ * refusal instead of a misleading success or 'conflict' (FixAudit18).
+ * lstatSync succeeds for a dangling link; existsSync follows the link
+ * and returns false. */
+export function rulesFileIsDanglingSymlink(dataDir: string): boolean {
+	try {
+		const file = rulesFile(dataDir);
+		return fs.lstatSync(file).isSymbolicLink() && !fs.existsSync(file);
+	} catch {
+		return false; // missing file is fine
 	}
 }
 /** True when the digests dir (or its parent) is a symlink. The digest

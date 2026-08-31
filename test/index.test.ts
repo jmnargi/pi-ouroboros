@@ -8,7 +8,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -386,10 +386,13 @@ describe("session_start", () => {
 		expect(api.messages).toHaveLength(0);
 		expect(readdirSync(digestsDir(dataDir))).toEqual([]);
 	});
-	test("one unreadable marker does not stall recovery of the rest (TestQuality4)", async () => {
-		// sess-a's marker path is a directory (readInjectedDigest throws);
-		// sess-b is a valid recovered digest. The per-digest isolation must
-		// skip sess-a (marker kept) and still inject sess-b.
+	test("a non-file marker is skipped by the listing; recovery continues (TestQuality4)", async () => {
+		// sess-a's marker path is a directory. listInjectedDigests filters
+		// non-regular files, so the marker is skipped (kept) and sess-b is
+		// still injected. The per-digest try/catch isolation is
+		// inspection-verified: a listed-but-unreadable marker (e.g. a
+		// permission-denied file) cannot be exercised portably (root
+		// ignores chmod 000).
 		saveDigest(dataDir, buildDigest(notableEntries("sess-a"), "sess-a", "/proj", "2026-08-30T10:00:00.000Z"));
 		markDigestInjected(dataDir, "sess-a");
 		const markerA = join(digestsDir(dataDir), "sess-a.injected.json");
@@ -457,8 +460,8 @@ describe("session_start", () => {
 		await api.fire("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }] }, fakeCtx({ sessionManager: { getEntries: () => entries } }));
 		expect(readdirSync(digestsDir(dataDir))).toEqual([]);
 	});
-	test("reload branch isolates one unreadable marker from the rest (TestQuality5)", async () => {
-		// sess-a's marker path is a directory (readInjectedDigest throws);
+	test("reload branch skips a non-file marker and still reconciles the rest (TestQuality5)", async () => {
+		// sess-a's marker path is a directory (filtered by the listing);
 		// sess-b's reflection is in the history. The reload branch must
 		// skip sess-a (marker kept) and still delete sess-b's marker.
 		saveDigest(dataDir, buildDigest(notableEntries("sess-a"), "sess-a", "/proj", "2026-08-30T10:00:00.000Z"));
@@ -473,8 +476,8 @@ describe("session_start", () => {
 		await handler({ reason: "reload" }, fakeCtx({ sessionManager: { getEntries: () => entries } }));
 		expect(readdirSync(digestsDir(dataDir)).sort()).toEqual(["sess-a.injected.json"]);
 	});
-	test("agent_end keeps an unreadable marker and deletes a delivered one (TestQuality5)", async () => {
-		// sess-a's marker path is a directory (readInjectedDigest throws —
+	test("agent_end keeps a non-file marker and deletes a delivered one (TestQuality5)", async () => {
+		// sess-a's marker path is a directory (filtered by the listing —
 		// the marker must survive); sess-b's reflection is in the history
 		// (the marker must be deleted at agent_end).
 		saveDigest(dataDir, buildDigest(notableEntries("sess-a"), "sess-a", "/proj", "2026-08-30T10:00:00.000Z"));
@@ -764,6 +767,33 @@ describe("/ouroboros command", () => {
 		expect(loadRules(dataDir)).toHaveLength(1);
 		cmd().handler("reset", fakeCtx());
 		expect(loadRules(dataDir)).toHaveLength(0);
+	});
+	test("reset refuses a symlinked ouroboros dir and reports it (TQ-20-01)", () => {
+		const victim = mkdtempSync(join(tmpdir(), "ouroboros-victim-"));
+		mkdirSync(join(victim, "ouroboros"), { recursive: true });
+		writeFileSync(join(victim, "ouroboros", "rules.md"), "- victim rule\n");
+		symlinkSync(join(victim, "ouroboros"), join(dataDir, "ouroboros"));
+		const notified: string[] = [];
+		const ctx = fakeCtx({ hasUI: true, ui: { setStatus: () => {}, notify: (m: string) => notified.push(m) } });
+		cmd().handler("reset", ctx);
+		expect(notified.join(" ")).toContain("refusing to clear");
+		expect(notified.join(" ")).not.toContain("rules cleared");
+		// The victim's rules must be untouched.
+		expect(readFileSync(join(victim, "ouroboros", "rules.md"), "utf8")).toBe("- victim rule\n");
+		rmSync(victim, { recursive: true, force: true });
+	});
+	test("reset refuses a DANGLING rules.md symlink and reports it (FixAudit18)", () => {
+		// A real ouroboros dir with a dangling rules.md symlink: the
+		// writeRules refusal must not be reported as 'rules cleared'.
+		mkdirSync(join(dataDir, "ouroboros"), { recursive: true });
+		symlinkSync(join(dataDir, "missing-target.md"), join(dataDir, "ouroboros", "rules.md"));
+		const notified: string[] = [];
+		const ctx = fakeCtx({ hasUI: true, ui: { setStatus: () => {}, notify: (m: string) => notified.push(m) } });
+		cmd().handler("reset", ctx);
+		expect(notified.join(" ")).toContain("refusing to clear");
+		expect(notified.join(" ")).not.toContain("rules cleared");
+		// The dangling link must survive.
+		expect(lstatSync(join(dataDir, "ouroboros", "rules.md")).isSymbolicLink()).toBe(true);
 	});
 
 	test("reflect queues a mid-session message without a digest", () => {

@@ -337,15 +337,14 @@ describe("rules", () => {
 		fs.mkdirSync(path.dirname(rulesFile(dir)), { recursive: true });
 		// A symlink to a not-yet-created target: realpathSync throws
 		// ENOENT. The write must refuse, not replace the link with a
-		// regular file.
+		// regular file, and must report 'symlink', not a misleading
+		// 'conflict' (FixAudit18).
 		fs.symlinkSync(path.join(dir, "missing-target.md"), rulesFile(dir));
-		await appendRule(dir, "new rule");
+		expect((await appendRule(dir, "new rule")).reason).toBe("symlink");
 		expect(fs.lstatSync(rulesFile(dir)).isSymbolicLink()).toBe(true);
 		expect(fs.existsSync(path.join(dir, "missing-target.md"))).toBe(false);
 		expect(loadRules(dir)).toEqual([]);
 	});
-});
-describe("digests", () => {
 	const digest = () => buildDigest([], "sess-abc", "/proj", "2026-08-30T12:00:00.000Z");
 
 	test("save/load round-trips and listDigests orders newest first", () => {

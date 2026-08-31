@@ -53,6 +53,7 @@ import {
 	cleanupStaleTmp,
 	loadLastDigest,
 	ouroborosDirIsSymlink,
+	rulesFileIsDanglingSymlink,
 	lastDigestFile,
 	saveLastDigest,
 } from "./persistence.ts";
@@ -465,14 +466,14 @@ export default function (pi: ExtensionAPI): void {
 				const { added, reason, count, cap } = appendRule(dataDir, params.lesson, rulesCap, rulesMaxChars);
 				updateStatus();
 				const text =
-					reason === "duplicate"
-						? `duplicate rule skipped (${count}/${cap})`
-						: reason === "empty"
-							? "rule not recorded — lesson is empty after normalization"
-							: reason === "too-large"
-								? "rule not recorded — rules.md exceeds 1MB; trim it manually"
-								: reason === "symlink"
-									? "rule not recorded — ouroboros dir is a symlink; refusing to write"
+				reason === "duplicate"
+					? `duplicate rule skipped (${count}/${cap})`
+					: reason === "empty"
+						? "rule not recorded — lesson is empty after normalization"
+						: reason === "too-large"
+							? "rule not recorded — rules.md exceeds 1MB; trim it manually"
+							: reason === "symlink"
+								? "rule not recorded — a symlink is in the way; refusing to write"
 									: reason === "conflict"
 										? `rule not recorded — concurrent write (${count}/${cap})`
 										: `rule recorded (${count}/${cap}) — active from next turn`;
@@ -513,13 +514,12 @@ export default function (pi: ExtensionAPI): void {
 		handler: async (args, cmdCtx) => {
 			uiHost = cmdCtx as unknown as UiHost;
 			const sub = (args ?? "").trim().split(/\s+/)[0] ?? "";
-
 			if (sub === "reset") {
 				// The writeRules symlink guard silently no-ops: report the
 				// refusal instead of claiming the rules were cleared
-				// (FixAudit17).
-				if (ouroborosDirIsSymlink(dataDir)) {
-					if (cmdCtx.hasUI) cmdCtx.ui.notify("ouroboros: ouroboros dir is a symlink — refusing to clear rules", "error");
+				// (FixAudit17, FixAudit18).
+				if (ouroborosDirIsSymlink(dataDir) || rulesFileIsDanglingSymlink(dataDir)) {
+					if (cmdCtx.hasUI) cmdCtx.ui.notify("ouroboros: a symlink is in the way — refusing to clear rules", "error");
 					return;
 				}
 				try {
